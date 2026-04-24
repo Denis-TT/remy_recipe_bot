@@ -390,6 +390,47 @@
         }
         .auth-error .error-icon { font-size: 48px; }
 
+        .debug-block {
+            text-align: left;
+            margin-top: 18px;
+            background: var(--card-bg);
+            border: 1px solid var(--border);
+            border-radius: var(--radius-md);
+            padding: 10px 12px;
+            max-width: 420px;
+            margin-left: auto;
+            margin-right: auto;
+        }
+        .debug-block summary {
+            cursor: pointer;
+            color: var(--text-secondary);
+            font-size: 13px;
+            user-select: none;
+            list-style: none;
+        }
+        .debug-block summary::-webkit-details-marker { display: none; }
+        .debug-block summary::before {
+            content: "▸";
+            display: inline-block;
+            margin-right: 6px;
+            transition: transform 0.15s ease;
+        }
+        .debug-block[open] summary::before { transform: rotate(90deg); }
+        .debug-block pre.debug-info {
+            margin-top: 10px;
+            padding: 10px;
+            background: #fafafa;
+            border-radius: var(--radius-sm);
+            font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+            font-size: 11.5px;
+            line-height: 1.5;
+            color: var(--text-primary);
+            white-space: pre-wrap;
+            word-break: break-all;
+            max-height: 260px;
+            overflow: auto;
+        }
+
         /* Бейдж «Демо-режим» — плавает в правом верхнем углу */
         .demo-badge {
             position: fixed;
@@ -481,38 +522,130 @@
 
         const tg = window.Telegram && window.Telegram.WebApp ? window.Telegram.WebApp : null;
         if (tg) {
+            // tg.ready() обязательно ДО чтения initData: на некоторых
+            // сборках Telegram Desktop до ready() объект инициализируется
+            // асинхронно, и initDataUnsafe может оказаться пустым.
             try { tg.ready(); } catch (_) { /* noop */ }
             try { tg.expand(); } catch (_) { /* noop */ }
         }
 
-        // ------------------------------------------------------------ //
-        // Определение user_id — трёхступенчатый fallback:
-        //   1. Telegram WebApp API (основной сценарий — запуск из бота).
-        //   2. URL-параметр ?user_id=<id> (ручное тестирование / прямая
-        //      ссылка, например в DevTools десктопного клиента).
-        //   3. Демо-режим — подставляем строковый "demo_user". Запросы к
-        //      Supabase по такому user_id вернут пустой список, а UI
-        //      покажет информативный экран с инструкцией и бейджем
-        //      «Демо-режим», вместо пустой заглушки.
-        // ------------------------------------------------------------ //
-        let USER_ID =
-            (tg && tg.initDataUnsafe && tg.initDataUnsafe.user && tg.initDataUnsafe.user.id) || null;
+        // ================================================================ //
+        //  Диагностика Telegram WebApp
+        // ================================================================ //
+        //  Печатаем всё, что может пригодиться, если user_id не нашёлся.
+        //  В норме читается только из DevTools, но те же данные попадают
+        //  в DEBUG_INFO, который мы показываем на экране ошибки и
+        //  разрешаем скопировать одной кнопкой.
+        // ================================================================ //
 
-        if (!USER_ID) {
-            const raw = qp.get("user_id");
-            const num = raw != null && raw !== "" ? Number(raw) : NaN;
-            if (Number.isFinite(num) && num > 0) {
-                USER_ID = num;
+        const DEBUG_INFO = (function () {
+            const safe = function (fn) {
+                try { return fn(); } catch (e) { return "ERR: " + (e && e.message || e); }
+            };
+            return {
+                hasWebApp:       !!tg,
+                hasInitData:     !!(tg && tg.initData),
+                initDataLength:  tg && tg.initData ? tg.initData.length : 0,
+                hasUser:         !!(tg && tg.initDataUnsafe && tg.initDataUnsafe.user),
+                userId:          safe(function () { return tg && tg.initDataUnsafe && tg.initDataUnsafe.user && tg.initDataUnsafe.user.id; }) || null,
+                queryId:         safe(function () { return tg && tg.initDataUnsafe && tg.initDataUnsafe.query_id; }) || null,
+                chatId:          safe(function () { return tg && tg.initDataUnsafe && tg.initDataUnsafe.chat && tg.initDataUnsafe.chat.id; }) || null,
+                chatType:        safe(function () { return tg && tg.initDataUnsafe && tg.initDataUnsafe.chat_type; }) || null,
+                startParam:      safe(function () { return tg && tg.initDataUnsafe && tg.initDataUnsafe.start_param; }) || null,
+                platform:        safe(function () { return tg && tg.platform; }) || null,
+                version:         safe(function () { return tg && tg.version; }) || null,
+                colorScheme:     safe(function () { return tg && tg.colorScheme; }) || null,
+                isExpanded:      safe(function () { return tg && tg.isExpanded; }),
+                urlHasUserId:    qp.has("user_id")
+            };
+        })();
+
+        console.groupCollapsed("=== Telegram WebApp Debug ===");
+        console.log("tg:", tg);
+        console.log("initData (raw):", tg && tg.initData);
+        console.log("initDataUnsafe:", tg && tg.initDataUnsafe);
+        console.log("user:", tg && tg.initDataUnsafe && tg.initDataUnsafe.user);
+        console.log("platform:", tg && tg.platform, "| version:", tg && tg.version);
+        console.log("DEBUG_INFO:", DEBUG_INFO);
+        console.groupEnd();
+
+        // ================================================================ //
+        //  Четырёхступенчатое определение user_id
+        // ================================================================ //
+        //  1. tg.initDataUnsafe.user.id — основной способ. Передаётся,
+        //     когда Mini App открыт через InlineKeyboardButton / KeyboardButton
+        //     с WebAppInfo или через Menu Button, настроенный через
+        //     Bot API `setChatMenuButton` с type="web_app".
+        //  2. tg.initData — строка вида "user=%7B...%7D&auth_date=...&hash=...".
+        //     Иногда initDataUnsafe пуст, но сама строка есть (нечастый,
+        //     но встречающийся баг ранних версий WebApp SDK). Парсим её сами.
+        //  3. ?user_id=<int> — ручной dev-режим (например, тест прямо в
+        //     браузере). Принимаем только положительные целые.
+        //  4. tg.initDataUnsafe.chat.id — последний fallback для кейса,
+        //     когда Mini App открыт в групповом чате без user-контекста
+        //     (редко, но запросы к Supabase по chat_id имеют смысл, если
+        //     боту явно выдано право писать в группу).
+        //
+        //  Возвращает число/строку с id или null, если ничего не нашлось.
+        // ================================================================ //
+
+        function getUserId(tg) {
+            // Способ 1 — initDataUnsafe (основной).
+            try {
+                if (tg && tg.initDataUnsafe && tg.initDataUnsafe.user && tg.initDataUnsafe.user.id) {
+                    return tg.initDataUnsafe.user.id;
+                }
+            } catch (_) { /* noop */ }
+
+            // Способ 2 — распарсить строку tg.initData.
+            try {
+                if (tg && tg.initData) {
+                    const params = new URLSearchParams(tg.initData);
+                    const userRaw = params.get("user");
+                    if (userRaw) {
+                        const user = JSON.parse(userRaw);
+                        if (user && user.id) return user.id;
+                    }
+                }
+            } catch (e) {
+                console.warn("getUserId: не удалось распарсить tg.initData:", e);
             }
+
+            // Способ 3 — URL-параметр ?user_id=<id>.
+            try {
+                const urlRaw = qp.get("user_id");
+                if (urlRaw != null && urlRaw !== "") {
+                    const num = Number(urlRaw);
+                    if (Number.isFinite(num) && num > 0) return num;
+                }
+            } catch (_) { /* noop */ }
+
+            // Способ 4 — chat.id (групповой чат без user).
+            try {
+                if (tg && tg.initDataUnsafe && tg.initDataUnsafe.chat && tg.initDataUnsafe.chat.id) {
+                    return tg.initDataUnsafe.chat.id;
+                }
+            } catch (_) { /* noop */ }
+
+            return null;
         }
 
+        let USER_ID = getUserId(tg);
         const IS_DEMO = !USER_ID;
         if (IS_DEMO) {
             USER_ID = "demo_user";
             console.warn(
                 "⚠️ user_id не определён, использую demo_user. " +
-                "Откройте приложение через бота Remy или передайте ?user_id=<id>."
+                "Открой Mini App через бота Remy (InlineKeyboardButton/KeyboardButton " +
+                "с web_app) или передай ?user_id=<id> для локального теста."
             );
+        } else {
+            console.info("✅ user_id =", USER_ID, "(source:",
+                (tg && tg.initDataUnsafe && tg.initDataUnsafe.user && tg.initDataUnsafe.user.id === USER_ID) ? "initDataUnsafe.user" :
+                (tg && tg.initData && tg.initData.indexOf("user=") >= 0 && typeof USER_ID === "number") ? "initData parsed" :
+                qp.has("user_id") ? "URL ?user_id=" :
+                "initDataUnsafe.chat",
+                ")");
         }
 
         // ================================================================ //
@@ -748,13 +881,45 @@
         // Спец-экран для демо-режима (нет user_id ни из Telegram, ни из URL).
         // Показывается вместо пустой заглушки «📭 Пока пусто» на экране
         // категорий, когда USER_ID === "demo_user" и рецептов, очевидно,
-        // в БД нет.
+        // в БД нет. Сюда же выводим компактный блок отладки — обычно
+        // именно он показывает, почему initData не доехал (чаще всего
+        // приложение открыто через Menu Button с URL вместо WebApp-кнопки).
         function authErrorPlaceholder() {
+            console.error("Auth Debug:", DEBUG_INFO);
+
             const hint = el("p", { class: "auth-hint" }, [
                 "Откройте приложение через бота Remy или добавьте ",
                 el("code", {}, ["?user_id=ВАШ_ID"]),
                 " в адресную строку для тестирования."
             ]);
+
+            const debugPre = el("pre", { class: "debug-info" }, [
+                JSON.stringify(DEBUG_INFO, null, 2)
+            ]);
+            const debug = el("details", { class: "debug-block" }, [
+                el("summary", {}, ["🔧 Техническая информация"]),
+                debugPre
+            ]);
+
+            const copyBtn = el("button", {
+                class: "retry",
+                onclick: function (ev) {
+                    const text = JSON.stringify(DEBUG_INFO, null, 2);
+                    const done = function () {
+                        ev.target.textContent = "✅ Скопировано";
+                        setTimeout(function () {
+                            ev.target.textContent = "📋 Скопировать отладку";
+                        }, 1500);
+                    };
+                    if (navigator.clipboard && navigator.clipboard.writeText) {
+                        navigator.clipboard.writeText(text).then(done, function () {
+                            window.prompt("Скопируйте данные вручную:", text);
+                        });
+                    } else {
+                        window.prompt("Скопируйте данные вручную:", text);
+                    }
+                }
+            }, ["📋 Скопировать отладку"]);
 
             const children = [
                 el("span", { class: "ico error-icon" }, ["🔐"]),
@@ -773,6 +938,8 @@
                     }
                 }, ["🔙 Вернуться в бота"]));
             }
+            children.push(copyBtn);
+            children.push(debug);
 
             return el("div", {
                 class: "placeholder error-state auth-error"
