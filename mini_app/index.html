@@ -591,6 +591,12 @@
         }
 
         async function fetchCategories(userId) {
+            // Демо-режим: user_id — строка "demo_user", в БД поле BIGINT,
+            // любой такой запрос вернёт HTTP 400 (invalid input syntax).
+            // Сразу отдаём пустой список — на экране категорий рендерится
+            // authErrorPlaceholder() с инструкцией.
+            if (IS_DEMO) return [];
+
             // Берём только meal_type — меньше трафика.
             const rows = await apiGet(
                 "recipes?user_id=eq." + encodeURIComponent(userId) + "&select=meal_type"
@@ -608,6 +614,10 @@
         }
 
         async function fetchRecipes(userId, mealType) {
+            // См. fetchCategories: в демо-режиме запрос к Supabase всё равно
+            // упадёт на BIGINT-касте user_id — возвращаем пустой список.
+            if (IS_DEMO) return [];
+
             const path =
                 "recipes?user_id=eq." + encodeURIComponent(userId) +
                 "&meal_type=eq." + encodeURIComponent(mealType) +
@@ -617,6 +627,11 @@
         }
 
         async function fetchRecipe(recipeId) {
+            // В демо-режиме юзер не мог открыть карточку (список всегда
+            // пуст), но на случай прямого вызова из DevTools — возвращаем
+            // null, чтобы не ходить в Supabase.
+            if (IS_DEMO) return null;
+
             const rows = await apiGet(
                 "recipes?id=eq." + encodeURIComponent(recipeId) + "&limit=1"
             );
