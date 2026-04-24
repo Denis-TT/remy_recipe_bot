@@ -357,6 +357,56 @@
             font-size: 14px;
             cursor: pointer;
         }
+        .error-state .retry + .retry { margin-top: 8px; }
+        .error-state .retry.primary {
+            background: var(--accent);
+            color: #fff;
+            border-color: var(--accent);
+        }
+        .error-state .retry.primary:active { background: var(--accent-hover); }
+
+        /* Экран «нет user_id» */
+        .auth-error h2 {
+            font-size: 17px;
+            font-weight: 700;
+            color: var(--text-primary);
+            margin: 4px 0 6px;
+        }
+        .auth-error .auth-hint {
+            color: var(--text-secondary);
+            font-size: 14px;
+            max-width: 340px;
+            margin: 0 auto 14px;
+            line-height: 1.5;
+        }
+        .auth-error .auth-hint code {
+            background: var(--card-bg);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            padding: 2px 6px;
+            font-size: 12px;
+            font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+            white-space: nowrap;
+        }
+        .auth-error .error-icon { font-size: 48px; }
+
+        /* Бейдж «Демо-режим» — плавает в правом верхнем углу */
+        .demo-badge {
+            position: fixed;
+            top: calc(10px + var(--safe-top));
+            right: 12px;
+            background: #ff9500;
+            color: #fff;
+            font-size: 11px;
+            font-weight: 700;
+            letter-spacing: 0.4px;
+            text-transform: uppercase;
+            padding: 4px 10px;
+            border-radius: 999px;
+            box-shadow: var(--shadow-md);
+            z-index: 10;
+            pointer-events: none;
+        }
 
         /* Skeleton loader — plain grey placeholders with shimmer. */
         .skeleton {
@@ -435,10 +485,35 @@
             try { tg.expand(); } catch (_) { /* noop */ }
         }
 
-        const USER_ID =
-            (tg && tg.initDataUnsafe && tg.initDataUnsafe.user && tg.initDataUnsafe.user.id) ||
-            Number(qp.get("user_id")) ||
-            0;
+        // ------------------------------------------------------------ //
+        // Определение user_id — трёхступенчатый fallback:
+        //   1. Telegram WebApp API (основной сценарий — запуск из бота).
+        //   2. URL-параметр ?user_id=<id> (ручное тестирование / прямая
+        //      ссылка, например в DevTools десктопного клиента).
+        //   3. Демо-режим — подставляем строковый "demo_user". Запросы к
+        //      Supabase по такому user_id вернут пустой список, а UI
+        //      покажет информативный экран с инструкцией и бейджем
+        //      «Демо-режим», вместо пустой заглушки.
+        // ------------------------------------------------------------ //
+        let USER_ID =
+            (tg && tg.initDataUnsafe && tg.initDataUnsafe.user && tg.initDataUnsafe.user.id) || null;
+
+        if (!USER_ID) {
+            const raw = qp.get("user_id");
+            const num = raw != null && raw !== "" ? Number(raw) : NaN;
+            if (Number.isFinite(num) && num > 0) {
+                USER_ID = num;
+            }
+        }
+
+        const IS_DEMO = !USER_ID;
+        if (IS_DEMO) {
+            USER_ID = "demo_user";
+            console.warn(
+                "⚠️ user_id не определён, использую demo_user. " +
+                "Откройте приложение через бота Remy или передайте ?user_id=<id>."
+            );
+        }
 
         // ================================================================ //
         //  Локализация — копия из src/localization.py.
@@ -655,6 +730,40 @@
             }, children);
         }
 
+        // Спец-экран для демо-режима (нет user_id ни из Telegram, ни из URL).
+        // Показывается вместо пустой заглушки «📭 Пока пусто» на экране
+        // категорий, когда USER_ID === "demo_user" и рецептов, очевидно,
+        // в БД нет.
+        function authErrorPlaceholder() {
+            const hint = el("p", { class: "auth-hint" }, [
+                "Откройте приложение через бота Remy или добавьте ",
+                el("code", {}, ["?user_id=ВАШ_ID"]),
+                " в адресную строку для тестирования."
+            ]);
+
+            const children = [
+                el("span", { class: "ico error-icon" }, ["🔐"]),
+                el("h2", {}, ["Не удалось определить пользователя"]),
+                hint,
+                el("button", {
+                    class: "retry primary",
+                    onclick: function () { loadCategories(); }
+                }, ["🔄 Попробовать ещё раз"])
+            ];
+            if (tg) {
+                children.push(el("button", {
+                    class: "retry",
+                    onclick: function () {
+                        try { tg.close(); } catch (_) { /* noop */ }
+                    }
+                }, ["🔙 Вернуться в бота"]));
+            }
+
+            return el("div", {
+                class: "placeholder error-state auth-error"
+            }, children);
+        }
+
         function skeleton(count, kind) {
             const frag = document.createDocumentFragment();
             for (let i = 0; i < count; i++) {
@@ -710,12 +819,16 @@
 
             const categories = state.categories || [];
             if (categories.length === 0) {
-                screen.appendChild(placeholder(
-                    "📭",
-                    "Пока пусто",
-                    "Пришли боту ссылку на рецепт — он появится здесь."
-                ));
-                screen.appendChild(closeButton());
+                if (IS_DEMO) {
+                    screen.appendChild(authErrorPlaceholder());
+                } else {
+                    screen.appendChild(placeholder(
+                        "📭",
+                        "Пока пусто",
+                        "Пришли боту ссылку на рецепт — он появится здесь."
+                    ));
+                    screen.appendChild(closeButton());
+                }
                 root.appendChild(screen);
                 return;
             }
@@ -967,12 +1080,6 @@
         // ================================================================ //
 
         async function loadCategories() {
-            if (!USER_ID) {
-                state.loading = false;
-                state.error = "Открой это приложение через бота — так я узнаю, чьи рецепты показать.";
-                render();
-                return;
-            }
             state.loading = true;
             state.error = null;
             render();
@@ -1060,7 +1167,18 @@
         //  Bootstrap
         // ================================================================ //
 
+        function mountDemoBadge() {
+            if (!IS_DEMO) return;
+            if (document.querySelector(".demo-badge")) return;
+            const badge = document.createElement("div");
+            badge.className = "demo-badge";
+            badge.textContent = "Демо-режим";
+            badge.title = "user_id не определён — работаю без Telegram WebApp";
+            document.body.appendChild(badge);
+        }
+
         window.addEventListener("DOMContentLoaded", function () {
+            mountDemoBadge();
             render();
             loadCategories();
         });
