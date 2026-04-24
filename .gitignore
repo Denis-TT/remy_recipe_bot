@@ -1,0 +1,38 @@
+# Секреты и локальные настройки
+.env
+.env.local
+.env.*.local
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+.venv/
+.ENV/
+*.egg-info/
+.eggs/
+
+# Логи
+logs/
+*.log
+
+# Инструменты разработки
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# ОС
+.DS_Store
+Thumbs.db
