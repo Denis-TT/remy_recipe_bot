@@ -327,6 +327,140 @@
         }
 
         /* ============================================================= *
+         * Detail screen v2 — современный, лаконичный layout.
+         * Все правила скоупнуты под `.detail`, чтобы не задеть
+         * экраны категорий и списка рецептов.
+         * ============================================================= */
+        .detail .header { margin-bottom: 12px; }
+
+        /* Hero-плашка вместо фото — пока изображений нет */
+        .recipe-hero {
+            height: 220px;
+            background: linear-gradient(135deg, #f5f7fa 0%, #e8ecf3 100%);
+            border-radius: var(--radius-lg);
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            color: var(--text-secondary);
+            margin-bottom: 18px;
+            box-shadow: var(--shadow-sm);
+        }
+        .recipe-hero .hero-icon {
+            font-size: 56px;
+            line-height: 1;
+            margin-bottom: 8px;
+            opacity: 0.7;
+        }
+        .recipe-hero .hero-text {
+            font-size: 12px;
+            letter-spacing: 0.5px;
+            text-transform: uppercase;
+            opacity: 0.7;
+        }
+
+        /* Заголовок и описание — отдельные классы, не пересекаются с
+           `.title` из шапки (там flex/ellipsis). */
+        .recipe-title {
+            font-size: 26px;
+            font-weight: 700;
+            letter-spacing: -0.4px;
+            line-height: 1.22;
+            color: var(--text-primary);
+            margin: 4px 0 6px;
+            word-break: break-word;
+        }
+        .recipe-description {
+            font-size: 14.5px;
+            color: var(--text-secondary);
+            line-height: 1.5;
+            margin-bottom: 14px;
+            word-break: break-word;
+        }
+
+        /* Бейджи на детальном экране — облегчённые, с тонкой рамкой */
+        .detail .badges .badge {
+            background: var(--card-bg);
+            border: 1px solid var(--border);
+            box-shadow: none;
+            font-weight: 500;
+        }
+
+        /* Ингредиенты v2 — круглый маркер слева, количество справа,
+           разделители-линии. */
+        .ingredients-modern {
+            list-style: none;
+            display: flex;
+            flex-direction: column;
+            gap: 0;
+        }
+        .ingredients-modern li {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            padding: 10px 0;
+            border-bottom: 1px solid var(--border);
+        }
+        .ingredients-modern li:last-child { border-bottom: 0; }
+        .ingredients-modern li::before {
+            content: "";
+            flex-shrink: 0;
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: var(--accent);
+            opacity: 0.55;
+        }
+        .ingredients-modern .ing-name {
+            flex: 1;
+            min-width: 0;
+            color: var(--text-primary);
+            font-size: 14.5px;
+            line-height: 1.4;
+            word-break: break-word;
+        }
+        .ingredients-modern .ing-amount {
+            color: var(--text-secondary);
+            font-size: 13px;
+            font-variant-numeric: tabular-nums;
+            text-align: right;
+            white-space: nowrap;
+        }
+
+        /* Шаги v2 — расширенный отступ, более «дышащий» layout */
+        .detail .steps li {
+            line-height: 1.55;
+            padding-top: 2px;
+        }
+
+        /* Блок «Советы» — мягкий жёлтый акцент */
+        .detail .tips h3 { color: #6b5b00; }
+        .detail .tips ul {
+            list-style: none;
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+        }
+        .detail .tips ul li {
+            color: #6b5b00;
+            line-height: 1.55;
+            padding: 0;
+            border: 0;
+        }
+
+        /* Блок «Хранение» — холодный синий акцент */
+        .detail .storage {
+            background: #f0f7ff;
+            border-left: 3px solid var(--accent);
+        }
+        .detail .storage h3 { color: #1f4d6b; }
+        .detail .storage p {
+            color: #1f4d6b;
+            line-height: 1.55;
+            word-break: break-word;
+        }
+
+        /* ============================================================= *
          * Состояния: загрузка / ошибка / пусто
          * ============================================================= */
         .placeholder {
@@ -1103,24 +1237,51 @@
             root.appendChild(screen);
         }
 
+        // -------------------------------------------------------------- //
+        //  Экран 3 — детальный рецепт
+        //
+        //  Дизайн:
+        //   - hero-плашка с иконкой и подписью «Нет фото»
+        //   - крупный заголовок, описание серым
+        //   - бейджи (тип / кухня / сложность / время / порции)
+        //   - КБЖУ — горизонтальная сетка из 4 колонок
+        //   - ингредиенты с круглыми маркерами и количеством справа
+        //   - нумерованные шаги с акцентными значками
+        //   - блок «💡 Советы» (жёлтый) и «🧊 Хранение» (синий)
+        //
+        //  Сама отрисовка вынесена в `renderRecipeBody`, обёрнутый
+        //  в try/catch: если в одном из блоков случится исключение
+        //  (например, неожиданный формат поля), мы покажем понятный
+        //  плейсхолдер «Не удалось отобразить», а не пустую страницу.
+        // -------------------------------------------------------------- //
         function renderDetailScreen() {
             const root = clearApp();
             const screen = el("div", { class: "screen detail" });
 
-            screen.appendChild(el("div", { class: "header" }, [
-                backBtn()
-            ]));
+            screen.appendChild(el("div", { class: "header" }, [backBtn()]));
 
             if (state.loading) {
-                screen.appendChild(el("div", { class: "skeleton row", style: "height:180px;margin-bottom:12px" }));
-                screen.appendChild(el("div", { class: "skeleton row", style: "height:240px" }));
+                screen.appendChild(el("div", {
+                    class: "skeleton",
+                    style: "height:220px;border-radius:16px;margin-bottom:18px"
+                }));
+                screen.appendChild(el("div", {
+                    class: "skeleton",
+                    style: "height:32px;border-radius:8px;margin-bottom:10px;width:70%"
+                }));
+                screen.appendChild(el("div", {
+                    class: "skeleton",
+                    style: "height:200px;border-radius:16px"
+                }));
                 root.appendChild(screen);
                 return;
             }
 
             if (state.error) {
-                screen.appendChild(placeholder("😕", "Не удалось загрузить", state.error,
-                    function () { loadRecipe(state.currentRecipeId); }));
+                screen.appendChild(placeholder(
+                    "😕", "Не удалось загрузить", state.error,
+                    function () { loadRecipe(state.currentRecipeId); }
+                ));
                 root.appendChild(screen);
                 return;
             }
@@ -1132,33 +1293,76 @@
                 return;
             }
 
-            // --- Заголовок / описание ---
-            screen.appendChild(el("h1", { class: "title" }, [r.title || "Без названия"]));
-            if (r.description) {
-                screen.appendChild(el("div", { class: "description" }, [r.description]));
+            try {
+                renderRecipeBody(screen, r);
+            } catch (e) {
+                console.error("❌ Ошибка рендера рецепта:", e, "Данные:", r);
+                screen.appendChild(placeholder(
+                    "⚠️",
+                    "Не удалось отобразить рецепт",
+                    e && e.message ? e.message : "Неизвестная ошибка рендера"
+                ));
             }
 
-            // --- Бейджи (кухня, тип блюда, сложность, время) ---
+            root.appendChild(screen);
+        }
+
+        // Тело детальной страницы — все секции в порядке отображения.
+        // Принимает уже созданный `screen` и кладёт в него блоки.
+        function renderRecipeBody(screen, r) {
+            // 1. Hero-плашка вместо фото. В будущем сюда подставится
+            //    реальное изображение по `r.image_url`, если поле появится.
+            screen.appendChild(el("div", { class: "recipe-hero" }, [
+                el("div", { class: "hero-icon" }, ["🍽️"]),
+                el("div", { class: "hero-text" }, ["Нет фото"])
+            ]));
+
+            // 2. Заголовок и описание. textContent через el() ставит
+            //    text-node, поэтому HTML внутри строк не интерпретируется.
+            screen.appendChild(el("h1", { class: "recipe-title" }, [
+                String(r.title || "Без названия")
+            ]));
+            const desc = (r.description || "").trim();
+            if (desc) {
+                screen.appendChild(el("p", { class: "recipe-description" }, [desc]));
+            }
+
+            // 3. Бейджи: тип блюда, кухня, сложность, время, порции.
             const badges = el("div", { class: "badges" });
-            if (r.cuisine)     badges.appendChild(el("div", { class: "badge" }, ["🍽 " + cuisineName(r.cuisine)]));
-            if (r.meal_type)   badges.appendChild(el("div", { class: "badge" }, [mealEmoji(r.meal_type) + " " + mealName(r.meal_type)]));
-            if (r.difficulty)  badges.appendChild(el("div", { class: "badge" }, [diffEmoji(r.difficulty) + " " + diffName(r.difficulty)]));
-            const total = Number(r.total_time) || 0;
-            const totalLabel = formatTime(total);
-            if (totalLabel)    badges.appendChild(el("div", { class: "badge" }, ["⏱ " + totalLabel]));
+            if (r.meal_type) {
+                badges.appendChild(el("div", { class: "badge" },
+                    [mealEmoji(r.meal_type) + " " + mealName(r.meal_type)]));
+            }
+            if (r.cuisine) {
+                badges.appendChild(el("div", { class: "badge" },
+                    ["🌍 " + cuisineName(r.cuisine)]));
+            }
+            if (r.difficulty) {
+                badges.appendChild(el("div", { class: "badge" },
+                    [diffEmoji(r.difficulty) + " " + diffName(r.difficulty)]));
+            }
+            const totalLabel = formatTime(r.total_time);
+            if (totalLabel) {
+                badges.appendChild(el("div", { class: "badge" }, ["⏱ " + totalLabel]));
+            }
             const servings = Number(r.servings) || 0;
-            if (servings)      badges.appendChild(el("div", { class: "badge" }, ["👥 " + servings + " порц."]));
+            if (servings) {
+                badges.appendChild(el("div", { class: "badge" },
+                    ["👥 " + servings + " порц."]));
+            }
             if (badges.childNodes.length) screen.appendChild(badges);
 
-            // --- КБЖУ ---
-            const nut = nutritionPerServing(r);
-            if (nut && (nut.calories || nut.protein || nut.fat || nut.carbs)) {
+            // 4. КБЖУ на порцию — компактная сетка 4 колонки.
+            const nut = nutritionPerServing(r) || {};
+            const hasNutrition = ["calories", "protein", "fat", "carbs"]
+                .some(function (k) { return Number(nut[k]) > 0; });
+            if (hasNutrition) {
                 const grid = el("div", { class: "nutrition" });
                 [
-                    { v: nut.calories, l: "ккал", e: "🔥" },
-                    { v: nut.protein,  l: "белки", e: "💪" },
-                    { v: nut.fat,      l: "жиры",  e: "🧈" },
-                    { v: nut.carbs,    l: "углев.", e: "🍚" }
+                    { v: nut.calories, l: "ккал",     e: "🔥" },
+                    { v: nut.protein,  l: "белки, г", e: "💪" },
+                    { v: nut.fat,      l: "жиры, г",  e: "🧈" },
+                    { v: nut.carbs,    l: "углев., г", e: "🍚" }
                 ].forEach(function (c) {
                     grid.appendChild(el("div", { class: "cell" }, [
                         el("div", { class: "val" }, [c.e + " " + (Number(c.v) || 0)]),
@@ -1168,12 +1372,13 @@
                 screen.appendChild(grid);
             }
 
-            // --- Ингредиенты ---
+            // 5. Ингредиенты — список с круглыми маркерами слева
+            //    и количеством справа.
             const ingredients = Array.isArray(r.ingredients) ? r.ingredients : [];
             if (ingredients.length) {
                 const section = el("div", { class: "section" });
                 section.appendChild(el("h3", {}, ["🛒 Ингредиенты"]));
-                const ul = el("ul", { class: "ingredients" });
+                const ul = el("ul", { class: "ingredients-modern" });
                 ingredients.forEach(function (ing) {
                     ul.appendChild(renderIngredient(ing));
                 });
@@ -1181,80 +1386,94 @@
                 screen.appendChild(section);
             }
 
-            // --- Шаги ---
+            // 6. Шаги — нумерованный список. Сортируем по `step_number`
+            //    на случай, если из БД пришли вразнобой.
             const steps = Array.isArray(r.steps) ? r.steps : [];
             if (steps.length) {
                 const section = el("div", { class: "section" });
                 section.appendChild(el("h3", {}, ["📝 Приготовление"]));
-                const ul = el("ol", { class: "steps" });
-                steps.forEach(function (s) {
-                    const desc = (s && typeof s === "object") ? (s.description || "") : String(s);
-                    ul.appendChild(el("li", {}, [desc]));
+                const ol = el("ol", { class: "steps" });
+                const sorted = steps.slice().sort(function (a, b) {
+                    const an = Number(a && a.step_number) || 0;
+                    const bn = Number(b && b.step_number) || 0;
+                    return an - bn;
                 });
-                section.appendChild(ul);
+                sorted.forEach(function (s) {
+                    const text = (s && typeof s === "object")
+                        ? String(s.description || "").trim()
+                        : String(s || "").trim();
+                    if (!text) return;
+                    ol.appendChild(el("li", {}, [text]));
+                });
+                section.appendChild(ol);
                 screen.appendChild(section);
             }
 
-            // --- Советы ---
-            const tips = Array.isArray(r.tips) ? r.tips.filter(Boolean) : [];
+            // 7. Советы — мягкий жёлтый блок.
+            const tips = Array.isArray(r.tips) ? r.tips.filter(function (t) {
+                return t != null && String(t).trim() !== "";
+            }) : [];
             if (tips.length) {
                 const section = el("div", { class: "section tips" });
                 section.appendChild(el("h3", {}, ["💡 Советы"]));
-                const ul = el("ul", { class: "ingredients" });
+                const ul = el("ul");
                 tips.forEach(function (t) {
-                    const txt = typeof t === "object" ? (t.text || JSON.stringify(t)) : String(t);
-                    ul.appendChild(el("li", {}, [
-                        el("span", { class: "ing-name" }, [txt])
-                    ]));
+                    const txt = (t && typeof t === "object")
+                        ? String(t.text || "").trim()
+                        : String(t).trim();
+                    if (!txt) return;
+                    ul.appendChild(el("li", {}, [txt]));
                 });
                 section.appendChild(ul);
                 screen.appendChild(section);
             }
 
-            // --- Хранение ---
-            if (r.storage) {
-                const section = el("div", { class: "section" });
+            // 8. Хранение — холодный синий блок.
+            const storage = String(r.storage || "").trim();
+            if (storage) {
+                const section = el("div", { class: "section storage" });
                 section.appendChild(el("h3", {}, ["🧊 Хранение"]));
-                section.appendChild(el("div", {}, [String(r.storage)]));
+                section.appendChild(el("p", {}, [storage]));
                 screen.appendChild(section);
             }
 
-            // --- Источник ---
+            // 9. Источник — внешняя ссылка.
             if (r.source_url) {
                 const section = el("div", { class: "section" });
                 section.appendChild(el("h3", {}, ["🔗 Источник"]));
-                const a = el("a", {
+                section.appendChild(el("a", {
                     href: r.source_url,
                     target: "_blank",
                     rel: "noopener",
                     style: "color:var(--accent);word-break:break-all"
-                }, [r.source_url]);
-                section.appendChild(a);
+                }, [String(r.source_url)]));
                 screen.appendChild(section);
             }
-
-            root.appendChild(screen);
         }
 
+        // Один пункт ингредиента: круглый маркер (через CSS ::before),
+        // название слева, количество + единица справа. Маркер нерискованно
+        // ставится во всех случаях — даже если ингредиент пришёл строкой.
         function renderIngredient(ing) {
             if (!ing || typeof ing !== "object") {
                 return el("li", {}, [
-                    el("span", { class: "ing-name" }, [String(ing || "")])
+                    el("span", { class: "ing-name" }, [String(ing || "—")]),
+                    el("span", { class: "ing-amount" }, [""])
                 ]);
             }
-            const parts = [];
-            if (ing.amount) parts.push(String(ing.amount));
-            if (ing.unit)   parts.push(String(ing.unit));
-            const left = parts.join(" ");
+            const amount = Number(ing.amount);
+            const amountStr = (Number.isFinite(amount) && amount > 0) ? String(amount) : "";
+            const unit = String(ing.unit || "").trim();
+            const right = [amountStr, unit].filter(Boolean).join(" ");
 
-            const li = el("li", {}, [
-                el("span", { class: "ing-amount" }, [left || "—"]),
-                el("span", { class: "ing-name" }, [
-                    ing.name || "",
-                    ing.notes ? " (" + ing.notes + ")" : ""
-                ].join(""))
+            const baseName = String(ing.name || "").trim();
+            const notes = String(ing.notes || "").trim();
+            const fullName = baseName + (notes ? " (" + notes + ")" : "");
+
+            return el("li", {}, [
+                el("span", { class: "ing-name" }, [fullName || "—"]),
+                el("span", { class: "ing-amount" }, [right || "—"])
             ]);
-            return li;
         }
 
         // ================================================================ //
@@ -1298,11 +1517,17 @@
             state.recipe = null;
             render();
             try {
+                console.info("📖 Загружаем рецепт:", recipeId);
                 state.recipe = await fetchRecipe(recipeId);
-                if (!state.recipe) state.error = "Рецепт не найден";
+                if (!state.recipe) {
+                    state.error = "Рецепт не найден";
+                    console.warn("⚠️ Рецепт не найден в Supabase, id =", recipeId);
+                } else {
+                    console.info("✅ Рецепт загружен:", state.recipe);
+                }
             } catch (e) {
                 state.error = e.message || "Неизвестная ошибка";
-                console.error(e);
+                console.error("❌ Ошибка загрузки рецепта:", e);
             } finally {
                 state.loading = false;
                 render();
