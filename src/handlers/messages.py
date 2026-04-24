@@ -103,10 +103,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     # Всё остальное — подсказка.
-    bot = _get_bot(context)
     await message.reply_text(
         _NOT_A_URL_HINT,
-        reply_markup=main_menu_keyboard(bot.config.webapp_url),
+        reply_markup=main_menu_keyboard(),
     )
 
 

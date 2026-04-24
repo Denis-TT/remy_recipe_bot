@@ -35,6 +35,22 @@ from .localization import Localization
 
 
 # --------------------------------------------------------------------------- #
+# Архитектурная заметка: где открывается Mini App
+# --------------------------------------------------------------------------- #
+# Mini App «Книга рецептов» доступен пользователю из двух мест:
+#   1. Menu Button бота (настраивается один раз в BotFather на тот же
+#      HTTPS-URL, что и `WEBAPP_URL`; Telegram сам держит его в UI
+#      рядом с полем ввода).
+#   2. Inline-меню `/menu` — там есть WebApp-кнопка с `web_app=...`.
+#
+# В Reply-клавиатуре (та, что всегда видна внизу) WebApp-кнопка намеренно
+# НЕ дублируется, чтобы не перегружать главный экран. Поэтому ниже в
+# `main_menu_keyboard` никакого `web_app` нет, а helper-функция для
+# KeyboardButton-WebApp удалена — нужен только inline-вариант.
+# --------------------------------------------------------------------------- #
+
+
+# --------------------------------------------------------------------------- #
 # Тексты кнопок-якорей (Reply-клавиатура)
 # --------------------------------------------------------------------------- #
 # Эти же строки используются в `handlers/messages.py` для маршрутизации
@@ -70,6 +86,10 @@ def webapp_button(
 ) -> Optional[InlineKeyboardButton]:
     """Вернуть `InlineKeyboardButton`-WebApp для заданного URL.
 
+    Используется только в :func:`menu_keyboard` — Reply-клавиатура
+    сознательно не содержит WebApp-кнопок (см. архитектурную заметку
+    в шапке модуля).
+
     Args:
         webapp_url: Адрес мини-приложения (должен быть HTTPS).
         label: Текст кнопки (по умолчанию «📖 Книга рецептов»).
@@ -82,40 +102,21 @@ def webapp_button(
     return InlineKeyboardButton(label, web_app=WebAppInfo(url=webapp_url))
 
 
-def webapp_reply_button(
-    webapp_url: str,
-    label: str = BTN_WEBAPP,
-) -> Optional[KeyboardButton]:
-    """Аналогично :func:`webapp_button`, но для Reply-клавиатуры."""
-    if not _is_valid_webapp_url(webapp_url):
-        return None
-    return KeyboardButton(label, web_app=WebAppInfo(url=webapp_url))
-
-
 # --------------------------------------------------------------------------- #
 # Reply-клавиатуры
 # --------------------------------------------------------------------------- #
 
-def main_menu_keyboard(webapp_url: str = "") -> ReplyKeyboardMarkup:
+def main_menu_keyboard() -> ReplyKeyboardMarkup:
     """Главная Reply-клавиатура, приветствующая пользователя.
 
-    Всегда содержит текстовую кнопку «📋 Меню». Если задан
-    HTTPS-URL мини-приложения, рядом добавляется WebApp-кнопка
-    «📖 Книга рецептов» — так Mini App открывается в один тап с
-    главного экрана.
-
-    Args:
-        webapp_url: Адрес мини-приложения. Пустая строка или не-HTTPS —
-            кнопка WebApp не добавляется.
+    Содержит единственную кнопку «📋 Меню». Mini App «📖 Книга
+    рецептов» сюда сознательно не добавляется — он открывается через
+    Menu Button бота (BotFather) и через inline-меню `/menu`, чтобы не
+    дублировать входную точку и не загромождать всегда видимую
+    клавиатуру.
     """
-    buttons: List[KeyboardButton] = [KeyboardButton(BTN_MENU)]
-
-    web_btn = webapp_reply_button(webapp_url)
-    if web_btn is not None:
-        buttons.append(web_btn)
-
     return ReplyKeyboardMarkup(
-        [buttons],
+        [[KeyboardButton(BTN_MENU)]],
         resize_keyboard=True,
         is_persistent=True,
     )
