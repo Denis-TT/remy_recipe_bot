@@ -27,8 +27,12 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
+import urllib.error
+import urllib.parse
+import urllib.request
 from abc import ABC, abstractmethod
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -293,6 +297,64 @@ class WebParser(BaseParser):
 # Реализация: YouTube (субтитры + опционально Data API: заголовок/описание)
 # --------------------------------------------------------------------------- #
 
+# User-Agent для oEmbed / публичной страницы watch (без Data API).
+_YT_PUBLIC_UA = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+)
+
+
+def _youtube_oembed_title(page_url: str) -> Tuple[str, Optional[str]]:
+    """Заголовок через публичный oEmbed (без ключа API). (title, reason_if_empty)."""
+    q = urllib.parse.urlencode({"url": page_url.strip(), "format": "json"})
+    u = "https://www.youtube.com/oembed?" + q
+    req = urllib.request.Request(u, headers={"User-Agent": _YT_PUBLIC_UA})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode("utf-8", errors="replace"))
+        title = str(data.get("title") or "").strip()
+        return (title, None if title else "oEmbed: пустой title")
+    except urllib.error.HTTPError as exc:
+        reason = f"oEmbed HTTP {exc.code} (видео скрыто, удалено или embed отключён)"
+        logger.warning("⚠️ %s", reason)
+        return "", reason
+    except Exception as exc:  # noqa: BLE001
+        reason = f"oEmbed: {type(exc).__name__}: {exc}"
+        logger.warning("⚠️ %s", reason)
+        return "", reason
+
+
+def _youtube_watch_page_description(video_id: str) -> Tuple[str, Optional[str]]:
+    """Короткое описание из meta og:description / description на /watch (без API)."""
+    watch = f"https://www.youtube.com/watch?v={video_id}"
+    req = urllib.request.Request(
+        watch,
+        headers={
+            "User-Agent": _YT_PUBLIC_UA,
+            "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=25) as r:
+            html = r.read().decode("utf-8", errors="replace")
+    except Exception as exc:  # noqa: BLE001
+        reason = f"страница watch: {type(exc).__name__}: {exc}"
+        logger.warning("⚠️ Не удалось загрузить HTML: %s", reason)
+        return "", reason
+    soup = BeautifulSoup(html, "lxml")
+    og = soup.find("meta", property="og:description")
+    if og and og.get("content"):
+        txt = str(og["content"]).strip()
+        if txt:
+            return txt, None
+    meta = soup.find("meta", attrs={"name": "description"})
+    if meta and meta.get("content"):
+        txt = str(meta["content"]).strip()
+        if txt:
+            return txt, None
+    return "", "на странице нет og:description / meta description"
+
+
 def _extract_youtube_video_id(url: str) -> str:
     """Вернуть 11-символьный video_id или пустую строку (watch, Shorts, youtu.be)."""
     s = (url or "").strip()
@@ -333,16 +395,17 @@ def _flatten_subtitle_fetch(data: Any) -> str:
 
 
 class YouTubeParser(BaseParser):
-    """YouTube: текст из субтитров и (опционально) snippet через Data API v3.
+    """YouTube: субтитры, затем (опц.) Data API, затем oEmbed и HTML watch.
 
-    * Субтитры: сначала ``ru``/``en``, иначе любая авто-расшифровка, иначе
-      любой доступный вариант.
-    * Data API: при ``YOUTUBE_API_KEY`` подмешиваются ``title`` и
-      ``description``; при ошибке/отсутствии ключа — продолжаем без них.
+    Порядок: ru/en и автоген на любом языке → YouTube Data API (ключ)
+    → oEmbed-заголовок → meta-описание со страницы. Без субтитров
+    остаётся доступный текст (описание), без необработанных падений.
     """
 
     source_type: str = "youtube"
     MAX_TEXT_LENGTH: int = 50_000
+
+    _RUNTIME_NO_TEXT = "Видео не содержит субтитров или описания"
 
     def __init__(self, youtube_api_key: str = "") -> None:
         self._api_key: str = (youtube_api_key or "").strip()
@@ -365,42 +428,67 @@ class YouTubeParser(BaseParser):
     async def parse(self, url: str) -> str:
         if not self.can_parse(url):
             raise ValueError(f"YouTubeParser не поддерживает URL: {url!r}")
-        # Тяжёлая логика — в потоке, чтобы не блокировать event loop.
         return await asyncio.to_thread(self._parse_sync, url)
 
     def _parse_sync(self, url: str) -> str:
         video_id = _extract_youtube_video_id(url)
         if not video_id or len(video_id) != 11:
             raise ValueError("Некорректный YouTube URL")
+        page_url = url.strip()
         logger.info("🎬 Обнаружено YouTube-видео: %s", video_id)
 
-        sub_text, _sub_lang, _sub_failed = self._load_subtitles(video_id)
+        sub_text, _sub_lang, sub_reason = self._load_subtitles(video_id)
+        if not sub_text and sub_reason:
+            logger.warning(
+                "⚠️ Субтитры не получены (%s). Пробуем описание и публичные источники.",
+                sub_reason,
+            )
 
-        title, description = self._load_snippet_or_empty(video_id, have_subs=bool(sub_text))
+        title, desc = self._load_snippet_data_api(video_id, have_subs=bool(sub_text))
+        if (title and title.strip()) or (desc and desc.strip()):
+            logger.info("📋 Получено описание через YouTube Data API")
 
-        if not sub_text and (title or description):
-            logger.warning("⚠️ Субтитры не найдены, извлекаю только описание")
-        if title or description:
-            logger.info("📋 Получено описание через YouTube API")
+        # Публичные fallback: oEmbed (заголовок), стр. watch (og:description)
+        oembed_title, _o_msg = _youtube_oembed_title(page_url) if not (title and title.strip()) else ("", None)
+        if oembed_title:
+            logger.info("📋 Заголовок получен через oEmbed (без Data API)")
+
+        page_desc, page_reason = ("", None)
+        if not (desc and desc.strip()):
+            page_desc, page_reason = _youtube_watch_page_description(video_id)
+            if page_desc:
+                logger.info("📋 Описание/фрагмент взяты с публичной страницы (meta og:description)")
+            elif page_reason:
+                logger.warning("⚠️ Публичная страница: %s", page_reason)
+
+        final_title = (title or oembed_title or "").strip()
+        final_desc = (desc or page_desc or "").strip()
+
+        if (final_title or final_desc) and not sub_text:
+            logger.warning(
+                "⚠️ Субтитры отсутствуют; используем заголовок и/или описание (см. причины выше)"
+            )
 
         parts: List[str] = []
-        if title:
-            parts.append(title.strip())
-        if description:
-            parts.append(description.strip())
+        if final_title:
+            parts.append(final_title)
+        if final_desc:
+            parts.append(final_desc)
         if sub_text:
             parts.append(sub_text)
 
         if not any(p.strip() for p in parts):
-            raise RuntimeError("Не удалось извлечь текст: субтитры и API недоступны")
+            logger.error("❌ %s (субтитры, Data API, oEmbed, meta-описание — всё пусто)", self._RUNTIME_NO_TEXT)
+            raise RuntimeError(self._RUNTIME_NO_TEXT)
 
         text = "\n\n".join(p for p in parts if p and p.strip())
         if len(text) > self.MAX_TEXT_LENGTH:
             text = text[: self.MAX_TEXT_LENGTH]
         return text
 
-    def _load_subtitles(self, video_id: str) -> Tuple[str, str, bool]:
-        """Субтитры: (текст, язык, была_ли_тех_ошибка_при_загрузке)."""
+    def _load_subtitles(self, video_id: str) -> Tuple[str, str, str]:
+        """Субтитры: (текст, язык, причина_пусто — для логов; пусто = «OK»)."""
+        from youtube_transcript_api import YouTubeTranscriptApi
         from youtube_transcript_api._errors import (  # type: ignore[import-not-found]
             NoTranscriptFound,
             TranscriptsDisabled,
@@ -411,71 +499,90 @@ class YouTubeParser(BaseParser):
         try:
             tlist = _youtube_list_transcripts(video_id)
         except VideoUnavailable as exc:
-            raise RuntimeError("Видео не найдено") from exc
+            msg = f"ролик недоступен для субтитров (VideoUnavailable: {exc})"
+            logger.warning("⚠️ %s", msg)
+            return self._fallback_get_transcript_only(video_id, YouTubeTranscriptApi, reason_prefix=msg)
         except TranscriptsDisabled as exc:
-            logger.warning("Субтитры отключены для видео: %s", exc)
-            return "", "", False
+            reason = f"субтитры отключены автором: {exc}"
+            logger.warning("⚠️ %s", reason)
+            return "", "", reason
         except Exception as exc:  # noqa: BLE001
-            logger.error("❌ Ошибка получения субтитров: %s", exc)
-            # Фолбэк: прямой get_transcript (другой кодовый путь, иногда срабатывает
-            # при сбоях list_transcripts / смене разметки YouTube).
-            try:
-                from youtube_transcript_api import YouTubeTranscriptApi
+            err_t = f"{type(exc).__name__}: {exc}"
+            logger.error("❌ list_transcripts: %s", err_t)
+            return self._fallback_get_transcript_only(
+                video_id, YouTubeTranscriptApi, reason_prefix=err_t
+            )
 
-                ytt = YouTubeTranscriptApi
-                try:
-                    raw_fb = ytt.get_transcript(  # type: ignore[attr-defined]
-                        video_id, languages=["ru", "en"]
-                    )
-                except Exception:  # noqa: BLE001
-                    raw_fb = ytt.get_transcript(video_id)  # type: ignore[attr-defined]
-            except Exception as exc2:  # noqa: BLE001
-                logger.error("❌ Ошибка получения субтитров: %s", exc2)
-                return "", "", True
-            sub_fb = _flatten_subtitle_fetch(raw_fb)
-            if sub_fb:
-                logger.info(
-                    "📝 Получены субтитры (фолбэк get_transcript): %s символов",
-                    self._format_number(len(sub_fb)),
-                )
-            return sub_fb, "auto", False
+        all_tr: List[Any] = []
+        try:
+            for t in tlist:  # type: ignore[operator]
+                all_tr.append(t)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("❌ обход списка дорожек: %s", exc)
+            all_tr = []
+
+        if not all_tr:
+            reason = "YouTube не вернул ни одной дорожки субтитров (пустой список)"
+            logger.warning("⚠️ %s", reason)
+            return "", "", reason
 
         tr_obj: Any = None
-        lang: str = ""
+        pick_reason = ""
+
         try:
             tr_obj = tlist.find_transcript(["ru", "en"])
+            pick_reason = "дорожка ru/en (ручная/автоген)"
         except NoTranscriptFound:
+            logger.info("ℹ️ субтитры ru/en не найдены (NoTranscriptFound) — ищем автоген/другой язык")
             tr_obj = None
-
-        if tr_obj is None:
-            for t in tlist:  # type: ignore[operator]
+            for t in all_tr:
                 if getattr(t, "is_generated", False):
                     tr_obj = t
+                    pick_reason = f"автоген, язык {getattr(t, 'language_code', '?')}"
                     break
-        if tr_obj is None:
-            for t in tlist:  # type: ignore[operator]
-                tr_obj = t
-                break
-        if tr_obj is None:
-            return "", "", False
+            if tr_obj is None and all_tr:
+                tr_obj = all_tr[0]
+                pick_reason = f"доступная дорожка, язык {getattr(tr_obj, 'language_code', '?')}"
 
-        lang = str(getattr(tr_obj, "language_code", None) or getattr(tr_obj, "language", None) or "?")
+        lang = str(
+            getattr(tr_obj, "language_code", None) or getattr(tr_obj, "language", None) or "?"
+        )
         try:
             raw = tr_obj.fetch()
         except Exception as exc:  # noqa: BLE001
-            logger.error("❌ Ошибка получения субтитров: %s", exc)
-            return "", "", True
-        sub_text = _flatten_subtitle_fetch(raw)
-        if sub_text:
-            logger.info(
-                "📝 Получены субтитры (%s): %s символов",
-                lang,
-                self._format_number(len(sub_text)),
-            )
-        return sub_text, lang, False
+            logger.error("❌ fetch() субтитров: %s: %s", type(exc).__name__, exc)
+            return "", "", f"сбой fetch: {type(exc).__name__}"
 
-    def _load_snippet_or_empty(self, video_id: str, have_subs: bool) -> Tuple[str, str]:
-        """Заголовок и описание; при отсутствии ключа или ошибке — пустые строки."""
+        sub_text = _flatten_subtitle_fetch(raw)
+        if not sub_text:
+            r = f"текст дорожки пуст ({pick_reason})"
+            logger.warning("⚠️ %s", r)
+            return "", "", r
+
+        logger.info("📝 Получены субтитры (%s): %s символов — %s", lang, self._format_number(len(sub_text)), pick_reason)
+        return sub_text, lang, ""
+
+    def _fallback_get_transcript_only(
+        self, video_id: str, ytt: Any, reason_prefix: str
+    ) -> Tuple[str, str, str]:
+        """Фолбэк get_transcript, если list_transcripts не сработал (другой путь)."""
+        try:
+            try:
+                raw = ytt.get_transcript(video_id, languages=["ru", "en"])  # type: ignore[attr-defined]
+            except Exception:  # noqa: BLE001
+                raw = ytt.get_transcript(video_id)  # type: ignore[attr-defined]
+        except Exception as exc2:  # noqa: BLE001
+            r = f"{reason_prefix}; get_transcript: {type(exc2).__name__}: {exc2}"
+            logger.error("❌ %s", r)
+            return "", "", r
+        sub = _flatten_subtitle_fetch(raw)
+        if sub:
+            logger.info("📝 Получены субтитры (get_transcript): %s символов", self._format_number(len(sub)))
+            return sub, "mixed", ""
+        return "", "", f"{reason_prefix}; get_transcript вернул пустой текст"
+
+    def _load_snippet_data_api(self, video_id: str, have_subs: bool) -> Tuple[str, str]:
+        """Заголовок и описание через Data API; никаких raise — пусто при ошибке."""
         if not self._api_key:
             return "", ""
         try:
@@ -490,14 +597,11 @@ class YouTubeParser(BaseParser):
             resp: Dict[str, Any] = req.execute()
         except HttpError as exc:  # type: ignore[misc]
             code = int(getattr(getattr(exc, "resp", None), "status", 0) or 0)
-            if code == 404 and not have_subs:
-                raise RuntimeError("Видео не найдено") from exc
-            if code == 404 and have_subs:
-                logger.warning("YouTube Data API: 404, используем только субтитры")
-            else:
-                logger.warning(
-                    "YouTube Data API: запрос не выполнен, продолжаем без описания: %s", exc
-                )
+            logger.warning(
+                "YouTube Data API: HTTP %s — продолжаем без snippet (oEmbed/HTML): %s",
+                code,
+                exc,
+            )
             return "", ""
         except Exception as exc:  # noqa: BLE001
             logger.warning("YouTube Data API: запрос не выполнен, продолжаем без описания: %s", exc)
@@ -506,9 +610,10 @@ class YouTubeParser(BaseParser):
         items = resp.get("items") or []
         if not items:
             if have_subs:
-                logger.warning("YouTube Data API: пустой ответ по id, остаёмся на субтитрах")
-                return "", ""
-            raise RuntimeError("Видео не найдено")
+                logger.warning("YouTube Data API: пустой items — оставляем только субтитры")
+            else:
+                logger.warning("YouTube Data API: пустой items (ид не найден или нет прав) — oEmbed / meta")
+            return "", ""
         sn: Dict[str, Any] = items[0].get("snippet") or {}
         return str(sn.get("title", "") or ""), str(sn.get("description", "") or "")
 
@@ -657,6 +762,16 @@ if __name__ == "__main__":
                 print(f"📝 YouTube, начало: {tyt[:200]!r}…")
         except Exception as exc:  # noqa: BLE001
             print(f"⚠️  YouTube (субтитры) пропущен/ошибка: {exc}")
+
+        # Shorts / видео без субтитров: только oEmbed + meta (без API ключа)
+        short_url = "https://www.youtube.com/shorts/fdqQJNXSDbI"
+        try:
+            tshort = await reg_subs.parse(short_url)
+            print(f"✅ Shorts (без Data API): {len(tshort)} символов")
+        except RuntimeError as exc:
+            print(f"ℹ️  Shorts: нет текста — {exc}")
+        except Exception as exc:  # noqa: BLE001
+            print(f"⚠️  Shorts: {exc}")
 
         # С YOUTUBE_API_KEY из .env/окружения (заголовок+описание+субтитры)
         import os
