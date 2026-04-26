@@ -4,7 +4,7 @@
 Отвечает за две задачи:
 
 1. **Нормализация** пользовательских/AI-значений ключевых полей рецепта
-   (`meal_type`, `difficulty`, `cuisine`) — приведение любого входного
+   (`meal_type`, `dish_type`, `main_ingredient`, `difficulty`, `cuisine`) — приведение любого входного
    значения (русское, английское, верхний/нижний регистр, множественное
    число) к строгому латинскому ключу.
 
@@ -27,6 +27,7 @@ class Localization:
     Класс объединяет два слоя:
 
     * *Статический* — методы нормализации (`normalize_meal_type`,
+      `normalize_dish_type`, `normalize_main_ingredient`,
       `normalize_difficulty`, `normalize_cuisine`, `normalize_recipe`).
       Они не зависят от языка и всегда возвращают латинский ключ.
 
@@ -53,12 +54,47 @@ class Localization:
 
     VALID_DIFFICULTY: List[str] = ["easy", "medium", "hard"]
 
+    VALID_DISH_TYPES: List[str] = [
+        "soup", "side", "salad", "appetizer", "main", "dessert",
+        "drink", "baking", "sauce", "preserve",
+    ]
+    VALID_MAIN_INGREDIENTS: List[str] = [
+        "chicken", "beef", "pork", "fish", "seafood", "vegetables",
+        "mushrooms", "eggs", "grains", "pasta", "cheese", "fruits",
+        "nuts", "dough", "other",
+    ]
+
     # --------------------------------------------------------------------- #
     # Словарь переводов
     # --------------------------------------------------------------------- #
 
     TRANSLATIONS: Dict[str, Dict[str, str]] = {
         "ru": {
+            "dish_type_soup": "Супы",
+            "dish_type_side": "Гарниры",
+            "dish_type_salad": "Салаты",
+            "dish_type_appetizer": "Закуски",
+            "dish_type_main": "Основные блюда",
+            "dish_type_dessert": "Десерты",
+            "dish_type_drink": "Напитки",
+            "dish_type_baking": "Выпечка",
+            "dish_type_sauce": "Соусы",
+            "dish_type_preserve": "Заготовки",
+            "main_ingredient_chicken": "Курица",
+            "main_ingredient_beef": "Говядина",
+            "main_ingredient_pork": "Свинина",
+            "main_ingredient_fish": "Рыба",
+            "main_ingredient_seafood": "Морепродукты",
+            "main_ingredient_vegetables": "Овощи",
+            "main_ingredient_mushrooms": "Грибы",
+            "main_ingredient_eggs": "Яйца",
+            "main_ingredient_grains": "Крупы и зерно",
+            "main_ingredient_pasta": "Паста",
+            "main_ingredient_cheese": "Сыр",
+            "main_ingredient_fruits": "Фрукты",
+            "main_ingredient_nuts": "Орехи",
+            "main_ingredient_dough": "Тесто",
+            "main_ingredient_other": "Другое",
             # Категории блюд
             "meal_type_breakfast": "Завтраки",
             "meal_type_lunch": "Обеды",
@@ -116,6 +152,36 @@ class Localization:
         "easy": "🟢",
         "medium": "🟡",
         "hard": "🔴",
+    }
+
+    DISH_TYPE_EMOJIS: Dict[str, str] = {
+        "soup": "🥣",
+        "side": "🍚",
+        "salad": "🥗",
+        "appetizer": "🥨",
+        "main": "🍽️",
+        "dessert": "🍰",
+        "drink": "🥤",
+        "baking": "🧁",
+        "sauce": "🫕",
+        "preserve": "🫙",
+    }
+    MAIN_INGREDIENT_EMOJIS: Dict[str, str] = {
+        "chicken": "🍗",
+        "beef": "🥩",
+        "pork": "🥓",
+        "fish": "🐟",
+        "seafood": "🦐",
+        "vegetables": "🥦",
+        "mushrooms": "🍄",
+        "eggs": "🥚",
+        "grains": "🌾",
+        "pasta": "🍝",
+        "cheese": "🧀",
+        "fruits": "🍎",
+        "nuts": "🥜",
+        "dough": "🥟",
+        "other": "📦",
     }
 
     # --------------------------------------------------------------------- #
@@ -292,6 +358,104 @@ class Localization:
         "другое": "other",
     }
 
+    _DISH_TYPE_ALIASES: Dict[str, str] = {
+        "soup": "soup",
+        "soups": "soup",
+        "суп": "soup",
+        "супы": "soup",
+        "бульон": "soup",
+        "side": "side",
+        "sides": "side",
+        "side dish": "side",
+        "гарнир": "side",
+        "гарниры": "side",
+        "garnish": "side",
+        "salad": "salad",
+        "салат": "salad",
+        "салаты": "salad",
+        "appetizer": "appetizer",
+        "закуска": "appetizer",
+        "закуски": "appetizer",
+        "starter": "appetizer",
+        "main": "main",
+        "main course": "main",
+        "основное": "main",
+        "основное блюдо": "main",
+        "второе": "main",
+        "dessert": "dessert",
+        "десерт": "dessert",
+        "десерты": "dessert",
+        "drink": "drink",
+        "напиток": "drink",
+        "напитки": "drink",
+        "beverage": "drink",
+        "baking": "baking",
+        "выпечка": "baking",
+        "sauce": "sauce",
+        "соус": "sauce",
+        "соусы": "sauce",
+        "preserve": "preserve",
+        "заготовка": "preserve",
+        "заготовки": "preserve",
+        "варенье": "preserve",
+    }
+
+    _MAIN_INGREDIENT_ALIASES: Dict[str, str] = {
+        "chicken": "chicken",
+        "курица": "chicken",
+        "куриное": "chicken",
+        "цыпленок": "chicken",
+        "beef": "beef",
+        "говядина": "beef",
+        "телятина": "beef",
+        "pork": "pork",
+        "свинина": "pork",
+        "бекон": "pork",
+        "bacon": "pork",
+        "fish": "fish",
+        "рыба": "fish",
+        "лосось": "fish",
+        "треска": "fish",
+        "тунец": "fish",
+        "seafood": "seafood",
+        "морепродукты": "seafood",
+        "креветки": "seafood",
+        "кальмар": "seafood",
+        "креветка": "seafood",
+        "vegetables": "vegetables",
+        "овощи": "vegetables",
+        "овощ": "vegetables",
+        "mushrooms": "mushrooms",
+        "грибы": "mushrooms",
+        "eggs": "eggs",
+        "яйца": "eggs",
+        "яйцо": "eggs",
+        "grains": "grains",
+        "крупа": "grains",
+        "крупы": "grains",
+        "рис": "grains",
+        "гречка": "grains",
+        "pasta": "pasta",
+        "паста": "pasta",
+        "макароны": "pasta",
+        "лапша": "pasta",
+        "noodles": "pasta",
+        "cheese": "cheese",
+        "сыр": "cheese",
+        "творог": "cheese",
+        "fruits": "fruits",
+        "фрукты": "fruits",
+        "фрукт": "fruits",
+        "nuts": "nuts",
+        "орехи": "nuts",
+        "орех": "nuts",
+        "dough": "dough",
+        "тесто": "dough",
+        "other": "other",
+        "другое": "other",
+        "прочее": "other",
+    }
+
     # --------------------------------------------------------------------- #
     # Конструктор
     # --------------------------------------------------------------------- #
@@ -449,33 +613,46 @@ class Localization:
         return cleaned
 
     @staticmethod
-    def normalize_recipe(recipe: Mapping[str, Any]) -> Dict[str, Any]:
-        """Нормализовать ключевые поля рецепта.
+    def normalize_dish_type(value: Any) -> str:
+        """Нормализовать тип блюда (суп, основное, …) — ключ из ``VALID_DISH_TYPES``.
 
-        Возвращает **новый** словарь — копию входного `recipe`,
-        в котором поля `meal_type`, `difficulty` и `cuisine` приведены
-        к каноническим ключам. Остальные поля не изменяются.
-        Если какого-то из трёх полей нет в исходном словаре, оно
-        будет добавлено со значением по умолчанию: ``"other"``,
-        ``"medium"`` и ``"other"`` соответственно.
-
-        Примеры:
-            >>> Localization.normalize_recipe(
-            ...     {"meal_type": "обед", "difficulty": "сложно",
-            ...      "cuisine": "японская", "title": "Рамен"}
-            ... ) == {"meal_type": "lunch", "difficulty": "hard",
-            ...      "cuisine": "japanese", "title": "Рамен"}
-            True
-
-        Args:
-            recipe: Словарь рецепта (например, разобранный JSON от AI).
-
-        Returns:
-            Новый словарь с нормализованными `meal_type`, `difficulty`,
-            `cuisine` и неизменёнными прочими полями.
+        По умолчанию ``"main"``.
         """
+        cleaned = Localization._clean(value)
+        if not cleaned:
+            return "main"
+        n = Localization._DISH_TYPE_ALIASES.get(cleaned)
+        if n is not None:
+            return n
+        if cleaned in Localization.VALID_DISH_TYPES:
+            return cleaned
+        return "main"
+
+    @staticmethod
+    def normalize_main_ingredient(value: Any) -> str:
+        """Нормализовать основной ингредиент — ключ из ``VALID_MAIN_INGREDIENTS``.
+
+        По умолчанию ``"other"``.
+        """
+        cleaned = Localization._clean(value)
+        if not cleaned:
+            return "other"
+        n = Localization._MAIN_INGREDIENT_ALIASES.get(cleaned)
+        if n is not None:
+            return n
+        if cleaned in Localization.VALID_MAIN_INGREDIENTS:
+            return cleaned
+        return "other"
+
+    @staticmethod
+    def normalize_recipe(recipe: Mapping[str, Any]) -> Dict[str, Any]:
+        """Нормализовать ключевые поля рецепта (латиница, канонические ключи)."""
         result: Dict[str, Any] = dict(recipe)
         result["meal_type"] = Localization.normalize_meal_type(result.get("meal_type"))
+        result["dish_type"] = Localization.normalize_dish_type(result.get("dish_type"))
+        result["main_ingredient"] = Localization.normalize_main_ingredient(
+            result.get("main_ingredient")
+        )
         result["difficulty"] = Localization.normalize_difficulty(result.get("difficulty"))
         result["cuisine"] = Localization.normalize_cuisine(result.get("cuisine"))
         return result
@@ -582,6 +759,28 @@ class Localization:
         """
         return self.translate(key, "cuisine")
 
+    def get_dish_type_name(self, key: str) -> str:
+        return self.translate(key, "dish_type")
+
+    def get_dish_type_emoji(self, key: str) -> str:
+        return self.DISH_TYPE_EMOJIS.get(key, self.DISH_TYPE_EMOJIS["main"])
+
+    def get_dish_type_display(self, key: str) -> str:
+        return f"{self.get_dish_type_emoji(key)} {self.get_dish_type_name(key)}"
+
+    def get_main_ingredient_name(self, key: str) -> str:
+        return self.translate(key, "main_ingredient")
+
+    def get_main_ingredient_emoji(self, key: str) -> str:
+        return self.MAIN_INGREDIENT_EMOJIS.get(
+            key, self.MAIN_INGREDIENT_EMOJIS["other"]
+        )
+
+    def get_main_ingredient_display(self, key: str) -> str:
+        return (
+            f"{self.get_main_ingredient_emoji(key)} {self.get_main_ingredient_name(key)}"
+        )
+
 
 # --------------------------------------------------------------------------- #
 # Встроенные тесты
@@ -618,12 +817,20 @@ if __name__ == "__main__":
     assert Localization.normalize_cuisine("vietnamese") == "vietnamese"
     assert Localization.normalize_cuisine(None) == "other"
 
+    assert Localization.normalize_dish_type("супы") == "soup"
+    assert Localization.normalize_dish_type(None) == "main"
+    assert Localization.normalize_main_ingredient("курица") == "chicken"
+    assert Localization.normalize_main_ingredient("pasta") == "pasta"
+    assert Localization.normalize_main_ingredient(None) == "other"
+
     # --- Нормализация целого рецепта ------------------------------------
     recipe = {"meal_type": "обед", "difficulty": "сложно", "cuisine": "японская"}
     normalized = Localization.normalize_recipe(recipe)
     assert normalized["meal_type"] == "lunch"
     assert normalized["difficulty"] == "hard"
     assert normalized["cuisine"] == "japanese"
+    assert normalized["dish_type"] == "main"
+    assert normalized["main_ingredient"] == "other"
     assert recipe["meal_type"] == "обед", "normalize_recipe не должна мутировать исходный dict"
 
     # Отсутствующие поля → значения по умолчанию
@@ -631,6 +838,8 @@ if __name__ == "__main__":
     assert defaults["meal_type"] == "other"
     assert defaults["difficulty"] == "medium"
     assert defaults["cuisine"] == "other"
+    assert defaults["dish_type"] == "main"
+    assert defaults["main_ingredient"] == "other"
     assert defaults["title"] == "Борщ"
 
     # --- Отображение ----------------------------------------------------
@@ -640,6 +849,8 @@ if __name__ == "__main__":
     assert loc.get_meal_type_name("dessert") == "Десерты"
     assert loc.get_meal_type_emoji("breakfast") == "🍳"
     assert loc.get_difficulty_name("hard") == "Сложно"
+    assert loc.get_dish_type_display("soup") == "🥣 Супы"
+    assert loc.get_main_ingredient_display("chicken") == "🍗 Курица"
 
     # Неизвестный ключ перевода → возвращаем исходный ключ
     assert loc.translate("banana", "cuisine") == "banana"

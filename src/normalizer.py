@@ -6,7 +6,7 @@
 GitHub Models API (совместимый с OpenAI Chat Completions) и
 возвращает строго структурированный `dict` с полями:
 
-* `title`, `description`, `cuisine`, `meal_type`, `difficulty`,
+* `title`, `description`, `cuisine`, `meal_type`, `dish_type`, `main_ingredient`, `difficulty`,
 * `prep_time`, `cook_time`, `total_time`, `servings`,
 * `ingredients` (список словарей), `steps` (список словарей),
 * `nutrition_per_serving`, `nutrition` (на 100 г),
@@ -15,9 +15,8 @@ GitHub Models API (совместимый с OpenAI Chat Completions) и
 
 После получения JSON от AI выполняется пост-обработка:
 пустые/подозрительные значения заменяются безопасными, а
-строковые ключи (`meal_type`, `difficulty`, `cuisine`) прогоняются
-через `Localization.normalize_recipe` — чтобы все варианты ответа
-AI сводились к каноническим латинским ключам.
+строковые поля (в т.ч. `meal_type`, `dish_type`, `main_ingredient`) приводятся
+к латинице в `Localization.normalize_recipe` после `_postprocess`.
 
 Использование:
 
@@ -56,6 +55,8 @@ Return ONLY a valid JSON object with this EXACT structure:
     "description": "Brief description in Russian (2-3 sentences)",
     "cuisine": "italian",
     "meal_type": "lunch",
+    "dish_type": "main",
+    "main_ingredient": "pasta",
     "difficulty": "medium",
     "prep_time": 20,
     "cook_time": 40,
@@ -81,18 +82,21 @@ Return ONLY a valid JSON object with this EXACT structure:
 ALLOWED VALUES:
 - cuisine: italian, russian, japanese, french, chinese, georgian, korean, indian, thai, mexican, mediterranean, american, european, asian, other
 - meal_type: breakfast, lunch, dinner, dessert, snack, salad, soup, baking, drink, other
+- dish_type (Latin only): soup, side, salad, appetizer, main, dessert, drink, baking, sauce, preserve
+- main_ingredient (Latin only): chicken, beef, pork, fish, seafood, vegetables, mushrooms, eggs, grains, pasta, cheese, fruits, nuts, dough, other
 - difficulty: easy, medium, hard
 
 CRITICAL RULES:
 1. ALL text fields (title, description, ingredients, steps, tips, storage) MUST be in Russian.
 2. meal_type MUST be one of the allowed values.
-3. difficulty MUST be one of: easy, medium, hard.
-4. cuisine MUST be in lower case English from the allowed list.
-5. Calculate REALISTIC nutrition based on ingredients and servings.
-6. prep_time + cook_time MUST equal total_time.
-7. DO NOT use placeholder values like "Untitled" or 0 for required fields.
-8. If information is missing, make an EDUCATED GUESS based on similar recipes.
-9. Return ONLY valid JSON, no markdown, no additional text.
+3. dish_type and main_ingredient MUST be lower-case English keys from the lists above; infer from recipe.
+4. difficulty MUST be one of: easy, medium, hard.
+5. cuisine MUST be in lower case English from the allowed list.
+6. Calculate REALISTIC nutrition based on ingredients and servings.
+7. prep_time + cook_time MUST equal total_time.
+8. DO NOT use placeholder values like "Untitled" or 0 for required fields.
+9. If information is missing, make an EDUCATED GUESS based on similar recipes.
+10. Return ONLY valid JSON, no markdown, no additional text.
 """
 
 
@@ -424,6 +428,7 @@ class RecipeNormalizer:
         for flag in ("is_vegetarian", "is_vegan", "is_gluten_free", "is_lactose_free"):
             data[flag] = bool(data.get(flag, False))
 
+        # dish_type / main_ingredient нормализуются один раз в normalize_recipe()
         return data
 
     # ------------------------------------------------------------------ #

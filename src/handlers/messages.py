@@ -9,8 +9,8 @@
   отображение с кнопками Сохранить/Не сохранять»;
 * Любой другой текст — короткая подсказка отправить ссылку.
 
-Дополнительно здесь живёт функция :func:`format_recipe`, которая
-собирает HTML-представление распарсенного рецепта.
+Дополнительно: :func:`format_recipe` и псевдоним :func:`format_recipe_for_telegram`
+(одна реализация) — HTML-карточка рецепта для Telegram.
 """
 
 from __future__ import annotations
@@ -218,16 +218,21 @@ def format_recipe(recipe: Mapping[str, Any], bot: "RemyBot") -> str:
     meal_type = recipe.get("meal_type") or "other"
     difficulty = recipe.get("difficulty") or "medium"
     cuisine = recipe.get("cuisine") or "other"
+    dish_type = recipe.get("dish_type") or "main"
+    main_ingredient = recipe.get("main_ingredient") or "other"
 
     title = _html_escape(str(recipe.get("title") or "Без названия").strip())
     meal_emoji = loc.get_meal_type_emoji(meal_type)
     meal_name = _html_escape(loc.get_meal_type_name(meal_type))
     cuisine_name = _html_escape(loc.get_cuisine_name(cuisine))
     difficulty_display = _html_escape(loc.get_difficulty_display(difficulty))
+    dish_line = _html_escape(loc.get_dish_type_display(dish_type))
+    main_line = _html_escape(loc.get_main_ingredient_display(main_ingredient))
 
     lines: List[str] = [
         f"{meal_emoji} <b>{title}</b>",
         "",
+        f"{dish_line} | {main_line}",
         f"🍽 {cuisine_name} | 📋 {meal_name} | {difficulty_display}",
     ]
 
@@ -283,6 +288,10 @@ def format_recipe(recipe: Mapping[str, Any], bot: "RemyBot") -> str:
         # Не режем по байтам грубо, чтобы не сломать HTML-тег.
         text = text[: _TG_MESSAGE_LIMIT - 40].rstrip() + "\n…\n<i>(сокращено)</i>"
     return text
+
+
+# Имя из ТЗ / внешних импортов: одна реализация, без дублирования в `utils.py`.
+format_recipe_for_telegram = format_recipe
 
 
 # --------------------------------------------------------------------------- #

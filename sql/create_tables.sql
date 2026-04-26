@@ -24,6 +24,8 @@ CREATE TABLE IF NOT EXISTS recipes (
     -- Категоризация (хранится в КАНОНИЧЕСКОЙ ЛАТИНИЦЕ — см. src/localization.py)
     cuisine                TEXT        DEFAULT 'other',
     meal_type              TEXT        DEFAULT 'other',
+    dish_type              TEXT        DEFAULT 'main',
+    main_ingredient        TEXT        DEFAULT 'other',
     difficulty             TEXT        DEFAULT 'medium',
 
     -- Время приготовления (минуты)
@@ -67,6 +69,9 @@ CREATE TABLE IF NOT EXISTS recipes (
 CREATE INDEX IF NOT EXISTS idx_recipes_user_id     ON recipes (user_id);
 CREATE INDEX IF NOT EXISTS idx_recipes_meal_type   ON recipes (meal_type);
 CREATE INDEX IF NOT EXISTS idx_recipes_user_meal   ON recipes (user_id, meal_type);
+CREATE INDEX IF NOT EXISTS idx_recipes_dish_type   ON recipes (dish_type);
+CREATE INDEX IF NOT EXISTS idx_recipes_main_ingredient ON recipes (main_ingredient);
+CREATE INDEX IF NOT EXISTS idx_recipes_dish_ingredient ON recipes (dish_type, main_ingredient);
 CREATE INDEX IF NOT EXISTS idx_recipes_created_at  ON recipes (created_at DESC);
 
 

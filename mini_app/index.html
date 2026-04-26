@@ -195,6 +195,27 @@
             flex-wrap: wrap;
         }
         .recipe-card .meta span { white-space: nowrap; }
+        .recipe-card-badges {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 6px;
+            margin-top: 8px;
+        }
+        .recipe-card-badges .mini-badge {
+            font-size: 11px;
+            font-weight: 600;
+            padding: 3px 8px;
+            border-radius: 999px;
+            background: rgba(42, 171, 238, 0.12);
+            color: #0a6a8d;
+            border: 1px solid rgba(42, 171, 238, 0.25);
+        }
+        /* Приём пищи (meal_type) — отдельно от навигации dish_type / main_ingredient */
+        .recipe-card-badges .mini-badge--meal {
+            background: rgba(0, 0, 0, 0.05);
+            color: #444;
+            border-color: rgba(0, 0, 0, 0.1);
+        }
 
         /* ============================================================= *
          * Экран 3 — детальный рецепт
@@ -820,6 +841,35 @@
                 european:      "Европейская",
                 asian:         "Азиатская",
                 other:         "Другая"
+            },
+            dish_type: {
+                soup: { name: "Супы", emoji: "🥣" },
+                side: { name: "Гарниры", emoji: "🍚" },
+                salad: { name: "Салаты", emoji: "🥗" },
+                appetizer: { name: "Закуски", emoji: "🥨" },
+                main: { name: "Основные блюда", emoji: "🍽️" },
+                dessert: { name: "Десерты", emoji: "🍰" },
+                drink: { name: "Напитки", emoji: "🥤" },
+                baking: { name: "Выпечка", emoji: "🧁" },
+                sauce: { name: "Соусы", emoji: "🫕" },
+                preserve: { name: "Заготовки", emoji: "🫙" }
+            },
+            main_ingredient: {
+                chicken: { name: "Курица", emoji: "🍗" },
+                beef: { name: "Говядина", emoji: "🥩" },
+                pork: { name: "Свинина", emoji: "🥓" },
+                fish: { name: "Рыба", emoji: "🐟" },
+                seafood: { name: "Морепродукты", emoji: "🦐" },
+                vegetables: { name: "Овощи", emoji: "🥦" },
+                mushrooms: { name: "Грибы", emoji: "🍄" },
+                eggs: { name: "Яйца", emoji: "🥚" },
+                grains: { name: "Крупы и зерно", emoji: "🌾" },
+                pasta: { name: "Паста", emoji: "🍝" },
+                cheese: { name: "Сыр", emoji: "🧀" },
+                fruits: { name: "Фрукты", emoji: "🍎" },
+                nuts: { name: "Орехи", emoji: "🥜" },
+                dough: { name: "Тесто", emoji: "🥟" },
+                other: { name: "Другое", emoji: "📦" }
             }
         };
 
@@ -830,6 +880,18 @@
         function cuisineName(key) {
             if (!key) return "";
             return LOCALE.cuisine[key] || key;
+        }
+        function dishName(key) {
+            return (LOCALE.dish_type[key] || LOCALE.dish_type.main).name;
+        }
+        function dishEmoji(key) {
+            return (LOCALE.dish_type[key] || LOCALE.dish_type.main).emoji;
+        }
+        function mainIngName(key) {
+            return (LOCALE.main_ingredient[key] || LOCALE.main_ingredient.other).name;
+        }
+        function mainIngEmoji(key) {
+            return (LOCALE.main_ingredient[key] || LOCALE.main_ingredient.other).emoji;
         }
 
         // ================================================================ //
@@ -857,40 +919,35 @@
             return res.json();
         }
 
-        async function fetchCategories(userId) {
-            // Демо-режим: user_id — строка "demo_user", в БД поле BIGINT,
-            // любой такой запрос вернёт HTTP 400 (invalid input syntax).
-            // Сразу отдаём пустой список — на экране категорий рендерится
-            // authErrorPlaceholder() с инструкцией.
-            if (IS_DEMO) return [];
-
-            // Берём только meal_type — меньше трафика.
+        // Навигация в приложении: dish_type → main_ingredient. Поле meal_type
+        // (завтрак/обед/ужин) — другая ось: не фильтруем по нему, но показываем
+        // на карточках и в деталях вместе с dish/main.
+        async function fetchDishTree(userId) {
+            if (IS_DEMO) return Object.create(null);
             const rows = await apiGet(
-                "recipes?user_id=eq." + encodeURIComponent(userId) + "&select=meal_type"
+                "recipes?user_id=eq." + encodeURIComponent(userId) +
+                "&select=dish_type,main_ingredient"
             );
-            const counts = Object.create(null);
+            const tree = Object.create(null);
             rows.forEach(function (row) {
-                const key = row.meal_type || "other";
-                counts[key] = (counts[key] || 0) + 1;
+                const d = row.dish_type || "main";
+                const m = row.main_ingredient || "other";
+                if (!tree[d]) tree[d] = Object.create(null);
+                tree[d][m] = (tree[d][m] || 0) + 1;
             });
-            const list = Object.keys(counts).map(function (key) {
-                return { key: key, count: counts[key] };
-            });
-            list.sort(function (a, b) { return b.count - a.count; });
-            return list;
+            return tree;
         }
 
-        async function fetchRecipes(userId, mealType) {
-            // См. fetchCategories: в демо-режиме запрос к Supabase всё равно
-            // упадёт на BIGINT-касте user_id — возвращаем пустой список.
+        async function fetchRecipes(userId, dishType, mainIngredient) {
             if (IS_DEMO) return [];
-
-            const path =
+            return apiGet(
                 "recipes?user_id=eq." + encodeURIComponent(userId) +
-                "&meal_type=eq." + encodeURIComponent(mealType) +
+                "&dish_type=eq." + encodeURIComponent(dishType) +
+                "&main_ingredient=eq." + encodeURIComponent(mainIngredient) +
                 "&order=created_at.desc&limit=50" +
-                "&select=id,title,prep_time,cook_time,total_time,servings,difficulty,nutrition_per_serving";
-            return apiGet(path);
+                "&select=id,title,prep_time,cook_time,total_time,servings," +
+                "difficulty,meal_type,cuisine,dish_type,main_ingredient,nutrition_per_serving"
+            );
         }
 
         async function fetchRecipe(recipeId) {
@@ -910,10 +967,11 @@
         // ================================================================ //
 
         const state = {
-            screen: "categories",     // categories | recipes | detail
-            stack: [],                // история для "Назад"
-            categories: null,
-            currentCategory: null,
+            screen: "dish_types",
+            stack: [],
+            dishTree: null,
+            currentDishType: null,
+            currentMainIngredient: null,
             recipes: null,
             currentRecipeId: null,
             recipe: null,
@@ -924,7 +982,8 @@
         function navigate(next) {
             state.stack.push({
                 screen: state.screen,
-                currentCategory: state.currentCategory,
+                currentDishType: state.currentDishType,
+                currentMainIngredient: state.currentMainIngredient,
                 currentRecipeId: state.currentRecipeId
             });
             Object.assign(state, next);
@@ -939,14 +998,13 @@
                 return;
             }
             state.screen = prev.screen;
-            state.currentCategory = prev.currentCategory;
+            state.currentDishType = prev.currentDishType;
+            state.currentMainIngredient = prev.currentMainIngredient;
             state.currentRecipeId = prev.currentRecipeId;
             state.error = null;
             render();
-
-            // Дозагрузим ранее просмотренный рецепт, если это нужно
-            if (state.screen === "recipes" && state.currentCategory) {
-                loadRecipes(state.currentCategory);
+            if (state.screen === "recipes" && state.currentDishType && state.currentMainIngredient) {
+                loadRecipes(state.currentDishType, state.currentMainIngredient);
             }
         }
 
@@ -958,7 +1016,7 @@
         function syncTelegramBackButton() {
             if (!tg || !tg.BackButton) return;
             try {
-                if (state.screen === "categories") tg.BackButton.hide();
+                if (state.screen === "dish_types") tg.BackButton.hide();
                 else tg.BackButton.show();
             } catch (_) { /* noop */ }
         }
@@ -1061,7 +1119,7 @@
                 hint,
                 el("button", {
                     class: "retry primary",
-                    onclick: function () { loadCategories(); }
+                    onclick: function () { loadDishTree(); }
                 }, ["🔄 Попробовать ещё раз"])
             ];
             if (tg) {
@@ -1111,7 +1169,7 @@
         //  Рендеры экранов
         // ================================================================ //
 
-        function renderCategoriesScreen() {
+        function renderDishTypesScreen() {
             const root = clearApp();
             const screen = el("div", { class: "screen" });
 
@@ -1128,13 +1186,14 @@
             }
 
             if (state.error) {
-                screen.appendChild(placeholder("😕", "Не удалось загрузить", state.error, loadCategories));
+                screen.appendChild(placeholder("😕", "Не удалось загрузить", state.error, loadDishTree));
                 root.appendChild(screen);
                 return;
             }
 
-            const categories = state.categories || [];
-            if (categories.length === 0) {
+            const tree = state.dishTree;
+            const dkeys = tree ? Object.keys(tree) : [];
+            if (dkeys.length === 0) {
                 if (IS_DEMO) {
                     screen.appendChild(authErrorPlaceholder());
                 } else {
@@ -1149,22 +1208,68 @@
                 return;
             }
 
+            const rows = dkeys.map(function (dk) {
+                const sub = tree[dk];
+                let total = 0;
+                Object.keys(sub).forEach(function (mk) { total += sub[mk]; });
+                return { key: dk, count: total };
+            });
+            rows.sort(function (a, b) { return b.count - a.count; });
+
             const grid = el("div", { class: "categories" });
-            categories.forEach(function (cat) {
+            rows.forEach(function (row) {
                 grid.appendChild(el("div", {
                     class: "category-card",
                     role: "button",
                     tabindex: "0",
-                    onclick: function () { openCategory(cat.key); }
+                    onclick: function () { openDishType(row.key); }
                 }, [
-                    el("div", { class: "emoji" }, [mealEmoji(cat.key)]),
-                    el("div", { class: "name" },  [mealName(cat.key)]),
-                    el("div", { class: "count" }, [cat.count + " рецептов"])
+                    el("div", { class: "emoji" }, [dishEmoji(row.key)]),
+                    el("div", { class: "name" },  [dishName(row.key)]),
+                    el("div", { class: "count" }, [row.count + " рецептов"])
                 ]));
             });
 
             screen.appendChild(grid);
             screen.appendChild(closeButton());
+            root.appendChild(screen);
+        }
+
+        function renderMainIngredientsScreen() {
+            const root = clearApp();
+            const screen = el("div", { class: "screen" });
+            const dk = state.currentDishType || "main";
+
+            screen.appendChild(el("div", { class: "header" }, [
+                backBtn(),
+                el("h1", { class: "title" }, [dishEmoji(dk) + " " + dishName(dk)])
+            ]));
+
+            const sub = (state.dishTree && state.dishTree[dk]) || {};
+            const mkeys = Object.keys(sub);
+            if (mkeys.length === 0) {
+                screen.appendChild(placeholder("📭", "Нет рецептов"));
+                root.appendChild(screen);
+                return;
+            }
+
+            const rows = mkeys.map(function (mk) { return { key: mk, count: sub[mk] }; });
+            rows.sort(function (a, b) { return b.count - a.count; });
+
+            const grid = el("div", { class: "categories" });
+            rows.forEach(function (row) {
+                grid.appendChild(el("div", {
+                    class: "category-card",
+                    role: "button",
+                    tabindex: "0",
+                    onclick: function () { openMainIngredient(row.key); }
+                }, [
+                    el("div", { class: "emoji" }, [mainIngEmoji(row.key)]),
+                    el("div", { class: "name" },  [mainIngName(row.key)]),
+                    el("div", { class: "count" }, [row.count + " рецептов"])
+                ]));
+            });
+            screen.appendChild(grid);
             root.appendChild(screen);
         }
 
@@ -1180,11 +1285,13 @@
         function renderRecipesScreen() {
             const root = clearApp();
             const screen = el("div", { class: "screen" });
+            const dk = state.currentDishType || "main";
+            const mk = state.currentMainIngredient || "other";
+            const hdr = mainIngEmoji(mk) + " " + mainIngName(mk) + " · " + dishName(dk);
 
-            const key = state.currentCategory || "other";
             screen.appendChild(el("div", { class: "header" }, [
                 backBtn(),
-                el("h1", { class: "title" }, [mealEmoji(key) + " " + mealName(key)])
+                el("h1", { class: "title" }, [hdr])
             ]));
 
             if (state.loading) {
@@ -1197,7 +1304,7 @@
 
             if (state.error) {
                 screen.appendChild(placeholder("😕", "Не удалось загрузить", state.error,
-                    function () { loadRecipes(state.currentCategory); }));
+                    function () { loadRecipes(state.currentDishType, state.currentMainIngredient); }));
                 root.appendChild(screen);
                 return;
             }
@@ -1218,7 +1325,19 @@
                 const totalLabel = formatTime(total);
                 if (totalLabel) metaParts.push(el("span", {}, ["⏱ " + totalLabel]));
                 if (cal) metaParts.push(el("span", {}, ["🔥 " + cal + " ккал"]));
-                if (r.difficulty) metaParts.push(el("span", {}, [diffEmoji(r.difficulty) + " " + diffName(r.difficulty)]));
+                if (r.difficulty) {
+                    metaParts.push(el("span", {}, [diffEmoji(r.difficulty) + " " + diffName(r.difficulty)]));
+                }
+                const bds = el("div", { class: "recipe-card-badges" });
+                bds.appendChild(el("span", { class: "mini-badge" },
+                    [dishEmoji(r.dish_type || dk) + " " + dishName(r.dish_type || dk)]));
+                bds.appendChild(el("span", { class: "mini-badge" },
+                    [mainIngEmoji(r.main_ingredient || mk) + " " + mainIngName(r.main_ingredient || mk)]));
+                if (r.meal_type) {
+                    bds.appendChild(el("span", {
+                        class: "mini-badge mini-badge--meal"
+                    }, [mealEmoji(r.meal_type) + " " + mealName(r.meal_type)]));
+                }
 
                 list.appendChild(el("div", {
                     class: "recipe-card",
@@ -1227,6 +1346,7 @@
                     onclick: function () { openRecipe(r.id); }
                 }, [
                     el("div", { class: "name" }, [r.title || "Без названия"]),
+                    bds,
                     metaParts.length
                         ? el("div", { class: "meta" }, metaParts)
                         : null
@@ -1327,8 +1447,16 @@
                 screen.appendChild(el("p", { class: "recipe-description" }, [desc]));
             }
 
-            // 3. Бейджи: тип блюда, кухня, сложность, время, порции.
+            // 3. Бейджи: dish_type, main_ingredient; приём пищи, кухня, …
             const badges = el("div", { class: "badges" });
+            if (r.dish_type) {
+                badges.appendChild(el("div", { class: "badge" },
+                    [dishEmoji(r.dish_type) + " " + dishName(r.dish_type)]));
+            }
+            if (r.main_ingredient) {
+                badges.appendChild(el("div", { class: "badge" },
+                    [mainIngEmoji(r.main_ingredient) + " " + mainIngName(r.main_ingredient)]));
+            }
             if (r.meal_type) {
                 badges.appendChild(el("div", { class: "badge" },
                     [mealEmoji(r.meal_type) + " " + mealName(r.meal_type)]));
@@ -1480,12 +1608,12 @@
         //  Загрузчики данных
         // ================================================================ //
 
-        async function loadCategories() {
+        async function loadDishTree() {
             state.loading = true;
             state.error = null;
             render();
             try {
-                state.categories = await fetchCategories(USER_ID);
+                state.dishTree = await fetchDishTree(USER_ID);
             } catch (e) {
                 state.error = e.message || "Неизвестная ошибка";
                 console.error(e);
@@ -1495,13 +1623,13 @@
             }
         }
 
-        async function loadRecipes(mealType) {
+        async function loadRecipes(dishType, mainIngredient) {
             state.loading = true;
             state.error = null;
             state.recipes = null;
             render();
             try {
-                state.recipes = await fetchRecipes(USER_ID, mealType);
+                state.recipes = await fetchRecipes(USER_ID, dishType, mainIngredient);
             } catch (e) {
                 state.error = e.message || "Неизвестная ошибка";
                 console.error(e);
@@ -1538,13 +1666,38 @@
         //  Actions
         // ================================================================ //
 
-        function openCategory(key) {
+        function openDishType(dishKey) {
+            const sub = (state.dishTree && state.dishTree[dishKey]) || {};
+            const mkeys = Object.keys(sub);
+            if (mkeys.length === 1) {
+                const only = mkeys[0];
+                navigate({
+                    screen: "recipes",
+                    currentDishType: dishKey,
+                    currentMainIngredient: only,
+                    recipes: null
+                });
+                loadRecipes(dishKey, only);
+                return;
+            }
             navigate({
-                screen: "recipes",
-                currentCategory: key,
+                screen: "main_ingredients",
+                currentDishType: dishKey,
+                currentMainIngredient: null,
                 recipes: null
             });
-            loadRecipes(key);
+        }
+
+        function openMainIngredient(mainKey) {
+            const dk = state.currentDishType;
+            if (!dk) return;
+            navigate({
+                screen: "recipes",
+                currentDishType: dk,
+                currentMainIngredient: mainKey,
+                recipes: null
+            });
+            loadRecipes(dk, mainKey);
         }
 
         function openRecipe(id) {
@@ -1564,7 +1717,8 @@
         // ================================================================ //
 
         function render() {
-            if (state.screen === "categories") renderCategoriesScreen();
+            if (state.screen === "dish_types") renderDishTypesScreen();
+            else if (state.screen === "main_ingredients") renderMainIngredientsScreen();
             else if (state.screen === "recipes") renderRecipesScreen();
             else if (state.screen === "detail") renderDetailScreen();
             syncTelegramBackButton();
@@ -1587,7 +1741,7 @@
         window.addEventListener("DOMContentLoaded", function () {
             mountDemoBadge();
             render();
-            loadCategories();
+            loadDishTree();
         });
 
         // Telegram умеет менять тему по ходу сеанса — подхватим изменение
@@ -1605,7 +1759,7 @@
         // Экспортируем минимум для ручного тестирования из DevTools.
         window.__remy = {
             state: state,
-            loadCategories: loadCategories,
+            loadDishTree: loadDishTree,
             loadRecipes: loadRecipes,
             loadRecipe: loadRecipe,
             LOCALE: LOCALE

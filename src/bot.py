@@ -236,12 +236,17 @@ if __name__ == "__main__":
     assert 1 in bot.temp_recipes and 2 not in bot.temp_recipes
 
     # --- Форматирование рецепта ---------------------------------------- #
-    from src.handlers.messages import format_recipe  # noqa: E402
+    from src.handlers.messages import (  # noqa: E402
+        format_recipe,
+        format_recipe_for_telegram,
+    )
 
     demo = {
         "title": "Борщ классический",
         "description": "",
         "meal_type": "lunch",
+        "dish_type": "soup",
+        "main_ingredient": "beef",
         "difficulty": "medium",
         "cuisine": "russian",
         "prep_time": 20,
@@ -260,11 +265,13 @@ if __name__ == "__main__":
     }
 
     text = format_recipe(demo, bot)
+    assert text == format_recipe_for_telegram(demo, bot)
     assert "Борщ классический" in text
     assert "🍲" in text
     assert "Русская" in text
     assert "Обеды" in text
     assert "Средне" in text
+    assert "Супы" in text and "Говядина" in text  # dish_type + main_ingredient
     assert "500" in text and "Говядина" in text
     assert "1. Сварить бульон." in text
     assert "350" in text and "ккал" in text

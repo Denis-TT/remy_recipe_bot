@@ -37,7 +37,7 @@ logger = logging.getLogger(__name__)
 _ALLOWED_COLUMNS = frozenset({
     "user_id",
     "title", "description",
-    "cuisine", "meal_type", "difficulty",
+    "cuisine", "meal_type", "dish_type", "main_ingredient", "difficulty",
     "prep_time", "cook_time", "total_time", "servings",
     "ingredients", "steps",
     "nutrition", "nutrition_per_serving", "total_nutrition",
@@ -101,8 +101,9 @@ class SupabaseStorage(BaseStorage):
         """Сохранить новый рецепт в таблицу ``recipes``.
 
         Перед отправкой выполняется:
-        1. `Localization.normalize_recipe` — чтобы `meal_type`,
-           `difficulty` и `cuisine` хранились в канонической латинице.
+        1. `Localization.normalize_recipe` — чтобы `meal_type`, `dish_type`,
+           `main_ingredient`, `difficulty` и `cuisine` хранились в
+           канонической латинице.
         2. Фильтрация полей по `_ALLOWED_COLUMNS` — лишние ключи
            (например, сгенерированные AI-моделью) отбрасываются, чтобы
            PostgREST не ответил ошибкой 400 «unknown column».
