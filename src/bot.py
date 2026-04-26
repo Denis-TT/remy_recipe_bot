@@ -82,7 +82,7 @@ class RemyBot:
         self.config: Config = cfg if cfg is not None else default_config
 
         self.loc: Localization = Localization("ru")
-        self.parser: ParserRegistry = create_parser_registry()
+        self.parser: ParserRegistry = create_parser_registry(self.config)
         self.normalizer: RecipeNormalizer = RecipeNormalizer(self.config.github_token)
         self.storage: SupabaseStorage = SupabaseStorage(
             self.config.supabase_url,

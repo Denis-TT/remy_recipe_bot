@@ -42,6 +42,8 @@ class Config:
     log_level: str = "INFO"
     webapp_url: str = ""
     environment: str = "production"
+    # Data API (описание/заголовок). Без ключа YouTubeParser использует субтитры.
+    youtube_api_key: str = ""
 
     @property
     def is_development(self) -> bool:
@@ -92,6 +94,8 @@ class Config:
 
         webapp_url = os.getenv("WEBAPP_URL", "").strip()
 
+        youtube_api_key = os.getenv("YOUTUBE_API_KEY", "").strip()
+
         environment = os.getenv("ENVIRONMENT", "production").strip().lower() or "production"
         if environment not in _ALLOWED_ENVIRONMENTS:
             print(
@@ -109,6 +113,7 @@ class Config:
             log_level=log_level,
             webapp_url=webapp_url,
             environment=environment,
+            youtube_api_key=youtube_api_key,
         )
 
     @staticmethod
