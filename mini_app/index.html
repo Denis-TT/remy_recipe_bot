@@ -70,8 +70,17 @@
             display: flex;
             align-items: center;
             gap: 8px;
-            margin-bottom: 20px;
+            margin-bottom: 12px;
             min-height: 32px;
+        }
+        .home-hint {
+            text-align: center;
+            color: #8e8e93;
+            font-size: 14px;
+            font-style: italic;
+            line-height: 1.4;
+            margin: 8px 0 16px;
+            padding: 0 8px;
         }
 
         .back-btn {
@@ -117,6 +126,7 @@
         }
 
         .category-card {
+            position: relative;
             background: var(--card-bg);
             border-radius: var(--radius-lg);
             padding: 18px 16px;
@@ -146,6 +156,25 @@
             color: var(--text-secondary);
             margin-top: 2px;
         }
+        /* iOS-стиль: количество непросмотренных рецептов в категории */
+        .category-new-count {
+            position: absolute;
+            top: 6px;
+            right: 4px;
+            min-width: 20px;
+            height: 20px;
+            padding: 0 6px;
+            border-radius: 999px;
+            background: #ff3b30;
+            color: #fff;
+            font-size: 11px;
+            font-weight: 700;
+            line-height: 20px;
+            text-align: center;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.2);
+            transform: translate(4px, -4px);
+            transition: opacity 0.15s ease;
+        }
 
         .close-btn {
             display: block;
@@ -173,12 +202,30 @@
         }
 
         .recipe-card {
+            position: relative;
             background: var(--card-bg);
             border-radius: var(--radius-lg);
             padding: 14px 16px;
             box-shadow: var(--shadow-md);
             cursor: pointer;
-            transition: transform 0.12s ease;
+            transition: transform 0.12s ease, box-shadow 0.12s ease;
+        }
+        .recipe-card--unseen {
+            padding-top: 20px;
+        }
+        .recipe-new-tag {
+            position: absolute;
+            top: 8px;
+            left: 10px;
+            font-size: 10px;
+            font-weight: 700;
+            letter-spacing: 0.2px;
+            color: #fff;
+            background: rgba(52, 199, 89, 0.92);
+            padding: 3px 7px;
+            border-radius: 4px;
+            z-index: 1;
+            transition: opacity 0.15s ease;
         }
         .recipe-card:active { transform: scale(0.98); }
         .recipe-card .name {
@@ -919,23 +966,117 @@
             return res.json();
         }
 
-        // Навигация в приложении: dish_type → main_ingredient. Поле meal_type
-        // (завтрак/обед/ужин) — другая ось: не фильтруем по нему, но показываем
-        // на карточках и в деталях вместе с dish/main.
+        // ================================================================ //
+        //  Просмотренные рецепты (localStorage, ключ remy_viewed_recipes)
+        //  Формат: JSON-массив id. Без localStorage / при ошибке — пустой Set.
+        // ================================================================ //
+
+        var REMY_VIEWED_KEY = "remy_viewed_recipes";
+
+        /**
+         * Состояние «просмотренных»: tracking=false, если ключа в storage ещё нет
+         * (как в версии до фичи — без бейджей). После первой записи — tracking=true.
+         */
+        function getViewedState() {
+            var empty = new Set();
+            try {
+                if (typeof localStorage === "undefined" || !localStorage) {
+                    return { tracking: false, set: empty };
+                }
+                var raw = localStorage.getItem(REMY_VIEWED_KEY);
+                if (raw === null) {
+                    // ключ никогда не задавали — визуально как раньше, без бейджей
+                    return { tracking: false, set: empty };
+                }
+                var p = JSON.parse(raw);
+                if (Array.isArray(p)) {
+                    return { tracking: true, set: new Set(p.map(function (x) { return String(x); })) };
+                }
+                if (p && typeof p === "object") {
+                    return { tracking: true, set: new Set(Object.keys(p).map(String)) };
+                }
+            } catch (e) { /* приватный режим, квота, невалидный JSON */ }
+            return { tracking: false, set: empty };
+        }
+
+        function getViewedRecipeSet() {
+            return getViewedState().set;
+        }
+
+        function markRecipeViewedInStorage(rid) {
+            if (!rid) return;
+            try {
+                if (typeof localStorage === "undefined" || !localStorage) return;
+                var st = getViewedState();
+                st.set.add(String(rid));
+                localStorage.setItem(REMY_VIEWED_KEY, JSON.stringify(Array.from(st.set)));
+            } catch (e) { /* ignore */ }
+        }
+
+        function isRecipeUnviewedInStorage(rid) {
+            var st = getViewedState();
+            if (!st.tracking) return false;
+            return !st.set.has(String(rid));
+        }
+
+        function countUnviewedInIds(ids) {
+            if (!ids || !ids.length) return 0;
+            var st = getViewedState();
+            if (!st.tracking) return 0;
+            var v = st.set;
+            var n = 0;
+            for (var i = 0; i < ids.length; i++) {
+                if (!v.has(String(ids[i]))) n++;
+            }
+            return n;
+        }
+
+        /** Сколько непросмотренных внутри dish_type (все main_ingredient). */
+        function countUnviewedForDishType(dk, idTree) {
+            if (!idTree || !idTree[dk]) return 0;
+            var n = 0;
+            var sub = idTree[dk];
+            Object.keys(sub).forEach(function (mk) {
+                n += countUnviewedInIds(sub[mk] || []);
+            });
+            return n;
+        }
+
+        /** Сколько непросмотренных в паре (dish_type, main_ingredient). */
+        function countUnviewedForDishMain(dk, mk, idTree) {
+            if (!idTree || !idTree[dk] || !idTree[dk][mk]) return 0;
+            return countUnviewedInIds(idTree[dk][mk]);
+        }
+
+        // Ненавязчивая подсказка на главном экране категорий.
+        function homeMotivationLine() {
+            return el("p", { class: "home-hint" }, [
+                "✨ Добавляйте рецепты, и ваша кулинарная книга будет расти!"
+            ]);
+        }
+
+        // Навигация: dish_type → main_ingredient. Счётчики + дерево id для бейджей «новое».
         async function fetchDishTree(userId) {
-            if (IS_DEMO) return Object.create(null);
+            if (IS_DEMO) {
+                return { tree: Object.create(null), idTree: Object.create(null) };
+            }
             const rows = await apiGet(
                 "recipes?user_id=eq." + encodeURIComponent(userId) +
-                "&select=dish_type,main_ingredient"
+                "&select=id,dish_type,main_ingredient"
             );
             const tree = Object.create(null);
+            const idTree = Object.create(null);
             rows.forEach(function (row) {
                 const d = row.dish_type || "main";
                 const m = row.main_ingredient || "other";
+                const rid = String(row.id);
                 if (!tree[d]) tree[d] = Object.create(null);
+                if (!idTree[d]) idTree[d] = Object.create(null);
+                if (!idTree[d][m]) idTree[d][m] = [];
                 tree[d][m] = (tree[d][m] || 0) + 1;
+                idTree[d][m].push(rid);
             });
-            return tree;
+            return { tree: tree, idTree: idTree };
         }
 
         async function fetchRecipes(userId, dishType, mainIngredient) {
@@ -970,6 +1111,8 @@
             screen: "dish_types",
             stack: [],
             dishTree: null,
+            // id в разрезе dish_type → main_ingredient (для бейджей «новое»)
+            dishIdTree: null,
             currentDishType: null,
             currentMainIngredient: null,
             recipes: null,
@@ -1178,6 +1321,7 @@
             ]));
 
             if (state.loading) {
+                screen.appendChild(homeMotivationLine());
                 const grid = el("div", { class: "categories" });
                 grid.appendChild(skeleton(6, "cat"));
                 screen.appendChild(grid);
@@ -1197,6 +1341,7 @@
                 if (IS_DEMO) {
                     screen.appendChild(authErrorPlaceholder());
                 } else {
+                    screen.appendChild(homeMotivationLine());
                     screen.appendChild(placeholder(
                         "📭",
                         "Пока пусто",
@@ -1208,6 +1353,9 @@
                 return;
             }
 
+            screen.appendChild(homeMotivationLine());
+
+            const idTree = state.dishIdTree || null;
             const rows = dkeys.map(function (dk) {
                 const sub = tree[dk];
                 let total = 0;
@@ -1218,16 +1366,27 @@
 
             const grid = el("div", { class: "categories" });
             rows.forEach(function (row) {
-                grid.appendChild(el("div", {
+                const nNew = idTree
+                    ? countUnviewedForDishType(row.key, idTree)
+                    : 0;
+                const children = [
+                    el("div", { class: "emoji" }, [dishEmoji(row.key)]),
+                    el("div", { class: "name" },  [dishName(row.key)]),
+                    el("div", { class: "count" }, [row.count + " рецептов"])
+                ];
+                if (nNew > 0) {
+                    children.push(el("span", {
+                        class: "category-new-count",
+                        "aria-label": "Новых рецептов: " + nNew
+                    }, [String(nNew)]));
+                }
+                const card = el("div", {
                     class: "category-card",
                     role: "button",
                     tabindex: "0",
                     onclick: function () { openDishType(row.key); }
-                }, [
-                    el("div", { class: "emoji" }, [dishEmoji(row.key)]),
-                    el("div", { class: "name" },  [dishName(row.key)]),
-                    el("div", { class: "count" }, [row.count + " рецептов"])
-                ]));
+                }, children);
+                grid.appendChild(card);
             });
 
             screen.appendChild(grid);
@@ -1253,21 +1412,33 @@
                 return;
             }
 
+            const idTree = state.dishIdTree || null;
             const rows = mkeys.map(function (mk) { return { key: mk, count: sub[mk] }; });
             rows.sort(function (a, b) { return b.count - a.count; });
 
             const grid = el("div", { class: "categories" });
             rows.forEach(function (row) {
+                var nNew = 0;
+                if (idTree) {
+                    nNew = countUnviewedForDishMain(dk, row.key, idTree);
+                }
+                const ch = [
+                    el("div", { class: "emoji" }, [mainIngEmoji(row.key)]),
+                    el("div", { class: "name" },  [mainIngName(row.key)]),
+                    el("div", { class: "count" }, [row.count + " рецептов"])
+                ];
+                if (nNew > 0) {
+                    ch.push(el("span", {
+                        class: "category-new-count",
+                        "aria-label": "Новых рецептов: " + nNew
+                    }, [String(nNew)]));
+                }
                 grid.appendChild(el("div", {
                     class: "category-card",
                     role: "button",
                     tabindex: "0",
                     onclick: function () { openMainIngredient(row.key); }
-                }, [
-                    el("div", { class: "emoji" }, [mainIngEmoji(row.key)]),
-                    el("div", { class: "name" },  [mainIngName(row.key)]),
-                    el("div", { class: "count" }, [row.count + " рецептов"])
-                ]));
+                }, ch));
             });
             screen.appendChild(grid);
             root.appendChild(screen);
@@ -1339,18 +1510,25 @@
                     }, [mealEmoji(r.meal_type) + " " + mealName(r.meal_type)]));
                 }
 
-                list.appendChild(el("div", {
-                    class: "recipe-card",
-                    role: "button",
-                    tabindex: "0",
-                    onclick: function () { openRecipe(r.id); }
-                }, [
+                const unseen = isRecipeUnviewedInStorage(r.id);
+                const cardClass = "recipe-card" + (unseen ? " recipe-card--unseen" : "");
+                const cardChildren = [];
+                if (unseen) {
+                    cardChildren.push(el("div", { class: "recipe-new-tag" }, ["Новый"]));
+                }
+                cardChildren.push(
                     el("div", { class: "name" }, [r.title || "Без названия"]),
                     bds,
                     metaParts.length
                         ? el("div", { class: "meta" }, metaParts)
                         : null
-                ]));
+                );
+                list.appendChild(el("div", {
+                    class: cardClass,
+                    role: "button",
+                    tabindex: "0",
+                    onclick: function () { openRecipe(r.id); }
+                }, cardChildren));
             });
 
             screen.appendChild(list);
@@ -1613,7 +1791,9 @@
             state.error = null;
             render();
             try {
-                state.dishTree = await fetchDishTree(USER_ID);
+                var res = await fetchDishTree(USER_ID);
+                state.dishTree = res.tree;
+                state.dishIdTree = res.idTree;
             } catch (e) {
                 state.error = e.message || "Неизвестная ошибка";
                 console.error(e);
@@ -1651,6 +1831,8 @@
                     state.error = "Рецепт не найден";
                     console.warn("⚠️ Рецепт не найден в Supabase, id =", recipeId);
                 } else {
+                    // Помечаем просмотренным только после успешной загрузки.
+                    markRecipeViewedInStorage(recipeId);
                     console.info("✅ Рецепт загружен:", state.recipe);
                 }
             } catch (e) {
@@ -1762,7 +1944,10 @@
             loadDishTree: loadDishTree,
             loadRecipes: loadRecipes,
             loadRecipe: loadRecipe,
-            LOCALE: LOCALE
+            LOCALE: LOCALE,
+            getViewedState: getViewedState,
+            getViewedRecipeSet: getViewedRecipeSet,
+            markRecipeViewedInStorage: markRecipeViewedInStorage
         };
     })();
     </script>
