@@ -193,11 +193,16 @@
         .close-btn:active { background: var(--accent-hover); }
 
         .recipe-delete-wrap {
+            position: relative;
+            z-index: 2;
             width: 100%;
             box-sizing: border-box;
             margin: 20px 0 0;
+            pointer-events: auto;
         }
         .recipe-delete-btn {
+            position: relative;
+            z-index: 2;
             width: 100%;
             min-height: 48px;
             box-sizing: border-box;
@@ -209,6 +214,8 @@
             border: 1px solid #ff3b30;
             border-radius: 12px;
             cursor: pointer;
+            -webkit-tap-highlight-color: transparent;
+            touch-action: manipulation;
             transition: background 0.12s ease, opacity 0.12s ease;
         }
         .recipe-delete-btn:disabled {
@@ -217,6 +224,85 @@
         }
         .recipe-delete-btn:not(:disabled):active {
             background: rgba(255, 59, 48, 0.2);
+        }
+
+        /* Модалка подтверждения удаления (fallback, если showPopup недоступен) */
+        .delete-confirm-overlay {
+            position: fixed;
+            inset: 0;
+            z-index: 10000;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 20px 16px;
+            max-height: 100dvh;
+            box-sizing: border-box;
+            background: rgba(0, 0, 0, 0.45);
+            -webkit-tap-highlight-color: transparent;
+            animation: deleteOverlayFade 0.22s ease forwards;
+        }
+        @keyframes deleteOverlayFade {
+            from { opacity: 0; }
+            to   { opacity: 1; }
+        }
+        .delete-confirm-card {
+            width: 100%;
+            max-width: 360px;
+            background: var(--card-bg);
+            border-radius: var(--radius-lg);
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.18);
+            padding: 22px 20px 18px;
+            animation: deleteCardIn 0.24s ease forwards;
+        }
+        @keyframes deleteCardIn {
+            from { opacity: 0; transform: scale(0.96) translateY(8px); }
+            to   { opacity: 1; transform: none; }
+        }
+        .delete-confirm-text {
+            font-size: 17px;
+            font-weight: 600;
+            line-height: 1.35;
+            color: var(--text-primary);
+            text-align: center;
+            margin: 0 0 20px;
+        }
+        .delete-confirm-row {
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+        }
+        @media (min-width: 380px) {
+            .delete-confirm-row {
+                flex-direction: row;
+            }
+        }
+        .delete-confirm-btn {
+            flex: 1;
+            min-height: 48px;
+            padding: 0 16px;
+            font-size: 16px;
+            font-weight: 600;
+            border-radius: var(--radius-md);
+            border: 0;
+            cursor: pointer;
+            -webkit-tap-highlight-color: transparent;
+            touch-action: manipulation;
+            transition: opacity 0.12s ease, background 0.12s ease;
+        }
+        .delete-confirm-btn:disabled { opacity: 0.5; }
+        .delete-confirm-btn--danger {
+            background: var(--danger);
+            color: #fff;
+        }
+        .delete-confirm-btn--danger:not(:disabled):active {
+            filter: brightness(0.92);
+        }
+        .delete-confirm-btn--cancel {
+            background: #e8e8ed;
+            color: #3a3a3c;
+        }
+        .delete-confirm-btn--cancel:not(:disabled):active {
+            background: #dcdce0;
         }
 
         /* ============================================================= *
@@ -1254,6 +1340,10 @@
                         node.addEventListener(k.slice(2).toLowerCase(), v);
                     } else if (k === "html") {
                         node.innerHTML = v;
+                    } else if (k === "disabled") {
+                        /* setAttribute("disabled", "false") оставляет атрибут в DOM
+                           и в HTML5 кнопка остаётся disabled. Только property. */
+                        node.disabled = !!v;
                     } else {
                         node.setAttribute(k, v);
                     }
@@ -1838,7 +1928,6 @@
                     disabled: state.deleting,
                     onclick: function (ev) {
                         ev.preventDefault();
-                        ev.stopPropagation();
                         performDeleteRecipe(idStr);
                     }
                 }, ["🗑 Удалить рецепт"]));
@@ -1902,13 +1991,111 @@
             }).catch(function (e) { console.warn("dish tree refresh", e); });
         }
 
+        function showDeleteConfirmModal(onConfirm) {
+            if (typeof onConfirm !== "function") return;
+            var prevOverflow = document.body.style.overflow;
+            var closed = false;
+
+            var root = el("div", {
+                class: "delete-confirm-overlay",
+                role: "dialog",
+                "aria-modal": "true",
+                "aria-labelledby": "delete-confirm-question"
+            });
+            var card = el("div", { class: "delete-confirm-card" });
+            var question = el("p", {
+                class: "delete-confirm-text",
+                id: "delete-confirm-question"
+            }, ["Удалить этот рецепт?"]);
+            var row = el("div", { class: "delete-confirm-row" });
+            var btnDelete = el("button", {
+                class: "delete-confirm-btn delete-confirm-btn--danger",
+                type: "button"
+            }, ["Удалить"]);
+            var btnCancel = el("button", {
+                class: "delete-confirm-btn delete-confirm-btn--cancel",
+                type: "button"
+            }, ["Отмена"]);
+
+            function restoreBody() {
+                document.body.style.overflow = prevOverflow;
+            }
+
+            function onKey(ev) {
+                if (closed) return;
+                if (ev.key === "Escape" || ev.key === "Esc") {
+                    ev.preventDefault();
+                    ev.stopPropagation();
+                    close();
+                }
+            }
+            function onBackdropPointerDown(e) {
+                if (closed) return;
+                if (e.target === root) e.preventDefault();
+            }
+            function onBackdropClick(e) {
+                if (closed) return;
+                if (e.target === root) close();
+            }
+            function onCardClick(e) {
+                e.stopPropagation();
+            }
+
+            function onCancelClick() {
+                close();
+            }
+            function onDeleteClick() {
+                if (closed) return;
+                close();
+                onConfirm();
+            }
+
+            function close() {
+                if (closed) return;
+                closed = true;
+                document.removeEventListener("keydown", onKey, true);
+                btnCancel.removeEventListener("click", onCancelClick);
+                btnDelete.removeEventListener("click", onDeleteClick);
+                if (root) {
+                    root.removeEventListener("click", onBackdropClick);
+                    root.removeEventListener("pointerdown", onBackdropPointerDown, true);
+                }
+                if (card) {
+                    card.removeEventListener("click", onCardClick);
+                }
+                if (root && root.parentNode) {
+                    root.parentNode.removeChild(root);
+                }
+                restoreBody();
+            }
+
+            btnCancel.addEventListener("click", onCancelClick);
+            btnDelete.addEventListener("click", onDeleteClick);
+            /* На десктопе: слева «Отмена», справа «Удалить» */
+            row.appendChild(btnCancel);
+            row.appendChild(btnDelete);
+            card.appendChild(question);
+            card.appendChild(row);
+            /* capture на document — срабатывает до вложенного контента; снимаем в close() */
+            document.addEventListener("keydown", onKey, true);
+            root.addEventListener("pointerdown", onBackdropPointerDown, true);
+            root.addEventListener("click", onBackdropClick);
+            card.addEventListener("click", onCardClick);
+
+            document.body.style.overflow = "hidden";
+            root.appendChild(card);
+            document.body.appendChild(root);
+            try {
+                btnCancel.focus();
+            } catch (e) { /* ignore */ }
+        }
+
         function showDeleteConfirm(onDelete) {
             if (typeof onDelete !== "function") return;
             if (tg && typeof tg.showPopup === "function") {
                 try {
                     tg.showPopup({
-                        title: "Удалить рецепт?",
-                        message: "Рецепт будет удалён без возможности восстановления.",
+                        message: "Удалить этот рецепт?",
                         buttons: [
                             { id: "delete", type: "destructive", text: "Удалить" },
                             { type: "cancel", text: "Отмена" }
@@ -1917,9 +2104,9 @@
                         if (buttonId === "delete") onDelete();
                     });
                     return;
-                } catch (e) { /* fallback */ }
+                } catch (e) { /* fallback: своя модалка */ }
             }
-            if (window.confirm("Удалить рецепт? Это действие нельзя отменить.")) onDelete();
+            showDeleteConfirmModal(onDelete);
         }
 
         function notifyRecipeDeleted() {
