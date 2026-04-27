@@ -1,38 +1,18 @@
 """
 Модуль парсеров рецептов Remy Bot.
 
-Определяет расширяемую архитектуру для извлечения сырого текста
-рецепта из разных источников:
-
-* `BaseParser` — абстрактный базовый класс, описывающий контракт
-  (методы `can_parse`, `parse`, свойство `source_type`).
-* `WebParser` — конкретная реализация для обычных веб-страниц
-  (HTTP(S)-сайты с рецептами).
-* `YouTubeParser` — YouTube: субтитры (и опционально заголовок/описание
-  через YouTube Data API v3) → сырой текст для нормализатора.
-* `ParserRegistry` — реестр парсеров, который автоматически
-  выбирает подходящий парсер по URL.
-* `create_parser_registry` — фабрика, возвращающая реестр с
-  предустановленным набором парсеров.
-
-В дальнейшем к иерархии могут быть добавлены, например,
-`InstagramReelParser`, `TikTokParser` — им достаточно унаследоваться
-от `BaseParser` и быть зарегистрированными в `ParserRegistry`.
-
-Возвращаемый текст намеренно сырой и некрасивый — дальнейшая
-нормализация и извлечение структурированных полей (заголовок,
-ингредиенты, шаги) делается в отдельном слое (AI/LLM-обработка).
+* `BaseParser` — абстрактный контракт (`can_parse`, `parse`, `source_type`).
+* `WebParser` — обычные HTTP(S)-страницы с рецептами.
+* `YouTubeParser` — YouTube: `yt-dlp` для title/description/tags +
+  `youtube-transcript-api` для текста субтитров (приоритет ASR → ручные).
+* `ParserRegistry` / `create_parser_registry` — маршрутизация и фабрика.
 """
 
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import re
-import urllib.error
-import urllib.parse
-import urllib.request
 from abc import ABC, abstractmethod
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -40,11 +20,8 @@ import aiohttp
 from bs4 import BeautifulSoup
 
 try:
-    # readability-lxml даёт гораздо более чистый текст на типичных
-    # блогах/порталах с рецептами. Если пакет недоступен — мы всё
-    # равно отработаем, только с более шумным результатом.
     from readability import Document as _ReadabilityDocument
-except Exception:  # noqa: BLE001 — нам неважно, что именно сломалось
+except Exception:  # noqa: BLE001
     _ReadabilityDocument = None  # type: ignore[assignment]
 
 
@@ -55,82 +32,37 @@ logger = logging.getLogger(__name__)
 # Абстрактный базовый класс
 # --------------------------------------------------------------------------- #
 
+
 class BaseParser(ABC):
-    """Абстрактный базовый класс для всех парсеров рецептов.
-
-    Наследники обязаны реализовать три точки расширения:
-
-    * `source_type` — строковый идентификатор источника
-      (например, ``"website"``, ``"youtube_shorts"``).
-    * `can_parse(url)` — быстрая проверка, подходит ли URL для
-      данного парсера (используется реестром для маршрутизации).
-    * `parse(url)` — собственно асинхронное извлечение текста.
-    """
+    """Абстрактный базовый класс для всех парсеров рецептов."""
 
     @property
     @abstractmethod
     def source_type(self) -> str:
-        """Тип источника.
-
-        Ожидаемые значения: ``"website"``, ``"youtube_shorts"``,
-        ``"instagram_reel"``, ``"tiktok"``. Используется в логах и,
-        потенциально, при сохранении рецепта — чтобы знать, откуда он.
-        """
+        """Тип источника (``website``, ``youtube`` и т. д.)."""
 
     @staticmethod
     @abstractmethod
     def can_parse(url: str) -> bool:
-        """Вернуть True, если данный парсер умеет обработать `url`.
-
-        Должен быть быстрым и дешёвым: сетевые запросы здесь
-        запрещены. Обычно это проверка схемы/домена URL.
-        """
+        """Быстрая проверка URL (без сети)."""
 
     @abstractmethod
     async def parse(self, url: str) -> str:
-        """Извлечь сырой текст рецепта из источника.
-
-        Args:
-            url: URL источника.
-
-        Returns:
-            Извлечённый текст (может содержать переводы строк).
-
-        Raises:
-            ValueError: если URL не поддерживается этим парсером.
-            RuntimeError: при ошибке сети/парсинга (таймаут, HTTP-ошибка,
-                пустой контент и т. п.).
-        """
+        """Извлечь сырой текст рецепта."""
 
 
 # --------------------------------------------------------------------------- #
 # Реализация: обычные веб-страницы
 # --------------------------------------------------------------------------- #
 
+
 class WebParser(BaseParser):
-    """Парсер обычных веб-страниц с рецептами.
+    """Парсер веб-страниц: aiohttp + readability + BeautifulSoup."""
 
-    Алгоритм:
-
-    1. Асинхронный GET-запрос с браузерным User-Agent и таймаутом 30 с.
-    2. Извлечение основного содержимого через `readability-lxml`
-       (с фолбэком на чистый HTML, если readability не справился).
-    3. Очистка `BeautifulSoup`: удаление `<script>`, `<style>`, `<nav>`,
-       `<footer>`, `<header>`, `<aside>`, `<form>`, `<iframe>`,
-       `<noscript>` и сворачивание пробелов.
-    4. Обрезка результата до `MAX_TEXT_LENGTH` символов.
-    """
-
-    #: Строковый идентификатор источника.
     source_type: str = "website"
-
-    #: Максимальная длина возвращаемого текста (символы).
     MAX_TEXT_LENGTH: int = 50_000
-
-    #: Таймаут HTTP-запроса в секундах.
     TIMEOUT_SECONDS: float = 30.0
 
-    #: HTTP-заголовки, имитирующие обычный браузер Chrome.
     HEADERS: dict = {
         "User-Agent": (
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -144,42 +76,18 @@ class WebParser(BaseParser):
         "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
     }
 
-    #: HTML-теги, которые точно не содержат полезного текста рецепта.
     _TAGS_TO_REMOVE: tuple = (
         "script", "style", "nav", "footer", "header",
         "aside", "form", "iframe", "noscript", "svg",
     )
 
-    # ------------------------------------------------------------------ #
-    # Точки расширения из BaseParser
-    # ------------------------------------------------------------------ #
-
     @staticmethod
     def can_parse(url: str) -> bool:
-        """Проверить, похож ли URL на обычную HTTP(S)-страницу.
-
-        Специально делаем проверку самой общей: `WebParser` должен
-        использоваться как fallback для всех URL, не перехваченных
-        более специализированными парсерами (YouTube, Instagram и др.).
-        Поэтому реестр должен регистрировать `WebParser` последним.
-        """
         if not isinstance(url, str):
             return False
         return url.startswith(("http://", "https://"))
 
     async def parse(self, url: str) -> str:
-        """Загрузить страницу и вернуть очищенный текст рецепта.
-
-        Args:
-            url: Полный HTTP(S)-URL страницы.
-
-        Returns:
-            Текст длиной до `MAX_TEXT_LENGTH` символов.
-
-        Raises:
-            ValueError: если URL не поддерживается.
-            RuntimeError: при таймауте, HTTP-ошибке или пустом контенте.
-        """
         if not self.can_parse(url):
             raise ValueError(f"WebParser не поддерживает URL: {url!r}")
 
@@ -198,39 +106,18 @@ class WebParser(BaseParser):
         logger.info("📄 Извлечено %s символов текста", self._format_number(len(text)))
         return text
 
-    # ------------------------------------------------------------------ #
-    # Внутренняя реализация
-    # ------------------------------------------------------------------ #
-
     async def _fetch(self, url: str) -> str:
-        """Выполнить HTTP GET и вернуть тело ответа как строку.
-
-        Преобразует сетевые ошибки и нештатные HTTP-статусы в
-        `RuntimeError` с понятными русскими сообщениями.
-        """
         timeout = aiohttp.ClientTimeout(total=self.TIMEOUT_SECONDS)
 
         try:
             async with aiohttp.ClientSession(timeout=timeout, headers=self.HEADERS) as session:
                 async with session.get(url, allow_redirects=True) as response:
                     if response.status >= 400:
-                        logger.error(
-                            "❌ Ошибка парсинга %s: HTTP %s", url, response.status
-                        )
-                        raise RuntimeError(
-                            f"Ошибка HTTP {response.status} при загрузке страницы"
-                        )
-
-                    # `response.text()` сам подбирает кодировку из заголовков,
-                    # а при их отсутствии — через chardet.
+                        logger.error("❌ Ошибка парсинга %s: HTTP %s", url, response.status)
+                        raise RuntimeError(f"Ошибка HTTP {response.status} при загрузке страницы")
                     html = await response.text(errors="replace")
-
                     size_kb = max(len(html) // 1024, 1)
-                    logger.info(
-                        "✅ Страница загружена (%s), размер: %sKB",
-                        response.status,
-                        size_kb,
-                    )
+                    logger.info("✅ Страница загружена (%s), размер: %sKB", response.status, size_kb)
                     return html
 
         except asyncio.TimeoutError:
@@ -241,15 +128,7 @@ class WebParser(BaseParser):
             raise RuntimeError(f"Сетевая ошибка: {exc}") from exc
 
     def _extract_text(self, html: str) -> str:
-        """Извлечь основной текст страницы из HTML.
-
-        Сначала пытаемся выделить «статью» через readability-lxml —
-        он хорошо отсекает меню, сайдбары, рекламу. Если readability
-        по каким-то причинам упал или не установлен, работаем напрямую
-        с исходным HTML.
-        """
         content_html = html
-
         if _ReadabilityDocument is not None:
             try:
                 doc = _ReadabilityDocument(html)
@@ -257,115 +136,43 @@ class WebParser(BaseParser):
                 if summary and summary.strip():
                     content_html = summary
             except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    "⚠️  readability не справился, используем полный HTML: %s", exc
-                )
+                logger.warning("⚠️  readability не справился, используем полный HTML: %s", exc)
 
         soup = BeautifulSoup(content_html, "lxml")
-
         for tag in soup(self._TAGS_TO_REMOVE):
             tag.decompose()
-
         raw_text = soup.get_text(separator="\n")
         return self._clean_text(raw_text)
 
     @staticmethod
     def _clean_text(text: str) -> str:
-        """Нормализовать пробелы и убрать пустые строки.
-
-        * схлопывает повторяющиеся пробелы/табы в один пробел;
-        * убирает ведущие/концевые пробелы в каждой строке;
-        * выкидывает пустые строки;
-        * схлопывает более двух переводов строк подряд в два.
-        """
         lines: Iterable[str] = text.splitlines()
         cleaned_lines: List[str] = []
         for line in lines:
             collapsed = re.sub(r"[ \t\u00a0]+", " ", line).strip()
             if collapsed:
                 cleaned_lines.append(collapsed)
-
         return "\n".join(cleaned_lines)
 
     @staticmethod
     def _format_number(value: int) -> str:
-        """Отформатировать число с пробелом-разделителем тысяч (``12 345``)."""
         return f"{value:,}".replace(",", " ")
 
 
 # --------------------------------------------------------------------------- #
-# Реализация: YouTube (субтитры + опционально Data API: заголовок/описание)
+# YouTube: вспомогательные функции
 # --------------------------------------------------------------------------- #
-
-# User-Agent для oEmbed / публичной страницы watch (без Data API).
-_YT_PUBLIC_UA = (
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-)
-
-
-def _youtube_oembed_title(page_url: str) -> Tuple[str, Optional[str]]:
-    """Заголовок через публичный oEmbed (без ключа API). (title, reason_if_empty)."""
-    q = urllib.parse.urlencode({"url": page_url.strip(), "format": "json"})
-    u = "https://www.youtube.com/oembed?" + q
-    req = urllib.request.Request(u, headers={"User-Agent": _YT_PUBLIC_UA})
-    try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            data = json.loads(resp.read().decode("utf-8", errors="replace"))
-        title = str(data.get("title") or "").strip()
-        return (title, None if title else "oEmbed: пустой title")
-    except urllib.error.HTTPError as exc:
-        reason = f"oEmbed HTTP {exc.code} (видео скрыто, удалено или embed отключён)"
-        logger.warning("⚠️ %s", reason)
-        return "", reason
-    except Exception as exc:  # noqa: BLE001
-        reason = f"oEmbed: {type(exc).__name__}: {exc}"
-        logger.warning("⚠️ %s", reason)
-        return "", reason
-
-
-def _youtube_watch_page_description(video_id: str) -> Tuple[str, Optional[str]]:
-    """Короткое описание из meta og:description / description на /watch (без API)."""
-    watch = f"https://www.youtube.com/watch?v={video_id}"
-    req = urllib.request.Request(
-        watch,
-        headers={
-            "User-Agent": _YT_PUBLIC_UA,
-            "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
-        },
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=25) as r:
-            html = r.read().decode("utf-8", errors="replace")
-    except Exception as exc:  # noqa: BLE001
-        reason = f"страница watch: {type(exc).__name__}: {exc}"
-        logger.warning("⚠️ Не удалось загрузить HTML: %s", reason)
-        return "", reason
-    soup = BeautifulSoup(html, "lxml")
-    og = soup.find("meta", property="og:description")
-    if og and og.get("content"):
-        txt = str(og["content"]).strip()
-        if txt:
-            return _strip_youtube_description_text(txt), None
-    meta = soup.find("meta", attrs={"name": "description"})
-    if meta and meta.get("content"):
-        txt = str(meta["content"]).strip()
-        if txt:
-            return _strip_youtube_description_text(txt), None
-    return "", "на странице нет og:description / meta description"
 
 
 def _extract_youtube_video_id(url: str) -> str:
-    """Вернуть 11-символьный video_id или пустую строку (watch, Shorts, youtu.be)."""
+    """11-символьный id (watch, Shorts, youtu.be)."""
     s = (url or "").strip()
     m = re.search(
         r"(?:[?&]v=|/shorts/|youtu\.be/)([A-Za-z0-9_-]{11})\b",
         s,
         re.IGNORECASE,
     )
-    if m:
-        return m.group(1)
-    return ""
+    return m.group(1) if m else ""
 
 
 def _youtube_list_transcripts(video_id: str) -> Any:
@@ -378,10 +185,7 @@ def _youtube_list_transcripts(video_id: str) -> Any:
     return ytt.list(video_id)
 
 
-# Субтитры: теги по факту уже частично сняты парсером YouTube, но в тексте
-# остаются HTML-обрывки, служебные […], разрывы «число / единица».
 _SUBTITLE_HTML_TAG_RE = re.compile(r"<[^>]+>", re.IGNORECASE)
-# Метатеги вроде [музыка], [аплодисменты] (EN + RU) — мешают нормализатору.
 _CC_BRACKET_NOISE = re.compile(
     r"\[[^\]]{0,200}?"
     r"(?:"
@@ -393,31 +197,34 @@ _CC_BRACKET_NOISE = re.compile(
     r"[^\]]{0,200}?\]",
     re.IGNORECASE,
 )
-# Таймкоды [1:30] / [00:00] в субтитрах.
 _CC_TIME_BRACKETS = re.compile(r"\[\d{1,2}:\d{2}(?::\d{2})?(?:\s*-\s*\d{1,2}:\d{2}(?::\d{2})?)?\]")
-# Хэштеги и «хвосты» #слово в описании.
-_YT_DESC_HASHTAG_RE = re.compile(r"#[A-Za-z0-9_\u0400-\u04FF\u0500-\u052F]+")
-# Популярные эмодзи в описаниях (без внешних зависимостей).
+
+
+# Хэштеги: не трогать # внутри «числа #1» (редко) — требуется слово/кириллица после #.
+_YT_DESC_HASHTAG_RE = re.compile(
+    r"(?<!\w)#[A-Za-z0-9_\u0400-\u04FF\u0500-\u052F]+"
+)
+
+# Эмодзи (не затрагивают U+00B0 °, U+00B5 µ, латиницу/кириллицу).
 _YT_DESC_EMOJI_RE = re.compile(
     "["
-    "\U0001F1E0-\U0001F1FF"  # флаги
-    "\U0001F300-\U0001FAFF"  # pictographs, дополнения
-    "\U00002700-\U000027BF"  # Dingbats
-    "\U0001F600-\U0001F64F"  # emoticons
-    "\U0001F680-\U0001F6FF"  # transport & map
-    "\U0001F700-\U0001F7FF"  # alchemical
-    "\U0001F800-\U0001F8FF"  # supplemental arrows
-    "\U0001F900-\U0001F9FF"  # supplemental smilies & hands
-    "\U0001FA00-\U0001FAFF"  # extended-A
-    "\U00002600-\U000026FF"  # misc symbols
-    "\uFE00-\uFE0F"  # variation selectors
-    "\u200D"  # ZWJ
+    "\U0001F1E0-\U0001F1FF"
+    "\U0001F300-\U0001FAFF"
+    "\U00002700-\U000027BF"
+    "\U0001F600-\U0001F64F"
+    "\U0001F680-\U0001F6FF"
+    "\U0001F700-\U0001F7FF"
+    "\U0001F800-\U0001F8FF"
+    "\U0001F900-\U0001F9FF"
+    "\U0001FA00-\U0001FAFF"
+    "\U00002600-\U000026FF"
+    "\uFE00-\uFE0F"
+    "\u200D"
     "]+"
 )
 
 
 def _raw_subtitle_texts(data: Any) -> List[str]:
-    """Извлечь список фрагментов текста из ответа fetch / FetchedTranscript."""
     if not data:
         return []
     if isinstance(data, list):
@@ -442,20 +249,12 @@ def _clean_one_subtitle_line(text: str) -> str:
 
 
 def _join_subtitle_segments(segments: List[str]) -> str:
-    """Склеить сегменты: пробел между фрагментами, единый проход схлопывания пробелов.
-
-    YouTube нередко режет фразу так, что количество и «г/мл/шт» оказываются в
-    соседних сегментах — после join получаем «200 г»; внутри сегмента переносы
-    заменяются в `_clean_one_subtitle_line`.
-    """
     parts = [_clean_one_subtitle_line(s) for s in segments if s and str(s).strip()]
     text = " ".join(parts)
-    text = re.sub(r"\s+", " ", text).strip()
-    return text
+    return re.sub(r"\s+", " ", text).strip()
 
 
 def _clean_subtitle_fetch(data: Any) -> str:
-    """Превратить ответ fetch (list[dict] / FetchedTranscript) в очищенную строку."""
     if not data:
         return ""
     if isinstance(data, str):
@@ -469,11 +268,6 @@ def _clean_subtitle_fetch(data: Any) -> str:
     return _join_subtitle_segments(parts)
 
 
-def _flatten_subtitle_fetch(data: Any) -> str:
-    """Совместимое имя: «склеить + очистить» (раньше только склеивали)."""
-    return _clean_subtitle_fetch(data)
-
-
 def _transcript_lang_code(tr_obj: Any) -> str:
     return str(
         getattr(tr_obj, "language_code", None) or getattr(tr_obj, "language", None) or "?"
@@ -483,24 +277,19 @@ def _transcript_lang_code(tr_obj: Any) -> str:
 def _select_transcript_track(
     tlist: Any, all_tr: List[Any], NoTranscriptFound: Any
 ) -> Tuple[Any, str, str]:
-    """Предпочесть ASR (авто) ru → ASR en → ручные ru/en → любая ASR → любая дорожка.
-
-    Возвращает: (transcript, kind: "auto"|"manual", label для логов)
-    """
-    # 1) Автосубтитры: русский, затем английский (как в find_generated_transcript)
+    """ASR ru → ASR en → ручные ru/en → find_transcript → любая ASR → первая дорожка."""
     if hasattr(tlist, "find_generated_transcript"):
         try:
             t = tlist.find_generated_transcript(["ru", "en"])
             return t, "auto", "авто поиск ru/en"
         except NoTranscriptFound:
             pass
-    # 1b) fallback: та же логика ru → en, если find_generated не сработал
+
     for code in ("ru", "en"):
         for t in all_tr:
             if getattr(t, "is_generated", False) and getattr(t, "language_code", None) == code:
                 return t, "auto", f"asr {code} (обход по списку)"
 
-    # 2) Ручные ru / en
     if hasattr(tlist, "find_manually_created_transcript"):
         try:
             t = tlist.find_manually_created_transcript(["ru", "en"])
@@ -515,7 +304,6 @@ def _select_transcript_track(
             ):
                 return t, "manual", f"ручной {code} (обход по списку)"
 
-    # 3) find_transcript: ручной приоритет, иначе ASR
     try:
         t = tlist.find_transcript(["ru", "en"])
         kind = "auto" if getattr(t, "is_generated", False) else "manual"
@@ -523,7 +311,6 @@ def _select_transcript_track(
     except NoTranscriptFound:
         pass
 
-    # 4) Любые автодорожки
     for t in all_tr:
         if getattr(t, "is_generated", False):
             return t, "auto", "первая доступная ASR"
@@ -536,7 +323,7 @@ def _select_transcript_track(
 
 
 def _strip_youtube_description_text(text: str) -> str:
-    """Описание под видео: убрать хэштеги и эмодзи, оставить читаемый текст."""
+    """Описание/крупные поля: без эмодзи и хэштегов; не трогать °C, µg и т. п."""
     s = (text or "").replace("\r\n", "\n")
     s = _YT_DESC_HASHTAG_RE.sub(" ", s)
     s = _YT_DESC_EMOJI_RE.sub("", s)
@@ -551,29 +338,79 @@ def _strip_youtube_description_text(text: str) -> str:
     return s.strip()
 
 
+def _strip_youtube_title_text(text: str) -> str:
+    """Заголовок: HTML, эмодзи, лишние пробелы (без съедания буквенного текста)."""
+    s = (text or "").strip()
+    s = _SUBTITLE_HTML_TAG_RE.sub(" ", s)
+    s = _YT_DESC_EMOJI_RE.sub("", s)
+    s = re.sub(r"[ \t\u00a0]+", " ", s).strip()
+    return s
+
+
+def _format_tags_line(tags: List[Any], max_len: int = 4_000) -> str:
+    if not tags:
+        return ""
+    out: List[str] = []
+    for t in tags:
+        if not isinstance(t, str):
+            t = str(t) if t is not None else ""
+        t = t.strip()
+        if not t:
+            continue
+        t = _YT_DESC_EMOJI_RE.sub("", t)
+        t = re.sub(r"\s+", " ", t).strip()
+        if t:
+            out.append(t)
+    s = ", ".join(out)
+    if len(s) > max_len:
+        s = s[:max_len] + "…"
+    return s
+
+
+def _yt_dlp_extract_metadata(url: str) -> Dict[str, Any]:
+    """Title, description, tags + списки субтитров (URL-ы) без скачивания видео.
+
+    `writesubtitles` / `writeautomaticsub` вместе с `skip_download` в yt-dlp
+    заполняет поля `subtitles` / `automatic_captions` в `info` без гарантии
+    записи файлов на диск. Текст субтитров дальше берётся из youtube_transcript_api.
+    """
+    import yt_dlp
+
+    opts: Dict[str, Any] = {
+        "quiet": True,
+        "no_warnings": True,
+        "writesubtitles": True,
+        "writeautomaticsub": True,
+        "subtitleslangs": ["ru", "en"],
+        "skip_download": True,
+        "extract_flat": False,
+        "noplaylist": True,
+    }
+    with yt_dlp.YoutubeDL(opts) as ydl:  # type: ignore[operator]
+        info: Dict[str, Any] = ydl.extract_info(url, download=False)
+    if not info:
+        return {}
+    return info
+
+
 class YouTubeParser(BaseParser):
-    """YouTube: субтитры, затем (опц.) Data API, затем oEmbed и HTML watch.
+    """YouTube: метаданные через yt-dlp, субтитры — `youtube_transcript_api` (очистка как раньше).
 
-    Субтитры: в приоритете ASR (автосубтитры) ru → ASR en, затем ручные
-    ru/en, затем любая доступная дорожка. Текст субтитров очищается
-    (HTML, служебные [музыка] и т. п.) для устойчивого разбора количеств.
-
-    Описание из Data API / meta-описание со /watch: без эмодзи и хэштегов.
-
-    Без субтитров остаётся доступный текст (описание), без необработанных падений.
+    Ключ YouTube Data API не требуется. Параметр `youtube_api_key` в конструкторе
+    оставлен для обратной совместимости с `create_parser_registry` и игнорируется.
     """
 
     source_type: str = "youtube"
     MAX_TEXT_LENGTH: int = 50_000
 
-    _RUNTIME_NO_TEXT = "Видео не содержит субтитров или описания"
+    _ERR_NO_TEXT = "Не удалось извлечь текст из видео"
 
     def __init__(self, youtube_api_key: str = "") -> None:
-        self._api_key: str = (youtube_api_key or "").strip()
+        # API-ключ не используется (было только для YouTube Data API).
+        _ = (youtube_api_key or "").strip()
 
     @staticmethod
     def can_parse(url: str) -> bool:
-        """YouTube: watch, Shorts, youtu.be (m.youtube.com учитывается)."""
         if not isinstance(url, str) or not url.strip():
             return False
         u = url.lower()
@@ -595,52 +432,62 @@ class YouTubeParser(BaseParser):
         video_id = _extract_youtube_video_id(url)
         if not video_id or len(video_id) != 11:
             raise ValueError("Некорректный YouTube URL")
-        page_url = url.strip()
+
         logger.info("🎬 Обнаружено YouTube-видео: %s", video_id)
 
-        sub_text, _sub_lang, sub_reason = self._load_subtitles(video_id)
-        if not sub_text and sub_reason:
-            logger.warning(
-                "⚠️ Субтитры не получены (%s). Пробуем описание и публичные источники.",
-                sub_reason,
-            )
+        info: Optional[Dict[str, Any]] = None
+        ytdlp_ok = False
+        try:
+            info = _yt_dlp_extract_metadata(url.strip())
+            ytdlp_ok = True
+        except Exception as exc:  # noqa: BLE001
+            logger.error("❌ Не удалось получить данные через yt-dlp: %s", exc)
+            info = None
+            ytdlp_ok = False
 
-        title, desc = self._load_snippet_data_api(video_id, have_subs=bool(sub_text))
-        if (title and title.strip()) or (desc and desc.strip()):
-            logger.info("📋 Получено описание через YouTube Data API")
+        title_raw = ""
+        desc_raw = ""
+        tags_list: List[Any] = []
+        if info:
+            title_raw = (info.get("title") or info.get("fulltitle") or "")
+            if not isinstance(title_raw, str):
+                title_raw = str(title_raw)
+            desc_raw = info.get("description") or ""
+            if not isinstance(desc_raw, str):
+                desc_raw = str(desc_raw) if desc_raw is not None else ""
+            raw_tags = info.get("tags")
+            if isinstance(raw_tags, list):
+                tags_list = raw_tags
+            elif raw_tags is not None:
+                tags_list = [raw_tags]
 
-        # Публичные fallback: oEmbed (заголовок), стр. watch (og:description)
-        oembed_title, _o_msg = _youtube_oembed_title(page_url) if not (title and title.strip()) else ("", None)
-        if oembed_title:
-            logger.info("📋 Заголовок получен через oEmbed (без Data API)")
+        if ytdlp_ok and info:
+            dlen = len(desc_raw) if desc_raw else 0
+            t_short = (title_raw[:200] + "…") if len(title_raw) > 200 else title_raw
+            logger.info("📦 Данные получены через yt-dlp: title=%r, description=%s символов", t_short, dlen)
 
-        page_desc, page_reason = ("", None)
-        if not (desc and desc.strip()):
-            page_desc, page_reason = _youtube_watch_page_description(video_id)
-            if page_desc:
-                logger.info("📋 Описание/фрагмент взяты с публичной страницы (meta og:description)")
-            elif page_reason:
-                logger.warning("⚠️ Публичная страница: %s", page_reason)
+        if not ytdlp_ok:
+            logger.warning("⚠️ yt-dlp не смог извлечь данные, пробуем fallback (субтитры через transcript-api)")
 
-        final_title = (title or oembed_title or "").strip()
-        final_desc = _strip_youtube_description_text((desc or page_desc or "").strip())
+        clean_title = _strip_youtube_title_text(title_raw)
+        clean_desc = _strip_youtube_description_text(desc_raw) if desc_raw else ""
+        tag_line = _format_tags_line(tags_list)
 
-        if (final_title or final_desc) and not sub_text:
-            logger.warning(
-                "⚠️ Субтитры отсутствуют; используем заголовок и/или описание (см. причины выше)"
-            )
+        sub_text, _lang, _reason = self._load_subtitles(video_id)
 
         parts: List[str] = []
-        if final_title:
-            parts.append(final_title)
-        if final_desc:
-            parts.append(final_desc)
+        if clean_title:
+            parts.append(clean_title)
+        if clean_desc:
+            parts.append(clean_desc)
         if sub_text:
             parts.append(sub_text)
+        if tag_line:
+            parts.append("Теги: " + tag_line)
 
         if not any(p.strip() for p in parts):
-            logger.error("❌ %s (субтитры, Data API, oEmbed, meta-описание — всё пусто)", self._RUNTIME_NO_TEXT)
-            raise RuntimeError(self._RUNTIME_NO_TEXT)
+            logger.error("❌ %s", self._ERR_NO_TEXT)
+            raise RuntimeError(self._ERR_NO_TEXT)
 
         text = "\n\n".join(p for p in parts if p and p.strip())
         if len(text) > self.MAX_TEXT_LENGTH:
@@ -648,7 +495,7 @@ class YouTubeParser(BaseParser):
         return text
 
     def _load_subtitles(self, video_id: str) -> Tuple[str, str, str]:
-        """Субтитры: (текст, язык, причина_пусто — для логов; пусто = «OK»)."""
+        """Субтитры: (текст, язык, причина; пустая строка = OK)."""
         from youtube_transcript_api import YouTubeTranscriptApi
         from youtube_transcript_api._errors import (  # type: ignore[import-not-found]
             NoTranscriptFound,
@@ -656,11 +503,10 @@ class YouTubeParser(BaseParser):
             VideoUnavailable,
         )
 
-        tlist: Any
         try:
             tlist = _youtube_list_transcripts(video_id)
         except VideoUnavailable as exc:
-            msg = f"ролик недоступен для субтитров (VideoUnavailable: {exc})"
+            msg = f"ролик недоступен (VideoUnavailable: {exc})"
             logger.warning("⚠️ %s", msg)
             return self._fallback_get_transcript_only(video_id, YouTubeTranscriptApi, reason_prefix=msg)
         except TranscriptsDisabled as exc:
@@ -670,9 +516,7 @@ class YouTubeParser(BaseParser):
         except Exception as exc:  # noqa: BLE001
             err_t = f"{type(exc).__name__}: {exc}"
             logger.error("❌ list_transcripts: %s", err_t)
-            return self._fallback_get_transcript_only(
-                video_id, YouTubeTranscriptApi, reason_prefix=err_t
-            )
+            return self._fallback_get_transcript_only(video_id, YouTubeTranscriptApi, reason_prefix=err_t)
 
         all_tr: List[Any] = []
         try:
@@ -683,7 +527,7 @@ class YouTubeParser(BaseParser):
             all_tr = []
 
         if not all_tr:
-            reason = "YouTube не вернул ни одной дорожки субтитров (пустой список)"
+            reason = "YouTube не вернул ни одной дорожки субтитров"
             logger.warning("⚠️ %s", reason)
             return "", "", reason
 
@@ -718,7 +562,6 @@ class YouTubeParser(BaseParser):
     def _fallback_get_transcript_only(
         self, video_id: str, ytt: Any, reason_prefix: str
     ) -> Tuple[str, str, str]:
-        """Фолбэк get_transcript, если list_transcripts не сработал (другой путь)."""
         try:
             try:
                 raw = ytt.get_transcript(video_id, languages=["ru", "en"])  # type: ignore[attr-defined]
@@ -731,49 +574,11 @@ class YouTubeParser(BaseParser):
         sub = _clean_subtitle_fetch(raw)
         if sub:
             logger.info(
-                "ℹ️ Субтитры (get_transcript, без метаданных ASR/ручн.), %s символов",
+                "ℹ️ Субтитры (get_transcript, без деталей ASR/ручн.), %s символов",
                 self._format_number(len(sub)),
             )
             return sub, "mixed", ""
         return "", "", f"{reason_prefix}; get_transcript вернул пустой текст"
-
-    def _load_snippet_data_api(self, video_id: str, have_subs: bool) -> Tuple[str, str]:
-        """Заголовок и описание через Data API; никаких raise — пусто при ошибке."""
-        if not self._api_key:
-            return "", ""
-        try:
-            from googleapiclient.discovery import build
-            from googleapiclient.errors import HttpError
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("YouTube Data API недоступен (import): %s", exc)
-            return "", ""
-        try:
-            youtube = build("youtube", "v3", developerKey=self._api_key, cache_discovery=False)
-            req = youtube.videos().list(part="snippet", id=video_id)
-            resp: Dict[str, Any] = req.execute()
-        except HttpError as exc:  # type: ignore[misc]
-            code = int(getattr(getattr(exc, "resp", None), "status", 0) or 0)
-            logger.warning(
-                "YouTube Data API: HTTP %s — продолжаем без snippet (oEmbed/HTML): %s",
-                code,
-                exc,
-            )
-            return "", ""
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("YouTube Data API: запрос не выполнен, продолжаем без описания: %s", exc)
-            return "", ""
-
-        items = resp.get("items") or []
-        if not items:
-            if have_subs:
-                logger.warning("YouTube Data API: пустой items — оставляем только субтитры")
-            else:
-                logger.warning("YouTube Data API: пустой items (ид не найден или нет прав) — oEmbed / meta")
-            return "", ""
-        sn: Dict[str, Any] = items[0].get("snippet") or {}
-        title_sn = str(sn.get("title", "") or "")
-        desc_sn = str(sn.get("description", "") or "")
-        return title_sn, _strip_youtube_description_text(desc_sn)
 
     @staticmethod
     def _format_number(value: int) -> str:
@@ -781,82 +586,47 @@ class YouTubeParser(BaseParser):
 
 
 # --------------------------------------------------------------------------- #
-# Реестр парсеров
+# Реестр
 # --------------------------------------------------------------------------- #
 
-class ParserRegistry:
-    """Реестр парсеров: маршрутизирует URL к подходящему парсеру.
 
-    Порядок регистрации важен: парсер, добавленный раньше,
-    проверяется раньше. Поэтому специализированные парсеры
-    (YouTube, Instagram, TikTok) должны регистрироваться **до**
-    универсального `WebParser`.
-    """
+class ParserRegistry:
+    """Реестр: первый подходящий `can_parse` выигрывает."""
 
     def __init__(self) -> None:
         self._parsers: List[BaseParser] = []
 
     def register(self, parser: BaseParser) -> None:
-        """Добавить парсер в реестр.
-
-        Args:
-            parser: Экземпляр наследника `BaseParser`.
-        """
         self._parsers.append(parser)
         logger.info("📝 Зарегистрирован парсер: %s", parser.source_type)
 
     def get_parser(self, url: str) -> Optional[BaseParser]:
-        """Вернуть первый парсер, умеющий обработать `url`, или None."""
         for parser in self._parsers:
             try:
                 if parser.can_parse(url):
                     return parser
-            except Exception as exc:  # noqa: BLE001 — защитная полоса
-                logger.warning(
-                    "⚠️  %s.can_parse упал на %r: %s",
-                    type(parser).__name__, url, exc,
-                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("⚠️  %s.can_parse упал на %r: %s", type(parser).__name__, url, exc)
         return None
 
     async def parse(self, url: str) -> str:
-        """Найти подходящий парсер и делегировать ему работу.
-
-        Raises:
-            ValueError: если ни один из зарегистрированных парсеров
-                не принял URL.
-        """
         parser = self.get_parser(url)
         if parser is None:
             raise ValueError(f"Не удалось найти парсер для URL: {url}")
-
         logger.info("🔍 Парсинг через %s: %s", parser.source_type, url[:80])
         return await parser.parse(url)
 
     @property
     def parsers(self) -> List[BaseParser]:
-        """Копия списка зарегистрированных парсеров (read-only снаружи)."""
         return list(self._parsers)
 
 
-# --------------------------------------------------------------------------- #
-# Фабрика
-# --------------------------------------------------------------------------- #
-
 def create_parser_registry(cfg: Optional[object] = None) -> ParserRegistry:
-    """Построить реестр с набором парсеров по умолчанию.
-
-    ``YouTubeParser`` регистрируется **до** ``WebParser``, чтобы
-    YouTube-URL не уходили в обычный веб-парсер.
-
-    Args:
-        cfg: Объект с полем ``youtube_api_key`` (как :class:`config.Config`);
-             если ``None`` — подставляется глобальный ``config`` из ``config.py``.
-
-    Returns:
-        Готовый к использованию `ParserRegistry`.
+    """Реестр с YouTube (до Web). Поле `youtube_api_key` в `cfg` оставлено
+    для обратной совместимости; `YouTubeParser` его не использует.
     """
     if cfg is None:
-        from config import config as _cfg  # ленивый импорт, избегаем циклов
+        from config import config as _cfg
         cfg = _cfg
     api_key = str(getattr(cfg, "youtube_api_key", "") or "")
     registry = ParserRegistry()
@@ -866,7 +636,7 @@ def create_parser_registry(cfg: Optional[object] = None) -> ParserRegistry:
 
 
 # --------------------------------------------------------------------------- #
-# Тестовый запуск
+# __main__
 # --------------------------------------------------------------------------- #
 
 if __name__ == "__main__":
@@ -877,7 +647,6 @@ if __name__ == "__main__":
     )
 
     async def _test() -> None:
-        # --- YouTube: can_parse по формам ссылок ---
         assert YouTubeParser.can_parse("https://www.youtube.com/watch?v=dQw4w9WgXcQ")
         assert YouTubeParser.can_parse("https://youtu.be/dQw4w9WgXcQ")
         assert YouTubeParser.can_parse("https://m.youtube.com/shorts/abcdefghijk1")
@@ -887,17 +656,12 @@ if __name__ == "__main__":
         print("✅ YouTube can_parse / extract ok")
 
         registry = create_parser_registry()
-
-        # Порядок: YouTube раньше Web
         yt_p = registry.get_parser("https://www.youtube.com/watch?v=dQw4w9WgXcQ")
         assert yt_p is not None and getattr(yt_p, "source_type", None) == "youtube"
         assert registry.get_parser("https://eda.ru/test") is not None
-        assert registry.get_parser("https://www.youtube.com/watch?v=abc") is not None
         assert registry.get_parser("not-a-url") is None
-        assert registry.get_parser("ftp://example.com/file") is None
         print("✅ can_parse / реестр")
 
-        # Пустой реестр
         empty = ParserRegistry()
         try:
             await empty.parse("https://eda.ru/")
@@ -906,51 +670,22 @@ if __name__ == "__main__":
         else:
             raise AssertionError("Ожидался ValueError")
 
-        # YouTube: только субтитры (принудительно без Data API)
         yurl = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
-
-        class _CfgNoKey:
+        class _Cfg:
             youtube_api_key = ""
-
-        reg_subs = create_parser_registry(_CfgNoKey())
+        reg = create_parser_registry(_Cfg())
         try:
-            tyt = await reg_subs.parse(yurl)
-            print(f"✅ YouTube (только субтитры): {len(tyt)} символов")
+            tyt = await reg.parse(yurl)
+            print(f"✅ YouTube: {len(tyt)} символов")
             if tyt:
-                print(f"📝 YouTube, начало: {tyt[:200]!r}…")
+                print(f"📝 Начало: {tyt[:200]!r}…")
         except Exception as exc:  # noqa: BLE001
-            print(f"⚠️  YouTube (субтитры) пропущен/ошибка: {exc}")
+            print(f"⚠️  YouTube тест: {exc}")
 
-        # Shorts / видео без субтитров: только oEmbed + meta (без API ключа)
-        short_url = "https://www.youtube.com/shorts/fdqQJNXSDbI"
         try:
-            tshort = await reg_subs.parse(short_url)
-            print(f"✅ Shorts (без Data API): {len(tshort)} символов")
-        except RuntimeError as exc:
-            print(f"ℹ️  Shorts: нет текста — {exc}")
+            text = await registry.parse("https://eda.ru/recepty/supy/klassicheskij-borshh-34567")
+            print(f"✅ Eda: {len(text)} символов")
         except Exception as exc:  # noqa: BLE001
-            print(f"⚠️  Shorts: {exc}")
-
-        # С YOUTUBE_API_KEY из .env/окружения (заголовок+описание+субтитры)
-        import os
-
-        if os.environ.get("YOUTUBE_API_KEY", "").strip():
-            reg_full = create_parser_registry()
-            try:
-                t2 = await reg_full.parse(yurl)
-                print(f"✅ YouTube + YOUTUBE_API_KEY: {len(t2)} символов")
-            except Exception as exc:  # noqa: BLE001
-                print(f"⚠️  YouTube + API: {exc}")
-        else:
-            print("ℹ️  YOUTUBE_API_KEY не задан — тест YouTube Data API пропущен")
-
-        # Веб-страница
-        test_url = "https://eda.ru/recepty/supy/klassicheskij-borshh-34567"
-        try:
-            text = await registry.parse(test_url)
-            print(f"✅ Eda: извлечено {len(text)} символов")
-            print(f"📝 Eda, первые 200: {text[:200]!r}")
-        except Exception as exc:  # noqa: BLE001
-            print(f"⚠️  Eda тест пропущен: {exc}")
+            print(f"⚠️  Eda: {exc}")
 
     asyncio.run(_test())

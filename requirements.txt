@@ -6,9 +6,9 @@ beautifulsoup4==4.12.3
 lxml==5.3.0
 readability-lxml==0.8.1
 
-# YouTube: субтитры + (опц.) YouTube Data API
+# YouTube: метаданные (yt-dlp) + субтитры (fallback: youtube-transcript-api)
+yt-dlp>=2024.1.0
 youtube-transcript-api==0.6.2
-google-api-python-client==2.152.0
 
 # Telegram bot framework (block 6: bot)
 python-telegram-bot==22.7
