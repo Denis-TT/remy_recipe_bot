@@ -346,12 +346,12 @@ def _youtube_watch_page_description(video_id: str) -> Tuple[str, Optional[str]]:
     if og and og.get("content"):
         txt = str(og["content"]).strip()
         if txt:
-            return txt, None
+            return _strip_youtube_description_text(txt), None
     meta = soup.find("meta", attrs={"name": "description"})
     if meta and meta.get("content"):
         txt = str(meta["content"]).strip()
         if txt:
-            return txt, None
+            return _strip_youtube_description_text(txt), None
     return "", "на странице нет og:description / meta description"
 
 
@@ -378,28 +378,189 @@ def _youtube_list_transcripts(video_id: str) -> Any:
     return ytt.list(video_id)
 
 
-def _flatten_subtitle_fetch(data: Any) -> str:
-    """Склеить субтитры в одну строку (list[dict] или FetchedTranscript)."""
+# Субтитры: теги по факту уже частично сняты парсером YouTube, но в тексте
+# остаются HTML-обрывки, служебные […], разрывы «число / единица».
+_SUBTITLE_HTML_TAG_RE = re.compile(r"<[^>]+>", re.IGNORECASE)
+# Метатеги вроде [музыка], [аплодисменты] (EN + RU) — мешают нормализатору.
+_CC_BRACKET_NOISE = re.compile(
+    r"\[[^\]]{0,200}?"
+    r"(?:"
+    r"музык|аплодисмент|звук|шум|тих|тиш|инструмент|"
+    r"music|applause|laughter|laughing|silence|singing|noise|indistinct|"
+    r"inaudible|crowd|beat|beep|click|bass|guitar|piano|drum|"
+    r"♪|♫|\u266a|\u266b"
+    r")"
+    r"[^\]]{0,200}?\]",
+    re.IGNORECASE,
+)
+# Таймкоды [1:30] / [00:00] в субтитрах.
+_CC_TIME_BRACKETS = re.compile(r"\[\d{1,2}:\d{2}(?::\d{2})?(?:\s*-\s*\d{1,2}:\d{2}(?::\d{2})?)?\]")
+# Хэштеги и «хвосты» #слово в описании.
+_YT_DESC_HASHTAG_RE = re.compile(r"#[A-Za-z0-9_\u0400-\u04FF\u0500-\u052F]+")
+# Популярные эмодзи в описаниях (без внешних зависимостей).
+_YT_DESC_EMOJI_RE = re.compile(
+    "["
+    "\U0001F1E0-\U0001F1FF"  # флаги
+    "\U0001F300-\U0001FAFF"  # pictographs, дополнения
+    "\U00002700-\U000027BF"  # Dingbats
+    "\U0001F600-\U0001F64F"  # emoticons
+    "\U0001F680-\U0001F6FF"  # transport & map
+    "\U0001F700-\U0001F7FF"  # alchemical
+    "\U0001F800-\U0001F8FF"  # supplemental arrows
+    "\U0001F900-\U0001F9FF"  # supplemental smilies & hands
+    "\U0001FA00-\U0001FAFF"  # extended-A
+    "\U00002600-\U000026FF"  # misc symbols
+    "\uFE00-\uFE0F"  # variation selectors
+    "\u200D"  # ZWJ
+    "]+"
+)
+
+
+def _raw_subtitle_texts(data: Any) -> List[str]:
+    """Извлечь список фрагментов текста из ответа fetch / FetchedTranscript."""
     if not data:
-        return ""
+        return []
     if isinstance(data, list):
-        parts: List[str] = []
-        for item in data:
-            if isinstance(item, dict) and "text" in item:
-                parts.append(str(item["text"]).strip())
-        return re.sub(r"\s+", " ", " ".join(parts)).strip()
+        return [
+            str(item.get("text", "") or "")
+            for item in data
+            if isinstance(item, dict) and "text" in item
+        ]
     to_raw = getattr(data, "to_raw_data", None)
     if callable(to_raw):
-        return _flatten_subtitle_fetch(to_raw())
-    return re.sub(r"\s+", " ", str(data)).strip()
+        return _raw_subtitle_texts(to_raw())
+    return []
+
+
+def _clean_one_subtitle_line(text: str) -> str:
+    t = (text or "").replace("\n", " ").replace("\r", " ")
+    t = _SUBTITLE_HTML_TAG_RE.sub(" ", t)
+    t = _CC_BRACKET_NOISE.sub(" ", t)
+    t = _CC_TIME_BRACKETS.sub(" ", t)
+    t = re.sub(r"[ \t\u00a0]+", " ", t).strip()
+    return t
+
+
+def _join_subtitle_segments(segments: List[str]) -> str:
+    """Склеить сегменты: пробел между фрагментами, единый проход схлопывания пробелов.
+
+    YouTube нередко режет фразу так, что количество и «г/мл/шт» оказываются в
+    соседних сегментах — после join получаем «200 г»; внутри сегмента переносы
+    заменяются в `_clean_one_subtitle_line`.
+    """
+    parts = [_clean_one_subtitle_line(s) for s in segments if s and str(s).strip()]
+    text = " ".join(parts)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def _clean_subtitle_fetch(data: Any) -> str:
+    """Превратить ответ fetch (list[dict] / FetchedTranscript) в очищенную строку."""
+    if not data:
+        return ""
+    if isinstance(data, str):
+        return _join_subtitle_segments([data])
+    parts = _raw_subtitle_texts(data)
+    if not parts:
+        to_raw = getattr(data, "to_raw_data", None)
+        if not callable(to_raw):
+            return re.sub(r"\s+", " ", str(data)).strip()
+        return _clean_subtitle_fetch(to_raw())  # type: ignore[no-untyped-call]
+    return _join_subtitle_segments(parts)
+
+
+def _flatten_subtitle_fetch(data: Any) -> str:
+    """Совместимое имя: «склеить + очистить» (раньше только склеивали)."""
+    return _clean_subtitle_fetch(data)
+
+
+def _transcript_lang_code(tr_obj: Any) -> str:
+    return str(
+        getattr(tr_obj, "language_code", None) or getattr(tr_obj, "language", None) or "?"
+    )
+
+
+def _select_transcript_track(
+    tlist: Any, all_tr: List[Any], NoTranscriptFound: Any
+) -> Tuple[Any, str, str]:
+    """Предпочесть ASR (авто) ru → ASR en → ручные ru/en → любая ASR → любая дорожка.
+
+    Возвращает: (transcript, kind: "auto"|"manual", label для логов)
+    """
+    # 1) Автосубтитры: русский, затем английский (как в find_generated_transcript)
+    if hasattr(tlist, "find_generated_transcript"):
+        try:
+            t = tlist.find_generated_transcript(["ru", "en"])
+            return t, "auto", "авто поиск ru/en"
+        except NoTranscriptFound:
+            pass
+    # 1b) fallback: та же логика ru → en, если find_generated не сработал
+    for code in ("ru", "en"):
+        for t in all_tr:
+            if getattr(t, "is_generated", False) and getattr(t, "language_code", None) == code:
+                return t, "auto", f"asr {code} (обход по списку)"
+
+    # 2) Ручные ru / en
+    if hasattr(tlist, "find_manually_created_transcript"):
+        try:
+            t = tlist.find_manually_created_transcript(["ru", "en"])
+            return t, "manual", "ручные ru/en"
+        except NoTranscriptFound:
+            pass
+    for code in ("ru", "en"):
+        for t in all_tr:
+            if (
+                getattr(t, "language_code", None) == code
+                and not getattr(t, "is_generated", False)
+            ):
+                return t, "manual", f"ручной {code} (обход по списку)"
+
+    # 3) find_transcript: ручной приоритет, иначе ASR
+    try:
+        t = tlist.find_transcript(["ru", "en"])
+        kind = "auto" if getattr(t, "is_generated", False) else "manual"
+        return t, kind, "find_transcript ru/en"
+    except NoTranscriptFound:
+        pass
+
+    # 4) Любые автодорожки
+    for t in all_tr:
+        if getattr(t, "is_generated", False):
+            return t, "auto", "первая доступная ASR"
+    if all_tr:
+        t = all_tr[0]
+        kind = "auto" if getattr(t, "is_generated", False) else "manual"
+        return t, kind, "первая доступная дорожка"
+
+    raise RuntimeError("_select_transcript_track: all_tr is empty (внутренняя ошибка)")
+
+
+def _strip_youtube_description_text(text: str) -> str:
+    """Описание под видео: убрать хэштеги и эмодзи, оставить читаемый текст."""
+    s = (text or "").replace("\r\n", "\n")
+    s = _YT_DESC_HASHTAG_RE.sub(" ", s)
+    s = _YT_DESC_EMOJI_RE.sub("", s)
+    lines_out: List[str] = []
+    for line in s.splitlines():
+        collapsed = re.sub(r"[ \t\u00a0]+", " ", line).strip()
+        if collapsed:
+            lines_out.append(collapsed)
+    s = "\n".join(lines_out)
+    s = re.sub(r"\n{3,}", "\n\n", s)
+    s = re.sub(r"[ \t\u00a0]+", " ", s)
+    return s.strip()
 
 
 class YouTubeParser(BaseParser):
     """YouTube: субтитры, затем (опц.) Data API, затем oEmbed и HTML watch.
 
-    Порядок: ru/en и автоген на любом языке → YouTube Data API (ключ)
-    → oEmbed-заголовок → meta-описание со страницы. Без субтитров
-    остаётся доступный текст (описание), без необработанных падений.
+    Субтитры: в приоритете ASR (автосубтитры) ru → ASR en, затем ручные
+    ru/en, затем любая доступная дорожка. Текст субтитров очищается
+    (HTML, служебные [музыка] и т. п.) для устойчивого разбора количеств.
+
+    Описание из Data API / meta-описание со /watch: без эмодзи и хэштегов.
+
+    Без субтитров остаётся доступный текст (описание), без необработанных падений.
     """
 
     source_type: str = "youtube"
@@ -462,7 +623,7 @@ class YouTubeParser(BaseParser):
                 logger.warning("⚠️ Публичная страница: %s", page_reason)
 
         final_title = (title or oembed_title or "").strip()
-        final_desc = (desc or page_desc or "").strip()
+        final_desc = _strip_youtube_description_text((desc or page_desc or "").strip())
 
         if (final_title or final_desc) and not sub_text:
             logger.warning(
@@ -526,40 +687,32 @@ class YouTubeParser(BaseParser):
             logger.warning("⚠️ %s", reason)
             return "", "", reason
 
-        tr_obj: Any = None
-        pick_reason = ""
-
         try:
-            tr_obj = tlist.find_transcript(["ru", "en"])
-            pick_reason = "дорожка ru/en (ручная/автоген)"
-        except NoTranscriptFound:
-            logger.info("ℹ️ субтитры ru/en не найдены (NoTranscriptFound) — ищем автоген/другой язык")
-            tr_obj = None
-            for t in all_tr:
-                if getattr(t, "is_generated", False):
-                    tr_obj = t
-                    pick_reason = f"автоген, язык {getattr(t, 'language_code', '?')}"
-                    break
-            if tr_obj is None and all_tr:
-                tr_obj = all_tr[0]
-                pick_reason = f"доступная дорожка, язык {getattr(tr_obj, 'language_code', '?')}"
-
-        lang = str(
-            getattr(tr_obj, "language_code", None) or getattr(tr_obj, "language", None) or "?"
-        )
+            tr_obj, sub_kind, pick_reason = _select_transcript_track(
+                tlist, all_tr, NoTranscriptFound
+            )
+        except RuntimeError as exc:
+            logger.error("❌ выбор дорожки субтитров: %s", exc)
+            return "", "", str(exc)
+        lang = _transcript_lang_code(tr_obj)
         try:
             raw = tr_obj.fetch()
         except Exception as exc:  # noqa: BLE001
             logger.error("❌ fetch() субтитров: %s: %s", type(exc).__name__, exc)
             return "", "", f"сбой fetch: {type(exc).__name__}"
 
-        sub_text = _flatten_subtitle_fetch(raw)
+        sub_text = _clean_subtitle_fetch(raw)
         if not sub_text:
             r = f"текст дорожки пуст ({pick_reason})"
             logger.warning("⚠️ %s", r)
             return "", "", r
 
-        logger.info("📝 Получены субтитры (%s): %s символов — %s", lang, self._format_number(len(sub_text)), pick_reason)
+        nchars = self._format_number(len(sub_text))
+        if sub_kind == "auto":
+            logger.info("✅ Автосубтитры (%s), %s символов", lang, nchars)
+        else:
+            logger.info("⚠️ Ручные субтитры (%s), %s символов", lang, nchars)
+        logger.debug("Метка дорожки: %s", pick_reason)
         return sub_text, lang, ""
 
     def _fallback_get_transcript_only(
@@ -575,9 +728,12 @@ class YouTubeParser(BaseParser):
             r = f"{reason_prefix}; get_transcript: {type(exc2).__name__}: {exc2}"
             logger.error("❌ %s", r)
             return "", "", r
-        sub = _flatten_subtitle_fetch(raw)
+        sub = _clean_subtitle_fetch(raw)
         if sub:
-            logger.info("📝 Получены субтитры (get_transcript): %s символов", self._format_number(len(sub)))
+            logger.info(
+                "ℹ️ Субтитры (get_transcript, без метаданных ASR/ручн.), %s символов",
+                self._format_number(len(sub)),
+            )
             return sub, "mixed", ""
         return "", "", f"{reason_prefix}; get_transcript вернул пустой текст"
 
@@ -615,7 +771,9 @@ class YouTubeParser(BaseParser):
                 logger.warning("YouTube Data API: пустой items (ид не найден или нет прав) — oEmbed / meta")
             return "", ""
         sn: Dict[str, Any] = items[0].get("snippet") or {}
-        return str(sn.get("title", "") or ""), str(sn.get("description", "") or "")
+        title_sn = str(sn.get("title", "") or "")
+        desc_sn = str(sn.get("description", "") or "")
+        return title_sn, _strip_youtube_description_text(desc_sn)
 
     @staticmethod
     def _format_number(value: int) -> str:
