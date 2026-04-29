@@ -49,6 +49,16 @@ logger = logging.getLogger("remy.handlers.messages")
 # Максимальная длина одного Telegram-сообщения с учётом HTML-тегов.
 _TG_MESSAGE_LIMIT: int = 4096
 
+# Видимый текст дисклеймера ИИ (без тегов) — для проверок и документации.
+_RECIPE_AI_DISCLAIMER_TEXT: str = "Рецепт обработан ИИ, возможны неточности"
+
+# Часть карточки после основного текста: пустая строка + курсив (HTML).
+# Вариант A — деликатно предупреждает о возможных ошибках без подрыва доверия к боту.
+_RECIPE_AI_DISCLAIMER_HTML: str = f"\n\n<i>{_RECIPE_AI_DISCLAIMER_TEXT}</i>"
+
+# Суффикс при превышении лимита Telegram; ставится перед дисклеймером.
+_TRUNCATED_NOTICE_HTML: str = "\n…\n<i>(сокращено)</i>"
+
 # Регэксп для поиска URL в произвольном сообщении (берём первый http/https).
 # Допускаем любой непробельный суффикс — валидацию реальной доступности
 # выполняет парсер; лучше ошибиться в сторону «попробовали и узнали».
@@ -211,7 +221,8 @@ def format_recipe(recipe: Mapping[str, Any], bot: "RemyBot") -> str:
 
     Returns:
         Строка, готовая к отправке Telegram с `parse_mode=HTML`.
-        Длина гарантированно не превышает 4096 символов.
+        В конце добавлен дисклеймер об ИИ; длина гарантированно не превышает
+        4096 символов (при обрезке длинного текста дисклеймер сохраняется).
     """
     loc = bot.loc
 
@@ -283,11 +294,21 @@ def format_recipe(recipe: Mapping[str, Any], bot: "RemyBot") -> str:
             prefix = f"{num}. " if num else "• "
             lines.append(prefix + _html_escape(desc))
 
-    text = "\n".join(lines)
-    if len(text) > _TG_MESSAGE_LIMIT:
-        # Не режем по байтам грубо, чтобы не сломать HTML-тег.
-        text = text[: _TG_MESSAGE_LIMIT - 40].rstrip() + "\n…\n<i>(сокращено)</i>"
-    return text
+    # Основной текст карточки (до дисклеймера и возможной обрезки).
+    body = "\n".join(lines)
+    disc = _RECIPE_AI_DISCLAIMER_HTML
+
+    # Дисклеймер всегда в конце; если целиком не влезает — сначала укорачиваем body.
+    if len(body) + len(disc) <= _TG_MESSAGE_LIMIT:
+        return body + disc
+
+    # Резервируем место под маркер «сокращено» и дисклеймер (как в оригинале — буфер ~40
+    # символов, чтобы не резать посередине многобайтового символа / границы тега).
+    suffix_total = len(_TRUNCATED_NOTICE_HTML) + len(disc)
+    max_main = _TG_MESSAGE_LIMIT - suffix_total
+    safe_cut = max(0, max_main - 40)
+    truncated = body[:safe_cut].rstrip() + _TRUNCATED_NOTICE_HTML + disc
+    return truncated
 
 
 # Имя из ТЗ / внешних импортов: одна реализация, без дублирования в `utils.py`.
@@ -365,3 +386,53 @@ async def _safe_edit(message: Message, text: str, **kwargs: Any) -> None:
         await message.edit_text(text, parse_mode=ParseMode.HTML, **kwargs)
     except BadRequest as exc:
         logger.warning("⚠️  Не удалось отредактировать сообщение: %s", exc)
+
+
+# --------------------------------------------------------------------------- #
+# Локальная проверка format_recipe (без Telegram)
+# --------------------------------------------------------------------------- #
+
+
+if __name__ == "__main__":
+    import os
+    import sys
+    from importlib import reload
+    from pathlib import Path
+
+    _root = Path(__file__).resolve().parent.parent.parent
+    sys.path.insert(0, str(_root))
+
+    os.environ.setdefault("TELEGRAM_BOT_TOKEN", "test:telegram")
+    os.environ.setdefault("GITHUB_TOKEN", "test-github")
+    os.environ.setdefault("SUPABASE_URL", "https://example.supabase.co")
+    os.environ.setdefault("SUPABASE_KEY", "test-key")
+
+    import config as _cfg_module  # noqa: E402
+
+    reload(_cfg_module)
+
+    from src.bot import RemyBot  # noqa: E402
+
+    _bot = RemyBot(_cfg_module.config)
+
+    _demo: Mapping[str, Any] = {
+        "title": "Тест дисклеймера",
+        "meal_type": "lunch",
+        "dish_type": "soup",
+        "main_ingredient": "beef",
+        "difficulty": "medium",
+        "cuisine": "russian",
+        "ingredients": [{"name": "Вода", "amount": 1, "unit": "л", "notes": ""}],
+        "steps": [],
+    }
+
+    _out = format_recipe(_demo, _bot)
+    assert _RECIPE_AI_DISCLAIMER_TEXT in _out
+
+    _long = dict(_demo)
+    _long["steps"] = [{"step_number": 1, "description": "Д" * 12000}]
+    _out_long = format_recipe(_long, _bot)
+    assert _RECIPE_AI_DISCLAIMER_TEXT in _out_long
+    assert len(_out_long) <= _TG_MESSAGE_LIMIT
+
+    print("✅ format_recipe: дисклеймер и лимит длины ок")

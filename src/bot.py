@@ -275,6 +275,7 @@ if __name__ == "__main__":
     assert "500" in text and "Говядина" in text
     assert "1. Сварить бульон." in text
     assert "350" in text and "ккал" in text
+    assert "Рецепт обработан ИИ" in text
 
     # --- Клавиатуры ---------------------------------------------------- #
     from src.keyboards import (  # noqa: E402
