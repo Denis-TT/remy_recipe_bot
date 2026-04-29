@@ -13,9 +13,12 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import logging
 import os
 import re
+import urllib.error
+import urllib.request
 from abc import ABC, abstractmethod
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -429,6 +432,9 @@ class YouTubeParser(BaseParser):
 
     После первой ошибки yt-dlp при использовании файла cookies путь сбрасывается в памяти
     парсера до перезапуска процесса — чтобы не дергать заведомо проблемный файл на каждом URL.
+
+    Если yt-dlp и субтитры не дали текста, вызывается :meth:`_youtube_watch_page_description`
+    — разбор публичной HTML-страницы ``/watch`` (meta og:title / og:description).
     """
 
     source_type: str = "youtube"
@@ -536,6 +542,24 @@ class YouTubeParser(BaseParser):
             parts.append("Теги: " + tag_line)
 
         if not any(p.strip() for p in parts):
+            logger.warning(
+                "⚠️ yt-dlp и субтитры не дали текста — пробуем HTML страницы /watch",
+            )
+            raw_title, raw_desc = self._youtube_watch_page_description(url.strip(), video_id)
+            fb_title = _strip_youtube_title_text(raw_title) if raw_title else ""
+            fb_desc = _strip_youtube_description_text(raw_desc) if raw_desc else ""
+            if fb_title:
+                parts.append(fb_title)
+            if fb_desc:
+                parts.append(fb_desc)
+            if fb_title or fb_desc:
+                logger.info(
+                    "📄 Фолбэк со страницы watch применён: заголовок %s симв., текст описания %s симв.",
+                    len(fb_title),
+                    len(fb_desc),
+                )
+
+        if not any(p.strip() for p in parts):
             logger.error("❌ %s", self._ERR_NO_TEXT)
             raise RuntimeError(self._ERR_NO_TEXT)
 
@@ -570,6 +594,69 @@ class YouTubeParser(BaseParser):
             self.cookie_file,
         )
         return None
+
+    def _youtube_watch_page_description(self, url: str, video_id: str) -> Tuple[str, str]:
+        """Публичная страница ``/watch``: заголовок и описание из HTML (без yt-dlp / transcript-api).
+
+        Используется, если yt-dlp и субтитры не дали текста (капча, отключённые дорожки).
+        Строки возвращаются до очистки — см. вызывающий :meth:`_parse_sync`.
+
+        Args:
+            url: Исходный URL пользователя (для будущих расширений; страница строится по ``video_id``).
+            video_id: 11-символьный идентификатор ролика.
+        """
+        _ = url
+        watch_url = f"https://www.youtube.com/watch?v={video_id}"
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Safari/537.36"
+            ),
+            "Accept": "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
+        }
+        req = urllib.request.Request(watch_url, headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=25) as resp:
+                raw_bytes = resp.read()
+        except urllib.error.HTTPError as exc:
+            logger.warning("⚠️ Фолбэк HTML watch: HTTP %s для %s", exc.code, watch_url)
+            return "", ""
+        except urllib.error.URLError as exc:
+            logger.warning("⚠️ Фолбэк HTML watch: ошибка URL %s (%s)", watch_url, exc)
+            return "", ""
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("⚠️ Фолбэк HTML watch: не удалось загрузить страницу: %s", exc)
+            return "", ""
+
+        html_text = raw_bytes.decode("utf-8", errors="replace")
+        soup = BeautifulSoup(html_text, "lxml")
+
+        title_s = ""
+        og_title = soup.find("meta", attrs={"property": "og:title"})
+        if og_title and og_title.get("content"):
+            title_s = html.unescape(str(og_title["content"]).strip())
+        if not title_s:
+            meta_title = soup.find("meta", attrs={"name": "title"})
+            if meta_title and meta_title.get("content"):
+                title_s = html.unescape(str(meta_title["content"]).strip())
+
+        desc_s = ""
+        og_desc = soup.find("meta", attrs={"property": "og:description"})
+        if og_desc and og_desc.get("content"):
+            desc_s = html.unescape(str(og_desc["content"]).strip())
+        if not desc_s:
+            meta_desc = soup.find("meta", attrs={"name": "description"})
+            if meta_desc and meta_desc.get("content"):
+                desc_s = html.unescape(str(meta_desc["content"]).strip())
+
+        if not title_s and not desc_s:
+            logger.warning(
+                "⚠️ Фолбэк HTML watch: в разметке не найдены og:title / og:description (%s)",
+                watch_url,
+            )
+        return title_s, desc_s
 
     def _load_subtitles(self, video_id: str) -> Tuple[str, str, str]:
         """Субтитры: (текст, язык, причина; пустая строка = OK)."""

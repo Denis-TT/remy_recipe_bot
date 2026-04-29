@@ -3,7 +3,8 @@
 Точка входа Remy Bot.
 
 Отвечает за:
-* защиту от множественного запуска (через файловую блокировку);
+* защиту от множественного запуска (PID в ``/tmp/remy_bot.lock`` + ``os.kill(pid,0)``,
+  удаление устаревшего lock, затем эксклюзивная блокировка ``fcntl``);
 * настройку логирования (stdout + logs/remy.log с ротацией);
 * опциональный HTTP healthcheck на порту 8081;
 * корректную (graceful) остановку по SIGTERM/SIGINT.
@@ -14,6 +15,7 @@
 from __future__ import annotations
 
 import atexit
+import errno
 import fcntl
 import json
 import logging
@@ -111,16 +113,73 @@ def setup_logging() -> None:
 # Защита от множественного запуска
 # --------------------------------------------------------------------------- #
 
+
+def _read_pid_from_lock_file() -> Optional[int]:
+    """Прочитать PID из lock-файла или ``None``, если файла/числа нет."""
+    try:
+        raw = LOCK_FILE_PATH.read_text(encoding="utf-8").strip().split()
+        if not raw:
+            return None
+        pid = int(raw[0])
+        return pid if pid > 0 else None
+    except (OSError, ValueError):
+        return None
+
+
+def _pid_is_alive(pid: int) -> bool:
+    """Проверить существование процесса без отправки сигнала (``kill(pid, 0)``)."""
+    try:
+        os.kill(pid, 0)
+    except OSError as exc:
+        if exc.errno == errno.ESRCH:
+            return False
+        # EPERM и др. — процесс может существовать, доступ ограничен.
+        return True
+    return True
+
+
 def ensure_single_instance() -> None:
     """Гарантировать, что запущен ровно один экземпляр бота.
 
-    Использует эксклюзивную неблокирующую блокировку на файле
-    `/tmp/remy_bot.lock` (`fcntl.lockf` с `LOCK_EX | LOCK_NB`).
-    Если блокировка уже захвачена — пишет ошибку и завершает процесс
-    с кодом 1. Файловый дескриптор удерживается до выхода из процесса,
-    его освобождение зарегистрировано через `atexit`.
+    1) Если ``/tmp/remy_bot.lock`` уже есть и PID из файла жив —
+       немедленный выход с кодом 1 (защита от второго контейнера/процесса и 409 Conflict в Telegram).
+    2) Если PID мёртв — удалить устаревший lock и продолжить.
+    3) Эксклюзивная неблокирующая блокировка ``fcntl.lockf(LOCK_EX | LOCK_NB)`` на том же файле;
+       при занятости — выход с кодом 1. FD держится до конца процесса, снятие через ``atexit``.
     """
     global _lock_file_handle
+
+    if LOCK_FILE_PATH.is_file():
+        stale_pid = _read_pid_from_lock_file()
+        if stale_pid is not None:
+            if _pid_is_alive(stale_pid):
+                logger.error(
+                    "❌ Уже запущен процесс бота (PID %s по файлу %s). "
+                    "Повторный запуск приведёт к 409 Conflict в Telegram — завершение.",
+                    stale_pid,
+                    LOCK_FILE_PATH,
+                )
+                sys.exit(1)
+            logger.warning(
+                "⚠️ Устаревший lock (PID %s не существует), удаляю %s",
+                stale_pid,
+                LOCK_FILE_PATH,
+            )
+            try:
+                LOCK_FILE_PATH.unlink()
+            except OSError as exc:
+                logger.error("❌ Не удалось удалить устаревший lock %s: %s", LOCK_FILE_PATH, exc)
+                sys.exit(1)
+        else:
+            logger.warning(
+                "⚠️ Lock-файл %s без корректного PID — удаляю",
+                LOCK_FILE_PATH,
+            )
+            try:
+                LOCK_FILE_PATH.unlink()
+            except OSError as exc:
+                logger.error("❌ Не удалось удалить повреждённый lock %s: %s", LOCK_FILE_PATH, exc)
+                sys.exit(1)
 
     try:
         # Открываем в режиме записи, чтобы и создать файл, и удержать fd.
