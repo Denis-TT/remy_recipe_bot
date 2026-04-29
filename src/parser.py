@@ -17,6 +17,7 @@ import html
 import logging
 import os
 import re
+import time
 import urllib.error
 import urllib.request
 from abc import ABC, abstractmethod
@@ -181,14 +182,55 @@ def _extract_youtube_video_id(url: str) -> str:
     return m.group(1) if m else ""
 
 
-def _youtube_list_transcripts(video_id: str) -> Any:
-    """Совместимость youtube-transcript-api 0.6.x (list_transcripts) и 1.x (list)."""
+def _youtube_list_transcripts(video_id: str, cookies: Optional[str] = None) -> Any:
+    """Совместимость youtube-transcript-api 0.6.x (list_transcripts) и 1.x (list).
+
+    ``cookies`` — путь к Netscape cookies.txt (тот же файл, что для yt-dlp), опционально.
+    """
     from youtube_transcript_api import YouTubeTranscriptApi
 
     if hasattr(YouTubeTranscriptApi, "list_transcripts"):
-        return YouTubeTranscriptApi.list_transcripts(video_id)  # type: ignore[no-any-return, misc]
+        return YouTubeTranscriptApi.list_transcripts(  # type: ignore[no-any-return, misc]
+            video_id,
+            proxies=None,
+            cookies=cookies,
+        )
     ytt = YouTubeTranscriptApi()  # type: ignore[call-arg]
-    return ytt.list(video_id)
+    return ytt.list(video_id, proxies=None, cookies=cookies)
+
+
+def _exc_is_transcript_rate_limit(exc: BaseException) -> bool:
+    """429 / Too Many Requests от transcript-api — имеет смысл повторить запрос позже."""
+    try:
+        from youtube_transcript_api._errors import TooManyRequests, YouTubeRequestFailed
+    except ImportError:
+        return "429" in f"{exc}" and "Too Many" in f"{exc}"
+
+    if isinstance(exc, TooManyRequests):
+        return True
+    if isinstance(exc, YouTubeRequestFailed):
+        r = getattr(exc, "reason", str(exc))
+        rs = str(r)
+        return "429" in rs or "Too Many Requests" in rs
+    text = f"{type(exc).__name__}: {exc}"
+    return "429" in text and "Too Many Requests" in text
+
+
+def _youtube_watch_html_looks_rate_limited(html_text: str) -> bool:
+    """Эвристика страницы-заглушки после лимита IP (не полноценный watch с og:-мета)."""
+    if not html_text.strip():
+        return False
+    low = html_text.lower()
+    if "429" in html_text:
+        return True
+    if "too many requests" in low:
+        return True
+    # Частые формулировки заглушки / блокировки (не используем голый «sorry» — ложные срабатывания).
+    if "sorry" in low and any(
+        x in low for x in ("try again", "something went wrong", "many requests", "unusual traffic")
+    ):
+        return True
+    return False
 
 
 _SUBTITLE_HTML_TAG_RE = re.compile(r"<[^>]+>", re.IGNORECASE)
@@ -419,9 +461,9 @@ class YouTubeParser(BaseParser):
     Ключ YouTube Data API не требуется. Параметр `youtube_api_key` в конструкторе
     оставлен для обратной совместимости с `create_parser_registry` и игнорируется.
 
-    **Cookies (``YOUTUBE_COOKIE_FILE``):** передаются **только в yt-dlp** при запросе
-    метаданных видео. Запросы ``youtube_transcript_api`` к страницам транскриптов cookies
-    из этого файла не используют — см. также :func:`_yt_dlp_extract_metadata`.
+    **Cookies (``YOUTUBE_COOKIE_FILE``):** тот же Netscape cookies.txt передаётся в **yt-dlp**
+    и в **youtube_transcript_api** (список дорожек и ``get_transcript``), чтобы снизить отказы
+    по капче/боту на стороне YouTube.
 
     Cookies для yt-dlp (обход проверки «Sign in to confirm you're not a bot»):
 
@@ -433,14 +475,16 @@ class YouTubeParser(BaseParser):
     После первой ошибки yt-dlp при использовании файла cookies путь сбрасывается в памяти
     парсера до перезапуска процесса — чтобы не дергать заведомо проблемный файл на каждом URL.
 
-    Если yt-dlp и субтитры не дали текста, вызывается :meth:`_youtube_watch_page_description`
-    — разбор публичной HTML-страницы ``/watch`` (meta og:title / og:description).
+    Порядок запросов: субтитры (transcript-api, с retry при 429) → при успешном тексте субтитров
+    yt-dlp не вызывается; иначе метаданные через yt-dlp → при полном провале — HTML ``/watch``.
     """
 
     source_type: str = "youtube"
     MAX_TEXT_LENGTH: int = 50_000
 
     _ERR_NO_TEXT = "Не удалось извлечь текст из видео"
+    _YOUTUBE_RATE_LIMIT_USER_MESSAGE = "YouTube временно ограничил доступ. Попробуйте позже."
+    _SUBTITLE_RETRY_DELAYS_SEC: Tuple[float, float] = (2.0, 4.0)
 
     def __init__(self, youtube_api_key: str = "", cookie_file: str | None = None) -> None:
         # API-ключ не используется (было только для YouTube Data API).
@@ -476,60 +520,81 @@ class YouTubeParser(BaseParser):
 
         cookie_path = self._resolved_cookie_file()
 
+        # Субтитры первыми (retry при 429): меньше шансов «прожечь» лимит yt-dlp сразу.
+        sub_text, _sub_lang, sub_reason = self._load_subtitles_with_retry(video_id, cookie_path)
+
         info: Optional[Dict[str, Any]] = None
         ytdlp_ok = False
-        try:
-            info = _yt_dlp_extract_metadata(url.strip(), cookie_path)
-            ytdlp_ok = True
-        except Exception as exc:  # noqa: BLE001
-            if cookie_path:
-                # Не ERROR: для этого URL почти всегда есть повтор без cookies.
-                logger.warning(
-                    "⚠️ yt-dlp с cookies не удалось (%s), повторяем без cookies",
-                    exc,
-                )
-                self._disable_ytdlp_cookies_for_session()
-                try:
-                    info = _yt_dlp_extract_metadata(url.strip(), None)
-                    ytdlp_ok = True
-                except Exception as exc2:  # noqa: BLE001
-                    logger.error("❌ Не удалось получить данные через yt-dlp: %s", exc2)
-                    info = None
-                    ytdlp_ok = False
-            else:
-                logger.error("❌ Не удалось получить данные через yt-dlp: %s", exc)
-                info = None
-                ytdlp_ok = False
-
         title_raw = ""
         desc_raw = ""
         tags_list: List[Any] = []
-        if info:
-            title_raw = (info.get("title") or info.get("fulltitle") or "")
-            if not isinstance(title_raw, str):
-                title_raw = str(title_raw)
-            desc_raw = info.get("description") or ""
-            if not isinstance(desc_raw, str):
-                desc_raw = str(desc_raw) if desc_raw is not None else ""
-            raw_tags = info.get("tags")
-            if isinstance(raw_tags, list):
-                tags_list = raw_tags
-            elif raw_tags is not None:
-                tags_list = [raw_tags]
 
-        if ytdlp_ok and info:
-            dlen = len(desc_raw) if desc_raw else 0
-            t_short = (title_raw[:200] + "…") if len(title_raw) > 200 else title_raw
-            logger.info("📦 Данные получены через yt-dlp: title=%r, description=%s символов", t_short, dlen)
+        if sub_text.strip():
+            logger.info(
+                "📼 Субтитры есть — yt-dlp для этого URL не вызываем; заголовок/описание с HTML watch",
+            )
+            raw_title, raw_desc = self._youtube_watch_page_description(
+                url.strip(),
+                video_id,
+                strict_rate_limit=False,
+            )
+            title_raw = raw_title or ""
+            desc_raw = raw_desc or ""
+            tags_list = []
+        else:
+            try:
+                info = _yt_dlp_extract_metadata(url.strip(), cookie_path)
+                ytdlp_ok = True
+            except Exception as exc:  # noqa: BLE001
+                if cookie_path:
+                    logger.warning(
+                        "⚠️ yt-dlp с cookies не удалось (%s), повторяем без cookies",
+                        exc,
+                    )
+                    self._disable_ytdlp_cookies_for_session()
+                    try:
+                        info = _yt_dlp_extract_metadata(url.strip(), None)
+                        ytdlp_ok = True
+                    except Exception as exc2:  # noqa: BLE001
+                        logger.error("❌ Не удалось получить данные через yt-dlp: %s", exc2)
+                        info = None
+                        ytdlp_ok = False
+                else:
+                    logger.error("❌ Не удалось получить данные через yt-dlp: %s", exc)
+                    info = None
+                    ytdlp_ok = False
 
-        if not ytdlp_ok:
-            logger.warning("⚠️ yt-dlp не смог извлечь данные, пробуем fallback (субтитры через transcript-api)")
+            if info:
+                title_raw = (info.get("title") or info.get("fulltitle") or "")
+                if not isinstance(title_raw, str):
+                    title_raw = str(title_raw)
+                desc_raw = info.get("description") or ""
+                if not isinstance(desc_raw, str):
+                    desc_raw = str(desc_raw) if desc_raw is not None else ""
+                raw_tags = info.get("tags")
+                if isinstance(raw_tags, list):
+                    tags_list = raw_tags
+                elif raw_tags is not None:
+                    tags_list = [raw_tags]
+
+            if ytdlp_ok and info:
+                dlen = len(desc_raw) if desc_raw else 0
+                t_short = (title_raw[:200] + "…") if len(title_raw) > 200 else title_raw
+                logger.info(
+                    "📦 Данные получены через yt-dlp: title=%r, description=%s символов",
+                    t_short,
+                    dlen,
+                )
+
+            if not ytdlp_ok:
+                logger.warning(
+                    "⚠️ yt-dlp не дал метаданные (субтитры: %s)",
+                    (sub_reason[:120] + "…") if len(sub_reason) > 120 else sub_reason or "пусто",
+                )
 
         clean_title = _strip_youtube_title_text(title_raw)
         clean_desc = _strip_youtube_description_text(desc_raw) if desc_raw else ""
         tag_line = _format_tags_line(tags_list)
-
-        sub_text, _lang, _reason = self._load_subtitles(video_id)
 
         parts: List[str] = []
         if clean_title:
@@ -543,9 +608,13 @@ class YouTubeParser(BaseParser):
 
         if not any(p.strip() for p in parts):
             logger.warning(
-                "⚠️ yt-dlp и субтитры не дали текста — пробуем HTML страницы /watch",
+                "⚠️ Контента всё ещё нет — последний фолбэк: HTML страницы /watch",
             )
-            raw_title, raw_desc = self._youtube_watch_page_description(url.strip(), video_id)
+            raw_title, raw_desc = self._youtube_watch_page_description(
+                url.strip(),
+                video_id,
+                strict_rate_limit=True,
+            )
             fb_title = _strip_youtube_title_text(raw_title) if raw_title else ""
             fb_desc = _strip_youtube_description_text(raw_desc) if raw_desc else ""
             if fb_title:
@@ -554,7 +623,7 @@ class YouTubeParser(BaseParser):
                 parts.append(fb_desc)
             if fb_title or fb_desc:
                 logger.info(
-                    "📄 Фолбэк со страницы watch применён: заголовок %s симв., текст описания %s симв.",
+                    "📄 Фолбэк HTML watch: заголовок %s симв., описание %s симв.",
                     len(fb_title),
                     len(fb_desc),
                 )
@@ -567,6 +636,31 @@ class YouTubeParser(BaseParser):
         if len(text) > self.MAX_TEXT_LENGTH:
             text = text[: self.MAX_TEXT_LENGTH]
         return text
+
+    def _load_subtitles_with_retry(
+        self, video_id: str, transcript_cookies: Optional[str]
+    ) -> Tuple[str, str, str]:
+        """Субтитры с повторами при лимите YouTube (429). После исчерпания — сообщение пользователю."""
+        delays = self._SUBTITLE_RETRY_DELAYS_SEC
+        for attempt in range(3):
+            try:
+                return self._load_subtitles(video_id, transcript_cookies)
+            except Exception as exc:
+                if not _exc_is_transcript_rate_limit(exc):
+                    raise
+                if attempt >= 2:
+                    logger.error(
+                        "❌ transcript-api: лимит запросов после 3 попыток: %s",
+                        exc,
+                    )
+                    raise RuntimeError(self._YOUTUBE_RATE_LIMIT_USER_MESSAGE) from exc
+                wait = delays[attempt]
+                logger.warning(
+                    "⚠️ transcript-api: лимит (429), пауза %.0f с перед повтором (%s/3)",
+                    wait,
+                    attempt + 2,
+                )
+                time.sleep(wait)
 
     def _disable_ytdlp_cookies_for_session(self) -> None:
         """Не использовать файл cookies для yt-dlp до перезапуска процесса бота."""
@@ -595,17 +689,24 @@ class YouTubeParser(BaseParser):
         )
         return None
 
-    def _youtube_watch_page_description(self, url: str, video_id: str) -> Tuple[str, str]:
+    def _youtube_watch_page_description(
+        self,
+        url: str,
+        video_id: str,
+        *,
+        strict_rate_limit: bool = True,
+    ) -> Tuple[str, str]:
         """Публичная страница ``/watch``: заголовок и описание из HTML (без yt-dlp / transcript-api).
 
-        Используется, если yt-dlp и субтитры не дали текста (капча, отключённые дорожки).
-        Строки возвращаются до очистки — см. вызывающий :meth:`_parse_sync`.
+        Признаки страницы-заглушки (429 / лимит IP) обрабатываются до парсинга meta.
+        Если ``strict_rate_limit=True`` и обнаружена блокировка — ``RuntimeError`` с текстом для пользователя.
 
         Args:
-            url: Исходный URL пользователя (для будущих расширений; страница строится по ``video_id``).
-            video_id: 11-символьный идентификатор ролика.
+            strict_rate_limit: Если False и страница похожа на блокировку — вернуть ``("", "")`` без исключения
+                (например, когда уже есть текст субтитров).
         """
         _ = url
+        msg = self._YOUTUBE_RATE_LIMIT_USER_MESSAGE
         watch_url = f"https://www.youtube.com/watch?v={video_id}"
         headers = {
             "User-Agent": (
@@ -621,6 +722,11 @@ class YouTubeParser(BaseParser):
             with urllib.request.urlopen(req, timeout=25) as resp:
                 raw_bytes = resp.read()
         except urllib.error.HTTPError as exc:
+            if exc.code == 429:
+                logger.warning("⚠️ Фолбэк HTML watch: HTTP 429 для %s", watch_url)
+                if strict_rate_limit:
+                    raise RuntimeError(msg) from exc
+                return "", ""
             logger.warning("⚠️ Фолбэк HTML watch: HTTP %s для %s", exc.code, watch_url)
             return "", ""
         except urllib.error.URLError as exc:
@@ -631,6 +737,16 @@ class YouTubeParser(BaseParser):
             return "", ""
 
         html_text = raw_bytes.decode("utf-8", errors="replace")
+
+        if _youtube_watch_html_looks_rate_limited(html_text):
+            logger.warning(
+                "⚠️ Фолбэк HTML watch: похоже на блокировку/заглушку YouTube (429/sorry), не парсим og:-мета (%s)",
+                watch_url,
+            )
+            if strict_rate_limit:
+                raise RuntimeError(msg)
+            return "", ""
+
         soup = BeautifulSoup(html_text, "lxml")
 
         title_s = ""
@@ -658,29 +774,62 @@ class YouTubeParser(BaseParser):
             )
         return title_s, desc_s
 
-    def _load_subtitles(self, video_id: str) -> Tuple[str, str, str]:
-        """Субтитры: (текст, язык, причина; пустая строка = OK)."""
+    def _load_subtitles(self, video_id: str, transcript_cookies: Optional[str] = None) -> Tuple[str, str, str]:
+        """Субтитры: (текст, язык, причина; пустая строка = OK).
+
+        При лимите YouTube (429 / :class:`~youtube_transcript_api._errors.TooManyRequests`)
+        исключение пробрасывается наверх для :meth:`_load_subtitles_with_retry`.
+
+        ``transcript_cookies`` — тот же Netscape cookies.txt, что и для yt-dlp (если задан).
+        """
         from youtube_transcript_api import YouTubeTranscriptApi
         from youtube_transcript_api._errors import (  # type: ignore[import-not-found]
             NoTranscriptFound,
+            TooManyRequests,
             TranscriptsDisabled,
             VideoUnavailable,
+            YouTubeRequestFailed,
         )
 
         try:
-            tlist = _youtube_list_transcripts(video_id)
+            tlist = _youtube_list_transcripts(video_id, transcript_cookies)
+        except TooManyRequests:
+            raise
         except VideoUnavailable as exc:
             msg = f"ролик недоступен (VideoUnavailable: {exc})"
             logger.warning("⚠️ %s", msg)
-            return self._fallback_get_transcript_only(video_id, YouTubeTranscriptApi, reason_prefix=msg)
+            return self._fallback_get_transcript_only(
+                video_id,
+                YouTubeTranscriptApi,
+                reason_prefix=msg,
+                transcript_cookies=transcript_cookies,
+            )
         except TranscriptsDisabled as exc:
             reason = f"субтитры отключены автором: {exc}"
             logger.warning("⚠️ %s", reason)
             return "", "", reason
-        except Exception as exc:  # noqa: BLE001
+        except YouTubeRequestFailed as exc:
+            if _exc_is_transcript_rate_limit(exc):
+                raise
             err_t = f"{type(exc).__name__}: {exc}"
             logger.error("❌ list_transcripts: %s", err_t)
-            return self._fallback_get_transcript_only(video_id, YouTubeTranscriptApi, reason_prefix=err_t)
+            return self._fallback_get_transcript_only(
+                video_id,
+                YouTubeTranscriptApi,
+                reason_prefix=err_t,
+                transcript_cookies=transcript_cookies,
+            )
+        except Exception as exc:  # noqa: BLE001
+            if _exc_is_transcript_rate_limit(exc):
+                raise
+            err_t = f"{type(exc).__name__}: {exc}"
+            logger.error("❌ list_transcripts: %s", err_t)
+            return self._fallback_get_transcript_only(
+                video_id,
+                YouTubeTranscriptApi,
+                reason_prefix=err_t,
+                transcript_cookies=transcript_cookies,
+            )
 
         all_tr: List[Any] = []
         try:
@@ -705,7 +854,16 @@ class YouTubeParser(BaseParser):
         lang = _transcript_lang_code(tr_obj)
         try:
             raw = tr_obj.fetch()
+        except TooManyRequests:
+            raise
+        except YouTubeRequestFailed as exc:
+            if _exc_is_transcript_rate_limit(exc):
+                raise
+            logger.error("❌ fetch() субтитров: %s: %s", type(exc).__name__, exc)
+            return "", "", f"сбой fetch: {type(exc).__name__}"
         except Exception as exc:  # noqa: BLE001
+            if _exc_is_transcript_rate_limit(exc):
+                raise
             logger.error("❌ fetch() субтитров: %s: %s", type(exc).__name__, exc)
             return "", "", f"сбой fetch: {type(exc).__name__}"
 
@@ -724,14 +882,29 @@ class YouTubeParser(BaseParser):
         return sub_text, lang, ""
 
     def _fallback_get_transcript_only(
-        self, video_id: str, ytt: Any, reason_prefix: str
+        self,
+        video_id: str,
+        ytt: Any,
+        reason_prefix: str,
+        transcript_cookies: Optional[str] = None,
     ) -> Tuple[str, str, str]:
         try:
             try:
-                raw = ytt.get_transcript(video_id, languages=["ru", "en"])  # type: ignore[attr-defined]
+                raw = ytt.get_transcript(
+                    video_id,
+                    languages=["ru", "en"],
+                    proxies=None,
+                    cookies=transcript_cookies,
+                )  # type: ignore[attr-defined]
             except Exception:  # noqa: BLE001
-                raw = ytt.get_transcript(video_id)  # type: ignore[attr-defined]
+                raw = ytt.get_transcript(
+                    video_id,
+                    proxies=None,
+                    cookies=transcript_cookies,
+                )  # type: ignore[attr-defined]
         except Exception as exc2:  # noqa: BLE001
+            if _exc_is_transcript_rate_limit(exc2):
+                raise
             r = f"{reason_prefix}; get_transcript: {type(exc2).__name__}: {exc2}"
             logger.error("❌ %s", r)
             return "", "", r
