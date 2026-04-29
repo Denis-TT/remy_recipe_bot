@@ -5,6 +5,8 @@
 * `WebParser` — обычные HTTP(S)-страницы с рецептами.
 * `YouTubeParser` — YouTube: `yt-dlp` для title/description/tags +
   `youtube-transcript-api` для текста субтитров (приоритет ASR → ручные).
+  При запросе «Sign in…» можно передать Netscape cookies — только для yt-dlp
+  (метаданные); текст субтитров — через ``youtube_transcript_api``, без этого файла.
 * `ParserRegistry` / `create_parser_registry` — маршрутизация и фабрика.
 """
 
@@ -12,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import re
 from abc import ABC, abstractmethod
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -367,12 +370,24 @@ def _format_tags_line(tags: List[Any], max_len: int = 4_000) -> str:
     return s
 
 
-def _yt_dlp_extract_metadata(url: str) -> Dict[str, Any]:
-    """Title, description, tags + списки субтитров (URL-ы) без скачивания видео.
+def _yt_dlp_extract_metadata(url: str, cookie_file: Optional[str] = None) -> Dict[str, Any]:
+    """Title, description, tags + списки дорожек субтитров (URL-ы) без скачивания видео.
 
-    `writesubtitles` / `writeautomaticsub` вместе с `skip_download` в yt-dlp
-    заполняет поля `subtitles` / `automatic_captions` в `info` без гарантии
-    записи файлов на диск. Текст субтитров дальше берётся из youtube_transcript_api.
+    **Область cookies:** параметр ``cookie_file`` используется **только здесь**
+    (опции yt-dlp для ``extract_info``): заголовок, описание, теги, метаданные дорожек.
+
+    Текст субтитров для карточки рецепта берётся отдельным кодом —
+    :meth:`YouTubeParser._load_subtitles` через ``youtube_transcript_api``, который
+    **не получает** этот файл cookies (другой HTTP-клиент и контракт библиотеки).
+    Если в будущем понадобится обход капчи и для дорожек transcript-api, это потребует
+    отдельной интеграции в эту библиотеку или резервного пути через yt-dlp.
+
+    `writesubtitles` / `writeautomaticsub` с `skip_download` заполняют в ``info``
+    поля ``subtitles`` / ``automatic_captions`` без записи файлов на диск.
+
+    Args:
+        cookie_file: Путь к Netscape cookies.txt — только если файл уже проверен
+            на существование (см. :meth:`YouTubeParser._resolved_cookie_file`).
     """
     import yt_dlp
 
@@ -386,6 +401,8 @@ def _yt_dlp_extract_metadata(url: str) -> Dict[str, Any]:
         "extract_flat": False,
         "noplaylist": True,
     }
+    if cookie_file:
+        opts["cookiefile"] = cookie_file
     with yt_dlp.YoutubeDL(opts) as ydl:  # type: ignore[operator]
         info: Dict[str, Any] = ydl.extract_info(url, download=False)
     if not info:
@@ -398,6 +415,20 @@ class YouTubeParser(BaseParser):
 
     Ключ YouTube Data API не требуется. Параметр `youtube_api_key` в конструкторе
     оставлен для обратной совместимости с `create_parser_registry` и игнорируется.
+
+    **Cookies (``YOUTUBE_COOKIE_FILE``):** передаются **только в yt-dlp** при запросе
+    метаданных видео. Запросы ``youtube_transcript_api`` к страницам транскриптов cookies
+    из этого файла не используют — см. также :func:`_yt_dlp_extract_metadata`.
+
+    Cookies для yt-dlp (обход проверки «Sign in to confirm you're not a bot»):
+
+    1. Установите расширение браузера «Get cookies.txt LOCALLY».
+    2. В отдельной вкладке инкогнито войдите в аккаунт YouTube.
+    3. Экспортируйте cookies в файл ``youtube_cookies.txt`` (формат Netscape).
+    4. Укажите путь к файлу в переменной окружения ``YOUTUBE_COOKIE_FILE``.
+
+    После первой ошибки yt-dlp при использовании файла cookies путь сбрасывается в памяти
+    парсера до перезапуска процесса — чтобы не дергать заведомо проблемный файл на каждом URL.
     """
 
     source_type: str = "youtube"
@@ -405,9 +436,11 @@ class YouTubeParser(BaseParser):
 
     _ERR_NO_TEXT = "Не удалось извлечь текст из видео"
 
-    def __init__(self, youtube_api_key: str = "") -> None:
+    def __init__(self, youtube_api_key: str = "", cookie_file: str | None = None) -> None:
         # API-ключ не используется (было только для YouTube Data API).
         _ = (youtube_api_key or "").strip()
+        raw = (cookie_file or "").strip()
+        self.cookie_file: str | None = raw if raw else None
 
     @staticmethod
     def can_parse(url: str) -> bool:
@@ -435,15 +468,32 @@ class YouTubeParser(BaseParser):
 
         logger.info("🎬 Обнаружено YouTube-видео: %s", video_id)
 
+        cookie_path = self._resolved_cookie_file()
+
         info: Optional[Dict[str, Any]] = None
         ytdlp_ok = False
         try:
-            info = _yt_dlp_extract_metadata(url.strip())
+            info = _yt_dlp_extract_metadata(url.strip(), cookie_path)
             ytdlp_ok = True
         except Exception as exc:  # noqa: BLE001
-            logger.error("❌ Не удалось получить данные через yt-dlp: %s", exc)
-            info = None
-            ytdlp_ok = False
+            if cookie_path:
+                # Не ERROR: для этого URL почти всегда есть повтор без cookies.
+                logger.warning(
+                    "⚠️ yt-dlp с cookies не удалось (%s), повторяем без cookies",
+                    exc,
+                )
+                self._disable_ytdlp_cookies_for_session()
+                try:
+                    info = _yt_dlp_extract_metadata(url.strip(), None)
+                    ytdlp_ok = True
+                except Exception as exc2:  # noqa: BLE001
+                    logger.error("❌ Не удалось получить данные через yt-dlp: %s", exc2)
+                    info = None
+                    ytdlp_ok = False
+            else:
+                logger.error("❌ Не удалось получить данные через yt-dlp: %s", exc)
+                info = None
+                ytdlp_ok = False
 
         title_raw = ""
         desc_raw = ""
@@ -493,6 +543,33 @@ class YouTubeParser(BaseParser):
         if len(text) > self.MAX_TEXT_LENGTH:
             text = text[: self.MAX_TEXT_LENGTH]
         return text
+
+    def _disable_ytdlp_cookies_for_session(self) -> None:
+        """Не использовать файл cookies для yt-dlp до перезапуска процесса бота."""
+        if not self.cookie_file:
+            return
+        logger.info(
+            "ℹ️ Путь cookies для yt-dlp сброшен до перезапуска "
+            "(ошибка запроса с cookies; следующие видео — без этого файла)",
+        )
+        self.cookie_file = None
+
+    def _resolved_cookie_file(self) -> Optional[str]:
+        """Путь к cookies.txt для yt-dlp или ``None`` (файл необязателен).
+
+        Без пути или при отсутствии файла парсер ведёт себя как раньше.
+        """
+        if not self.cookie_file:
+            return None
+        expanded = os.path.abspath(os.path.expanduser(self.cookie_file.strip()))
+        if os.path.isfile(expanded):
+            logger.info("🍪 Используются cookies из %s", expanded)
+            return expanded
+        logger.warning(
+            "⚠️ Файл cookies не найден: %s, работаем без cookies",
+            self.cookie_file,
+        )
+        return None
 
     def _load_subtitles(self, video_id: str) -> Tuple[str, str, str]:
         """Субтитры: (текст, язык, причина; пустая строка = OK)."""
@@ -622,15 +699,18 @@ class ParserRegistry:
 
 
 def create_parser_registry(cfg: Optional[object] = None) -> ParserRegistry:
-    """Реестр с YouTube (до Web). Поле `youtube_api_key` в `cfg` оставлено
-    для обратной совместимости; `YouTubeParser` его не использует.
+    """Реестр с YouTube (до Web). Поля ``youtube_api_key`` и связанные — для
+    обратной совместимости; ``YouTubeParser`` ключ API не использует.
+    Путь к cookies: ``cfg.youtube_cookie_file`` → ``YouTubeParser``.
     """
     if cfg is None:
         from config import config as _cfg
         cfg = _cfg
     api_key = str(getattr(cfg, "youtube_api_key", "") or "")
+    yt_cookie_raw = str(getattr(cfg, "youtube_cookie_file", "") or "").strip()
+    yt_cookie: str | None = yt_cookie_raw if yt_cookie_raw else None
     registry = ParserRegistry()
-    registry.register(YouTubeParser(youtube_api_key=api_key))
+    registry.register(YouTubeParser(youtube_api_key=api_key, cookie_file=yt_cookie))
     registry.register(WebParser())
     return registry
 

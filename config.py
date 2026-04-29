@@ -44,6 +44,8 @@ class Config:
     environment: str = "production"
     # Data API (описание/заголовок). Без ключа YouTubeParser использует субтитры.
     youtube_api_key: str = ""
+    # Netscape cookies.txt для yt-dlp (обход «Sign in to confirm you're not a bot»).
+    youtube_cookie_file: str = ""
 
     @property
     def is_development(self) -> bool:
@@ -96,6 +98,8 @@ class Config:
 
         youtube_api_key = os.getenv("YOUTUBE_API_KEY", "").strip()
 
+        youtube_cookie_file = os.getenv("YOUTUBE_COOKIE_FILE", "").strip()
+
         environment = os.getenv("ENVIRONMENT", "production").strip().lower() or "production"
         if environment not in _ALLOWED_ENVIRONMENTS:
             print(
@@ -114,6 +118,7 @@ class Config:
             webapp_url=webapp_url,
             environment=environment,
             youtube_api_key=youtube_api_key,
+            youtube_cookie_file=youtube_cookie_file,
         )
 
     @staticmethod
