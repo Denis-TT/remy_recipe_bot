@@ -44,7 +44,7 @@ class Config:
     environment: str = "production"
     # YouTube Data API v3: заголовок и описание (для YouTube URL без ключа parse() не выполнить).
     youtube_api_key: str = ""
-    # Apify API token: субтитры YouTube через Actor ``compass~youtube-transcript-scraper``.
+    # Apify API token: субтитры YouTube через Actor ``pintostudio~youtube-transcript-scraper``.
     apify_api_token: str = ""
     # Устарело: ранее yt-dlp; поле оставлено для совместимости существующих .env.
     youtube_cookie_file: str = ""

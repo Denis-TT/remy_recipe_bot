@@ -4,7 +4,7 @@
 * `BaseParser` — абстрактный контракт (`can_parse`, `parse`, `source_type`).
 * `WebParser` — обычные HTTP(S)-страницы с рецептами.
 * `YouTubeParser` — заголовок и описание через YouTube Data API v3; субтитры — Apify Actor
-  ``compass~youtube-transcript-scraper`` (при наличии ``APIFY_API_TOKEN``).
+  ``pintostudio~youtube-transcript-scraper`` (при наличии ``APIFY_API_TOKEN``).
 * `ParserRegistry` / `create_parser_registry` — маршрутизация и фабрика.
 """
 
@@ -221,7 +221,7 @@ def _strip_youtube_title_text(text: str) -> str:
 
 
 # Apify Actor (субтитры YouTube). Официальный список items: GET /v2/actor-runs/{runId}/dataset/items
-APIFY_TRANSCRIPT_ACTOR = "compass~youtube-transcript-scraper"
+APIFY_TRANSCRIPT_ACTOR = "pintostudio~youtube-transcript-scraper"
 APIFY_WAIT_FINISH_SEC = 120
 
 
@@ -355,7 +355,12 @@ class YouTubeParser(BaseParser):
             f"https://api.apify.com/v2/acts/{APIFY_TRANSCRIPT_ACTOR}/runs"
             f"?waitForFinish={APIFY_WAIT_FINISH_SEC}"
         )
-        envelope = _apify_http_json("POST", run_url, token, {"videoId": video_id})
+        envelope = _apify_http_json(
+            "POST",
+            run_url,
+            token,
+            {"videoUrl": f"https://www.youtube.com/watch?v={video_id}"},
+        )
         if not isinstance(envelope, dict):
             return ""
 
