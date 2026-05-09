@@ -46,6 +46,8 @@ class Config:
     youtube_api_key: str = ""
     # Apify API token: субтитры YouTube через Actor ``pintostudio~youtube-transcript-scraper``.
     apify_api_token: str = ""
+    # Hugging Face API token (Inference API) — генерация картинок блюд для не-web источников.
+    hf_api_key: str = ""
     # Устарело: ранее yt-dlp; поле оставлено для совместимости существующих .env.
     youtube_cookie_file: str = ""
 
@@ -113,6 +115,8 @@ class Config:
 
         apify_api_token = cls._env_optional_secret("APIFY_API_TOKEN")
 
+        hf_api_key = cls._env_optional_secret("HF_API_KEY")
+
         youtube_cookie_file = os.getenv("YOUTUBE_COOKIE_FILE", "").strip()
 
         environment = os.getenv("ENVIRONMENT", "production").strip().lower() or "production"
@@ -134,6 +138,7 @@ class Config:
             environment=environment,
             youtube_api_key=youtube_api_key,
             apify_api_token=apify_api_token,
+            hf_api_key=hf_api_key,
             youtube_cookie_file=youtube_cookie_file,
         )
 

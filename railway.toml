@@ -8,3 +8,5 @@ pythonVersion = "3.11"
 startCommand = "pkill -9 -f 'python.*run.py' 2>/dev/null; sleep 2; python run.py"
 numReplicas = 1
 restartPolicyType = "ON_FAILURE"
+# Том под сохранённые изображения рецептов (в UI Railway: Volume → mount path /images).
+volumes = ["/images"]

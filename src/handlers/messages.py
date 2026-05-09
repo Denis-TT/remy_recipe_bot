@@ -18,12 +18,13 @@ from __future__ import annotations
 
 import base64
 import logging
+import os
 import re
 import time
 from html import escape as _html_escape
-from typing import TYPE_CHECKING, Any, List, Mapping
+from typing import TYPE_CHECKING, Any, List, Mapping, Optional
 
-from telegram import Message, Update
+from telegram import InputFile, Message, Update
 from telegram.constants import ParseMode
 from telegram.error import BadRequest
 from telegram.ext import ContextTypes
@@ -36,6 +37,7 @@ from ..keyboards import (
     save_recipe_keyboard,
 )
 from ..normalizer import MAX_IMAGE_BYTES
+from . import callbacks, commands
 
 if TYPE_CHECKING:
     from ..bot import RemyBot
@@ -71,6 +73,76 @@ _NOT_A_URL_HINT: str = (
     "🤔 Не вижу ссылки. Отправь URL рецепта (начинается с http:// или https://),\n"
     "или нажми 📋 Меню, чтобы увидеть доступные действия."
 )
+
+# Лимит подписи к фото (Telegram).
+_TG_PHOTO_CAPTION_LIMIT: int = 1024
+
+
+# --------------------------------------------------------------------------- #
+# Показ рецепта (фото + полный текст)
+# --------------------------------------------------------------------------- #
+
+
+def _plain_caption_from_html(formatted_html: str, max_len: int = _TG_PHOTO_CAPTION_LIMIT) -> str:
+    plain = re.sub(r"<[^>]+>", "", formatted_html)
+    plain = re.sub(r"\s+", " ", plain).strip()
+    return plain[:max_len]
+
+
+async def _present_recipe_with_optional_photo(
+    message: Message,
+    status: Message,
+    recipe: Mapping[str, Any],
+    bot: "RemyBot",
+) -> None:
+    formatted = format_recipe(recipe, bot)
+    img_path = recipe.get("image_path")
+    if img_path and os.path.isfile(str(img_path)):
+        cap = _plain_caption_from_html(formatted)
+        try:
+            with open(str(img_path), "rb") as img_fh:
+                await message.reply_photo(
+                    photo=InputFile(img_fh, filename="recipe.jpg"),
+                    caption=cap or " ",
+                )
+        except (OSError, BadRequest) as exc:
+            logger.warning("⚠️  Не удалось отправить изображение рецепта: %s", exc)
+        try:
+            await message.reply_text(
+                formatted,
+                reply_markup=save_recipe_keyboard(),
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+            )
+        except BadRequest as exc:
+            logger.warning("⚠️  reply_text HTML: %s — без разметки", exc)
+            plain = re.sub(r"<[^>]+>", "", formatted)
+            await message.reply_text(
+                plain[:_TG_MESSAGE_LIMIT],
+                reply_markup=save_recipe_keyboard(),
+                disable_web_page_preview=True,
+            )
+        try:
+            await status.delete()
+        except BadRequest:
+            await _safe_edit(status, "✅ Готово")
+        return
+
+    try:
+        await status.edit_text(
+            formatted,
+            reply_markup=save_recipe_keyboard(),
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+    except BadRequest as exc:
+        logger.warning("⚠️  Ошибка edit_text с HTML: %s — отправляю без разметки", exc)
+        plain = re.sub(r"<[^>]+>", "", formatted)
+        await status.edit_text(
+            plain[:_TG_MESSAGE_LIMIT],
+            reply_markup=save_recipe_keyboard(),
+            disable_web_page_preview=True,
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -197,27 +269,22 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     result["source_url"] = ""
+    if not result.get("image_path") and (bot.config.hf_api_key or "").strip():
+        from ..parser import _generate_and_save_image
+
+        gen_path = await _generate_and_save_image(
+            str(result.get("title") or "блюдо")[:400],
+            hf_api_key=bot.config.hf_api_key,
+        )
+        if gen_path:
+            result["image_path"] = gen_path
+
     bot.temp_recipes[user.id] = {"recipe": result, "timestamp": time.time()}
     bot.cleanup_expired_temp_recipes()
 
     logger.info("✅ Рецепт извлечён из изображения")
 
-    formatted = format_recipe(result, bot)
-    try:
-        await status.edit_text(
-            formatted,
-            reply_markup=save_recipe_keyboard(),
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True,
-        )
-    except BadRequest as exc:
-        logger.warning("⚠️  Ошибка edit_text с HTML (фото): %s — отправляю без разметки", exc)
-        plain = re.sub(r"<[^>]+>", "", formatted)
-        await status.edit_text(
-            plain[:_TG_MESSAGE_LIMIT],
-            reply_markup=save_recipe_keyboard(),
-            disable_web_page_preview=True,
-        )
+    await _present_recipe_with_optional_photo(message, status, result, bot)
 
 
 # --------------------------------------------------------------------------- #
@@ -239,7 +306,8 @@ async def _handle_url(
 
     # 1) Парсинг
     try:
-        raw_text = await bot.parser.parse(url)
+        parsed = await bot.parser.parse(url)
+        raw_text = parsed.text
     except Exception as exc:  # noqa: BLE001 — логируем любую причину
         logger.error("❌ Ошибка обработки URL: %s", exc)
         await _safe_edit(status, f"❌ Не удалось прочитать страницу:\n<code>{_html_escape(str(exc))}</code>")
@@ -250,11 +318,22 @@ async def _handle_url(
         await _safe_edit(status, "❌ Со страницы не удалось извлечь текст")
         return
 
+    recipe_data: dict[str, Any] = {
+        "raw_text": raw_text,
+        "image_path": parsed.image_path,
+    }
+    src_parser = bot.parser.get_parser(url)
+    if src_parser is not None:
+        await src_parser.generate_image_if_needed(recipe_data, hf_api_key=bot.config.hf_api_key)
+
     # 2) Нормализация
     await _safe_edit(status, "🤖 Анализирую рецепт...")
 
     try:
-        recipe = await bot.normalizer.normalize(raw_text)
+        recipe = await bot.normalizer.normalize(
+            recipe_data["raw_text"],
+            image_path=recipe_data.get("image_path"),
+        )
     except Exception as exc:  # noqa: BLE001
         logger.error("❌ Ошибка нормализации: %s", exc)
         await _safe_edit(status, f"❌ Не удалось обработать рецепт:\n<code>{_html_escape(str(exc))}</code>")
@@ -287,25 +366,7 @@ async def _handle_url(
         recipe.get("meal_type"),
     )
 
-    formatted = format_recipe(recipe, bot)
-
-    try:
-        await status.edit_text(
-            formatted,
-            reply_markup=save_recipe_keyboard(),
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True,
-        )
-    except BadRequest as exc:
-        # Если форматированный рецепт слишком длинный или содержит «плохие»
-        # HTML-последовательности — подстрахуемся чистым текстом.
-        logger.warning("⚠️  Ошибка edit_text с HTML: %s — отправляю без разметки", exc)
-        plain = re.sub(r"<[^>]+>", "", formatted)
-        await status.edit_text(
-            plain[:_TG_MESSAGE_LIMIT],
-            reply_markup=save_recipe_keyboard(),
-            disable_web_page_preview=True,
-        )
+    await _present_recipe_with_optional_photo(message, status, recipe, bot)
 
 
 # --------------------------------------------------------------------------- #
@@ -536,4 +597,29 @@ if __name__ == "__main__":
     assert _RECIPE_AI_DISCLAIMER_TEXT in _out_long
     assert len(_out_long) <= _TG_MESSAGE_LIMIT
 
-    print("✅ format_recipe: дисклеймер и лимит длины ок")
+    import asyncio
+    import tempfile
+    from unittest.mock import AsyncMock, MagicMock
+
+    _tmp_img = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
+    _tmp_img.write(b"\xff\xd8\xff\xd9")
+    _tmp_img.close()
+    try:
+        _mock_msg = MagicMock()
+        _mock_msg.reply_photo = AsyncMock()
+        _mock_msg.reply_text = AsyncMock()
+        _mock_status = MagicMock()
+        _mock_status.delete = AsyncMock()
+        _demo_img = dict(_demo)
+        _demo_img["image_path"] = _tmp_img.name
+
+        async def _run_present() -> None:
+            await _present_recipe_with_optional_photo(_mock_msg, _mock_status, _demo_img, _bot)
+
+        asyncio.run(_run_present())
+        _mock_msg.reply_photo.assert_called_once()
+        _mock_msg.reply_text.assert_called_once()
+    finally:
+        os.unlink(_tmp_img.name)
+
+    print("✅ format_recipe + _present_recipe_with_optional_photo (мок)")

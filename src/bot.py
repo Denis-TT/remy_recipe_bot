@@ -43,7 +43,7 @@ from config import Config, config as default_config
 from .handlers import callbacks, commands, messages
 from .localization import Localization
 from .normalizer import RecipeNormalizer
-from .parser import ParserRegistry, create_parser_registry
+from .parser import ParserRegistry, create_parser_registry, ensure_images_dir
 from .storage import SupabaseStorage
 
 
@@ -82,6 +82,7 @@ class RemyBot:
         self.config: Config = cfg if cfg is not None else default_config
 
         self.loc: Localization = Localization("ru")
+        ensure_images_dir()
         self.parser: ParserRegistry = create_parser_registry(self.config)
         self.normalizer: RecipeNormalizer = RecipeNormalizer(self.config.github_token)
         self.storage: SupabaseStorage = SupabaseStorage(
