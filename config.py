@@ -42,9 +42,13 @@ class Config:
     log_level: str = "INFO"
     webapp_url: str = ""
     environment: str = "production"
-    # Data API (описание/заголовок). Без ключа YouTubeParser использует субтитры.
+    # YouTube Data API v3: заголовок и описание (для YouTube URL без ключа parse() не выполнить).
     youtube_api_key: str = ""
-    # Netscape cookies.txt для yt-dlp (обход «Sign in to confirm you're not a bot»).
+    # Субтитры: HTTP(S) прокси для youtube-transcript-api. Несколько URL через запятую — ротация при 429.
+    # Формат как в requests: http://user:pass@host:port (для резидентских провайдеров вроде Webshare чаще http).
+    # Спецсимволы в user/password — процент-кодирование (RFC 3986). Пример Webshare: ...@p.webshare.io:80/
+    youtube_proxy_url: str = ""
+    # Устарело: ранее yt-dlp; поле оставлено для совместимости существующих .env.
     youtube_cookie_file: str = ""
 
     @property
@@ -98,6 +102,8 @@ class Config:
 
         youtube_api_key = os.getenv("YOUTUBE_API_KEY", "").strip()
 
+        youtube_proxy_url = os.getenv("YOUTUBE_PROXY_URL", "").strip()
+
         youtube_cookie_file = os.getenv("YOUTUBE_COOKIE_FILE", "").strip()
 
         environment = os.getenv("ENVIRONMENT", "production").strip().lower() or "production"
@@ -118,6 +124,7 @@ class Config:
             webapp_url=webapp_url,
             environment=environment,
             youtube_api_key=youtube_api_key,
+            youtube_proxy_url=youtube_proxy_url,
             youtube_cookie_file=youtube_cookie_file,
         )
 

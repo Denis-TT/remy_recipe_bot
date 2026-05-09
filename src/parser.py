@@ -3,28 +3,32 @@
 
 * `BaseParser` — абстрактный контракт (`can_parse`, `parse`, `source_type`).
 * `WebParser` — обычные HTTP(S)-страницы с рецептами.
-* `YouTubeParser` — YouTube: `yt-dlp` для title/description/tags +
-  `youtube-transcript-api` для текста субтитров (приоритет ASR → ручные).
-  При запросе «Sign in…» можно передать Netscape cookies — только для yt-dlp
-  (метаданные); текст субтитров — через ``youtube_transcript_api``, без этого файла.
+* `YouTubeParser` — заголовок и описание через YouTube Data API v3; субтитры — `youtube-transcript-api`
+  (опционально через HTTP(S) прокси из конфига с ротацией при 429).
 * `ParserRegistry` / `create_parser_registry` — маршрутизация и фабрика.
 """
 
 from __future__ import annotations
 
 import asyncio
-import html
 import logging
-import os
 import re
-import time
-import urllib.error
-import urllib.request
 from abc import ABC, abstractmethod
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import List, Optional
 
 import aiohttp
 from bs4 import BeautifulSoup
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
+from youtube_transcript_api import YouTubeTranscriptApi
+from youtube_transcript_api._errors import (
+    IpBlocked,
+    NoTranscriptFound,
+    RequestBlocked,
+    TranscriptsDisabled,
+    VideoUnavailable,
+    YouTubeRequestFailed,
+)
 
 try:
     from readability import Document as _ReadabilityDocument
@@ -153,7 +157,7 @@ class WebParser(BaseParser):
 
     @staticmethod
     def _clean_text(text: str) -> str:
-        lines: Iterable[str] = text.splitlines()
+        lines = text.splitlines()
         cleaned_lines: List[str] = []
         for line in lines:
             collapsed = re.sub(r"[ \t\u00a0]+", " ", line).strip()
@@ -167,93 +171,18 @@ class WebParser(BaseParser):
 
 
 # --------------------------------------------------------------------------- #
-# YouTube: вспомогательные функции
+# YouTube: очистка текста из Data API
 # --------------------------------------------------------------------------- #
 
 
-def _extract_youtube_video_id(url: str) -> str:
-    """11-символьный id (watch, Shorts, youtu.be)."""
-    s = (url or "").strip()
-    m = re.search(
-        r"(?:[?&]v=|/shorts/|youtu\.be/)([A-Za-z0-9_-]{11})\b",
-        s,
-        re.IGNORECASE,
-    )
-    return m.group(1) if m else ""
+_HTML_TAG_RE = re.compile(r"<[^>]+>", re.IGNORECASE)
 
-
-def _youtube_list_transcripts(video_id: str, cookies: Optional[str] = None) -> Any:
-    """Совместимость youtube-transcript-api 0.6.x (list_transcripts) и 1.x (list).
-
-    ``cookies`` — путь к Netscape cookies.txt (тот же файл, что для yt-dlp), опционально.
-    """
-    from youtube_transcript_api import YouTubeTranscriptApi
-
-    if hasattr(YouTubeTranscriptApi, "list_transcripts"):
-        return YouTubeTranscriptApi.list_transcripts(  # type: ignore[no-any-return, misc]
-            video_id,
-            proxies=None,
-            cookies=cookies,
-        )
-    ytt = YouTubeTranscriptApi()  # type: ignore[call-arg]
-    return ytt.list(video_id, proxies=None, cookies=cookies)
-
-
-def _exc_is_transcript_rate_limit(exc: BaseException) -> bool:
-    """429 / Too Many Requests от transcript-api — имеет смысл повторить запрос позже."""
-    try:
-        from youtube_transcript_api._errors import TooManyRequests, YouTubeRequestFailed
-    except ImportError:
-        return "429" in f"{exc}" and "Too Many" in f"{exc}"
-
-    if isinstance(exc, TooManyRequests):
-        return True
-    if isinstance(exc, YouTubeRequestFailed):
-        r = getattr(exc, "reason", str(exc))
-        rs = str(r)
-        return "429" in rs or "Too Many Requests" in rs
-    text = f"{type(exc).__name__}: {exc}"
-    return "429" in text and "Too Many Requests" in text
-
-
-def _youtube_watch_html_looks_rate_limited(html_text: str) -> bool:
-    """Эвристика страницы-заглушки после лимита IP (не полноценный watch с og:-мета)."""
-    if not html_text.strip():
-        return False
-    low = html_text.lower()
-    if "429" in html_text:
-        return True
-    if "too many requests" in low:
-        return True
-    # Частые формулировки заглушки / блокировки (не используем голый «sorry» — ложные срабатывания).
-    if "sorry" in low and any(
-        x in low for x in ("try again", "something went wrong", "many requests", "unusual traffic")
-    ):
-        return True
-    return False
-
-
-_SUBTITLE_HTML_TAG_RE = re.compile(r"<[^>]+>", re.IGNORECASE)
-_CC_BRACKET_NOISE = re.compile(
-    r"\[[^\]]{0,200}?"
-    r"(?:"
-    r"музык|аплодисмент|звук|шум|тих|тиш|инструмент|"
-    r"music|applause|laughter|laughing|silence|singing|noise|indistinct|"
-    r"inaudible|crowd|beat|beep|click|bass|guitar|piano|drum|"
-    r"♪|♫|\u266a|\u266b"
-    r")"
-    r"[^\]]{0,200}?\]",
-    re.IGNORECASE,
-)
-_CC_TIME_BRACKETS = re.compile(r"\[\d{1,2}:\d{2}(?::\d{2})?(?:\s*-\s*\d{1,2}:\d{2}(?::\d{2})?)?\]")
-
-
-# Хэштеги: не трогать # внутри «числа #1» (редко) — требуется слово/кириллица после #.
+# Хэштеги: не трогать # внутри «числа #1» — требуется слово/кириллица после #.
 _YT_DESC_HASHTAG_RE = re.compile(
     r"(?<!\w)#[A-Za-z0-9_\u0400-\u04FF\u0500-\u052F]+"
 )
 
-# Эмодзи (не затрагивают U+00B0 °, U+00B5 µ, латиницу/кириллицу).
+# Эмодзи (не затрагивают U+00B0 °, U+00B5 µ).
 _YT_DESC_EMOJI_RE = re.compile(
     "["
     "\U0001F1E0-\U0001F1FF"
@@ -272,106 +201,8 @@ _YT_DESC_EMOJI_RE = re.compile(
 )
 
 
-def _raw_subtitle_texts(data: Any) -> List[str]:
-    if not data:
-        return []
-    if isinstance(data, list):
-        return [
-            str(item.get("text", "") or "")
-            for item in data
-            if isinstance(item, dict) and "text" in item
-        ]
-    to_raw = getattr(data, "to_raw_data", None)
-    if callable(to_raw):
-        return _raw_subtitle_texts(to_raw())
-    return []
-
-
-def _clean_one_subtitle_line(text: str) -> str:
-    t = (text or "").replace("\n", " ").replace("\r", " ")
-    t = _SUBTITLE_HTML_TAG_RE.sub(" ", t)
-    t = _CC_BRACKET_NOISE.sub(" ", t)
-    t = _CC_TIME_BRACKETS.sub(" ", t)
-    t = re.sub(r"[ \t\u00a0]+", " ", t).strip()
-    return t
-
-
-def _join_subtitle_segments(segments: List[str]) -> str:
-    parts = [_clean_one_subtitle_line(s) for s in segments if s and str(s).strip()]
-    text = " ".join(parts)
-    return re.sub(r"\s+", " ", text).strip()
-
-
-def _clean_subtitle_fetch(data: Any) -> str:
-    if not data:
-        return ""
-    if isinstance(data, str):
-        return _join_subtitle_segments([data])
-    parts = _raw_subtitle_texts(data)
-    if not parts:
-        to_raw = getattr(data, "to_raw_data", None)
-        if not callable(to_raw):
-            return re.sub(r"\s+", " ", str(data)).strip()
-        return _clean_subtitle_fetch(to_raw())  # type: ignore[no-untyped-call]
-    return _join_subtitle_segments(parts)
-
-
-def _transcript_lang_code(tr_obj: Any) -> str:
-    return str(
-        getattr(tr_obj, "language_code", None) or getattr(tr_obj, "language", None) or "?"
-    )
-
-
-def _select_transcript_track(
-    tlist: Any, all_tr: List[Any], NoTranscriptFound: Any
-) -> Tuple[Any, str, str]:
-    """ASR ru → ASR en → ручные ru/en → find_transcript → любая ASR → первая дорожка."""
-    if hasattr(tlist, "find_generated_transcript"):
-        try:
-            t = tlist.find_generated_transcript(["ru", "en"])
-            return t, "auto", "авто поиск ru/en"
-        except NoTranscriptFound:
-            pass
-
-    for code in ("ru", "en"):
-        for t in all_tr:
-            if getattr(t, "is_generated", False) and getattr(t, "language_code", None) == code:
-                return t, "auto", f"asr {code} (обход по списку)"
-
-    if hasattr(tlist, "find_manually_created_transcript"):
-        try:
-            t = tlist.find_manually_created_transcript(["ru", "en"])
-            return t, "manual", "ручные ru/en"
-        except NoTranscriptFound:
-            pass
-    for code in ("ru", "en"):
-        for t in all_tr:
-            if (
-                getattr(t, "language_code", None) == code
-                and not getattr(t, "is_generated", False)
-            ):
-                return t, "manual", f"ручной {code} (обход по списку)"
-
-    try:
-        t = tlist.find_transcript(["ru", "en"])
-        kind = "auto" if getattr(t, "is_generated", False) else "manual"
-        return t, kind, "find_transcript ru/en"
-    except NoTranscriptFound:
-        pass
-
-    for t in all_tr:
-        if getattr(t, "is_generated", False):
-            return t, "auto", "первая доступная ASR"
-    if all_tr:
-        t = all_tr[0]
-        kind = "auto" if getattr(t, "is_generated", False) else "manual"
-        return t, kind, "первая доступная дорожка"
-
-    raise RuntimeError("_select_transcript_track: all_tr is empty (внутренняя ошибка)")
-
-
 def _strip_youtube_description_text(text: str) -> str:
-    """Описание/крупные поля: без эмодзи и хэштегов; не трогать °C, µg и т. п."""
+    """Описание: без эмодзи и хэштегов; не трогать °C, µg и т. п."""
     s = (text or "").replace("\r\n", "\n")
     s = _YT_DESC_HASHTAG_RE.sub(" ", s)
     s = _YT_DESC_EMOJI_RE.sub("", s)
@@ -387,110 +218,92 @@ def _strip_youtube_description_text(text: str) -> str:
 
 
 def _strip_youtube_title_text(text: str) -> str:
-    """Заголовок: HTML, эмодзи, лишние пробелы (без съедания буквенного текста)."""
+    """Заголовок: HTML-теги в тексте, эмодзи, лишние пробелы."""
     s = (text or "").strip()
-    s = _SUBTITLE_HTML_TAG_RE.sub(" ", s)
+    s = _HTML_TAG_RE.sub(" ", s)
     s = _YT_DESC_EMOJI_RE.sub("", s)
     s = re.sub(r"[ \t\u00a0]+", " ", s).strip()
     return s
 
 
-def _format_tags_line(tags: List[Any], max_len: int = 4_000) -> str:
-    if not tags:
-        return ""
-    out: List[str] = []
-    for t in tags:
-        if not isinstance(t, str):
-            t = str(t) if t is not None else ""
-        t = t.strip()
-        if not t:
-            continue
-        t = _YT_DESC_EMOJI_RE.sub("", t)
-        t = re.sub(r"\s+", " ", t).strip()
-        if t:
-            out.append(t)
-    s = ", ".join(out)
-    if len(s) > max_len:
-        s = s[:max_len] + "…"
-    return s
+def _normalize_youtube_proxy_url(proxy_url: str) -> str:
+    """Приводит URL прокси к виду, который ожидает requests (как в документации библиотеки).
 
-
-def _yt_dlp_extract_metadata(url: str, cookie_file: Optional[str] = None) -> Dict[str, Any]:
-    """Title, description, tags + списки дорожек субтитров (URL-ы) без скачивания видео.
-
-    **Область cookies:** параметр ``cookie_file`` используется **только здесь**
-    (опции yt-dlp для ``extract_info``): заголовок, описание, теги, метаданные дорожек.
-
-    Текст субтитров для карточки рецепта берётся отдельным кодом —
-    :meth:`YouTubeParser._load_subtitles` через ``youtube_transcript_api``, который
-    **не получает** этот файл cookies (другой HTTP-клиент и контракт библиотеки).
-    Если в будущем понадобится обход капчи и для дорожек transcript-api, это потребует
-    отдельной интеграции в эту библиотеку или резервного пути через yt-dlp.
-
-    `writesubtitles` / `writeautomaticsub` с `skip_download` заполняют в ``info``
-    поля ``subtitles`` / ``automatic_captions`` без записи файлов на диск.
-
-    Args:
-        cookie_file: Путь к Netscape cookies.txt — только если файл уже проверен
-            на существование (см. :meth:`YouTubeParser._resolved_cookie_file`).
+    Поддерживается ``http://user:pass@host:port`` и ``https://...``. Если схема не указана,
+    добавляется ``http://`` (резидентские прокси вроде Webshare обычно идут по HTTP).
     """
-    import yt_dlp
+    u = (proxy_url or "").strip()
+    if not u:
+        return u
+    if "://" not in u:
+        u = f"http://{u}"
+    return u
 
-    opts: Dict[str, Any] = {
-        "quiet": True,
-        "no_warnings": True,
-        "writesubtitles": True,
-        "writeautomaticsub": True,
-        "subtitleslangs": ["ru", "en"],
-        "skip_download": True,
-        "extract_flat": False,
-        "noplaylist": True,
-    }
-    if cookie_file:
-        opts["cookiefile"] = cookie_file
-    with yt_dlp.YoutubeDL(opts) as ydl:  # type: ignore[operator]
-        info: Dict[str, Any] = ydl.extract_info(url, download=False)
-    if not info:
-        return {}
-    return info
+
+def _youtube_transcript_api_client(proxy_url: str | None) -> YouTubeTranscriptApi:
+    """Клиент youtube-transcript-api: без прокси или с ``requests.Session.proxies``.
+
+    Явная настройка Session эквивалентна ``GenericProxyConfig.to_requests_dict()`` из библиотеки
+    и стабильно работает с ``http://user:pass@host:port``. Заголовок ``Connection: close`` снижает
+    залипание на одном IP при ротируемых резидентских прокси.
+    """
+    if not (proxy_url or "").strip():
+        return YouTubeTranscriptApi()
+    from requests import Session
+
+    u = _normalize_youtube_proxy_url(proxy_url)
+    session = Session()
+    session.proxies = {"http": u, "https": u}
+    session.headers.update(
+        {
+            "Accept-Language": "en-US",
+            "Connection": "close",
+        }
+    )
+    return YouTubeTranscriptApi(http_client=session)
+
+
+def _is_subtitles_unavailable(exc: BaseException) -> bool:
+    return isinstance(exc, (TranscriptsDisabled, NoTranscriptFound, VideoUnavailable))
+
+
+def _is_youtube_transcript_rate_limit(exc: BaseException) -> bool:
+    """Ошибки блокировки / 429 — переключение прокси или немедленная ошибка без прокси."""
+    if isinstance(exc, (RequestBlocked, IpBlocked)):
+        return True
+    if isinstance(exc, YouTubeRequestFailed):
+        r = str(getattr(exc, "reason", exc))
+        low = r.lower()
+        return "429" in r or "too many requests" in low
+    s = f"{type(exc).__name__}: {exc}"
+    low = s.lower()
+    return "429" in s or "too many requests" in low
 
 
 class YouTubeParser(BaseParser):
-    """YouTube: метаданные через yt-dlp, субтитры — `youtube_transcript_api` (очистка как раньше).
-
-    Ключ YouTube Data API не требуется. Параметр `youtube_api_key` в конструкторе
-    оставлен для обратной совместимости с `create_parser_registry` и игнорируется.
-
-    **Cookies (``YOUTUBE_COOKIE_FILE``):** тот же Netscape cookies.txt передаётся в **yt-dlp**
-    и в **youtube_transcript_api** (список дорожек и ``get_transcript``), чтобы снизить отказы
-    по капче/боту на стороне YouTube.
-
-    Cookies для yt-dlp (обход проверки «Sign in to confirm you're not a bot»):
-
-    1. Установите расширение браузера «Get cookies.txt LOCALLY».
-    2. В отдельной вкладке инкогнито войдите в аккаунт YouTube.
-    3. Экспортируйте cookies в файл ``youtube_cookies.txt`` (формат Netscape).
-    4. Укажите путь к файлу в переменной окружения ``YOUTUBE_COOKIE_FILE``.
-
-    После первой ошибки yt-dlp при использовании файла cookies путь сбрасывается в памяти
-    парсера до перезапуска процесса — чтобы не дергать заведомо проблемный файл на каждом URL.
-
-    Порядок запросов: субтитры (transcript-api, с retry при 429) → при успешном тексте субтитров
-    yt-dlp не вызывается; иначе метаданные через yt-dlp → при полном провале — HTML ``/watch``.
-    """
+    """YouTube: Data API v3 — заголовок и описание; субтитры — transcript-api (опционально через прокси)."""
 
     source_type: str = "youtube"
     MAX_TEXT_LENGTH: int = 50_000
 
-    _ERR_NO_TEXT = "Не удалось извлечь текст из видео"
-    _YOUTUBE_RATE_LIMIT_USER_MESSAGE = "YouTube временно ограничил доступ. Попробуйте позже."
-    _SUBTITLE_RETRY_DELAYS_SEC: Tuple[float, float] = (2.0, 4.0)
+    def __init__(
+        self,
+        youtube_api_key: str = "",
+        proxy_urls: list[str] | None = None,
+    ) -> None:
+        self.youtube_api_key = (youtube_api_key or "").strip()
+        self._proxy_urls: list[str] = list(proxy_urls) if proxy_urls else []
 
-    def __init__(self, youtube_api_key: str = "", cookie_file: str | None = None) -> None:
-        # API-ключ не используется (было только для YouTube Data API).
-        _ = (youtube_api_key or "").strip()
-        raw = (cookie_file or "").strip()
-        self.cookie_file: str | None = raw if raw else None
+    @staticmethod
+    def _extract_youtube_video_id(url: str) -> str:
+        """11-символьный id (watch, Shorts, youtu.be)."""
+        s = (url or "").strip()
+        m = re.search(
+            r"(?:[?&]v=|/shorts/|youtu\.be/)([A-Za-z0-9_-]{11})\b",
+            s,
+            re.IGNORECASE,
+        )
+        return m.group(1) if m else ""
 
     @staticmethod
     def can_parse(url: str) -> bool:
@@ -511,415 +324,142 @@ class YouTubeParser(BaseParser):
             raise ValueError(f"YouTubeParser не поддерживает URL: {url!r}")
         return await asyncio.to_thread(self._parse_sync, url)
 
+    def _fetch_subtitles_via_api(self, video_id: str, proxy_url: str | None) -> str:
+        api = _youtube_transcript_api_client(proxy_url)
+        ft = api.fetch(video_id, languages=("ru", "en"))
+        parts: List[str] = []
+        for snippet in ft.snippets:
+            t = (snippet.text or "").replace("\n", " ").strip()
+            if t:
+                parts.append(t)
+        text = " ".join(parts)
+        return re.sub(r"\s+", " ", text).strip()
+
+    def _load_subtitles_no_proxy(self, video_id: str) -> str:
+        try:
+            return self._fetch_subtitles_via_api(video_id, None)
+        except Exception as exc:  # noqa: BLE001
+            if _is_subtitles_unavailable(exc):
+                return ""
+            if _is_youtube_transcript_rate_limit(exc):
+                raise RuntimeError(
+                    "YouTube временно ограничил доступ. Попробуйте позже."
+                ) from exc
+            logger.warning("Субтитры без прокси не получены: %s", exc)
+            return ""
+
+    def _load_subtitles_with_proxies(self, video_id: str, proxies: list[str]) -> str:
+        for idx, proxy in enumerate(proxies):
+            try:
+                text = self._fetch_subtitles_via_api(video_id, proxy)
+                if text:
+                    logger.info(
+                        "Получены субтитры через прокси %s (%s символов)",
+                        proxy,
+                        len(text),
+                    )
+                return text
+            except Exception as exc:  # noqa: BLE001
+                if _is_subtitles_unavailable(exc):
+                    return ""
+                if _is_youtube_transcript_rate_limit(exc):
+                    if idx < len(proxies) - 1:
+                        logger.warning(
+                            "Прокси %s недоступен (429), переключаю на следующий",
+                            proxy,
+                        )
+                        continue
+                    logger.error("Все прокси исчерпаны, субтитры не получены")
+                    raise RuntimeError(
+                        "YouTube временно ограничил доступ. Попробуйте позже."
+                    ) from exc
+                if idx < len(proxies) - 1:
+                    logger.warning(
+                        "Прокси %s: субтитры не получены (%s), пробую следующий",
+                        proxy,
+                        type(exc).__name__,
+                    )
+                    continue
+                logger.warning("Субтитры не получены после перебора прокси: %s", exc)
+                return ""
+        return ""
+
+    def _load_subtitles_best_effort(self, video_id: str) -> str:
+        if not self._proxy_urls:
+            return self._load_subtitles_no_proxy(video_id)
+        return self._load_subtitles_with_proxies(video_id, self._proxy_urls)
+
     def _parse_sync(self, url: str) -> str:
-        video_id = _extract_youtube_video_id(url)
+        video_id = self._extract_youtube_video_id(url)
         if not video_id or len(video_id) != 11:
             raise ValueError("Некорректный YouTube URL")
 
         logger.info("🎬 Обнаружено YouTube-видео: %s", video_id)
 
-        cookie_path = self._resolved_cookie_file()
-
-        # Субтитры первыми (retry при 429): меньше шансов «прожечь» лимит yt-dlp сразу.
-        sub_text, _sub_lang, sub_reason = self._load_subtitles_with_retry(video_id, cookie_path)
-
-        info: Optional[Dict[str, Any]] = None
-        ytdlp_ok = False
-        title_raw = ""
-        desc_raw = ""
-        tags_list: List[Any] = []
-
-        if sub_text.strip():
-            logger.info(
-                "📼 Субтитры есть — yt-dlp для этого URL не вызываем; заголовок/описание с HTML watch",
+        api_key = self.youtube_api_key
+        if not api_key:
+            logger.warning("YouTube API ключ не задан, парсинг невозможен")
+            raise RuntimeError(
+                "YouTube API ключ не настроен. Добавьте YOUTUBE_API_KEY в переменные окружения."
             )
-            raw_title, raw_desc = self._youtube_watch_page_description(
-                url.strip(),
-                video_id,
-                strict_rate_limit=False,
+
+        try:
+            youtube = build("youtube", "v3", developerKey=api_key, cache_discovery=False)
+            response = (
+                youtube.videos()
+                .list(part="snippet,contentDetails", id=video_id)
+                .execute()
             )
-            title_raw = raw_title or ""
-            desc_raw = raw_desc or ""
-            tags_list = []
-        else:
-            try:
-                info = _yt_dlp_extract_metadata(url.strip(), cookie_path)
-                ytdlp_ok = True
-            except Exception as exc:  # noqa: BLE001
-                if cookie_path:
-                    logger.warning(
-                        "⚠️ yt-dlp с cookies не удалось (%s), повторяем без cookies",
-                        exc,
-                    )
-                    self._disable_ytdlp_cookies_for_session()
-                    try:
-                        info = _yt_dlp_extract_metadata(url.strip(), None)
-                        ytdlp_ok = True
-                    except Exception as exc2:  # noqa: BLE001
-                        logger.error("❌ Не удалось получить данные через yt-dlp: %s", exc2)
-                        info = None
-                        ytdlp_ok = False
-                else:
-                    logger.error("❌ Не удалось получить данные через yt-dlp: %s", exc)
-                    info = None
-                    ytdlp_ok = False
+        except HttpError as exc:
+            err = str(exc)
+            logger.error("Ошибка YouTube Data API: %s", err)
+            raise RuntimeError(err) from exc
+        except Exception as exc:  # noqa: BLE001
+            err = str(exc)
+            logger.error("Ошибка YouTube Data API: %s", err)
+            raise RuntimeError(err) from exc
 
-            if info:
-                title_raw = (info.get("title") or info.get("fulltitle") or "")
-                if not isinstance(title_raw, str):
-                    title_raw = str(title_raw)
-                desc_raw = info.get("description") or ""
-                if not isinstance(desc_raw, str):
-                    desc_raw = str(desc_raw) if desc_raw is not None else ""
-                raw_tags = info.get("tags")
-                if isinstance(raw_tags, list):
-                    tags_list = raw_tags
-                elif raw_tags is not None:
-                    tags_list = [raw_tags]
+        items = response.get("items") or []
+        if not items:
+            raise RuntimeError("Видео не найдено")
 
-            if ytdlp_ok and info:
-                dlen = len(desc_raw) if desc_raw else 0
-                t_short = (title_raw[:200] + "…") if len(title_raw) > 200 else title_raw
-                logger.info(
-                    "📦 Данные получены через yt-dlp: title=%r, description=%s символов",
-                    t_short,
-                    dlen,
-                )
+        snippet = items[0].get("snippet") or {}
+        raw_title = snippet.get("title") or ""
+        if not isinstance(raw_title, str):
+            raw_title = str(raw_title)
+        raw_desc = snippet.get("description") or ""
+        if not isinstance(raw_desc, str):
+            raw_desc = str(raw_desc) if raw_desc is not None else ""
 
-            if not ytdlp_ok:
-                logger.warning(
-                    "⚠️ yt-dlp не дал метаданные (субтитры: %s)",
-                    (sub_reason[:120] + "…") if len(sub_reason) > 120 else sub_reason or "пусто",
-                )
+        clean_title = _strip_youtube_title_text(raw_title)
+        clean_desc = _strip_youtube_description_text(raw_desc) if raw_desc else ""
 
-        clean_title = _strip_youtube_title_text(title_raw)
-        clean_desc = _strip_youtube_description_text(desc_raw) if desc_raw else ""
-        tag_line = _format_tags_line(tags_list)
+        title_preview = raw_title[:50] + ("..." if len(raw_title) > 50 else "")
+        logger.info(
+            'Получены данные через YouTube Data API: "%s"',
+            title_preview,
+        )
 
-        parts: List[str] = []
+        sub_text = self._load_subtitles_best_effort(video_id)
+
+        parts_out: List[str] = []
         if clean_title:
-            parts.append(clean_title)
+            parts_out.append(clean_title)
         if clean_desc:
-            parts.append(clean_desc)
+            parts_out.append(clean_desc)
+        core = "\n\n".join(parts_out)
         if sub_text:
-            parts.append(sub_text)
-        if tag_line:
-            parts.append("Теги: " + tag_line)
+            text = f"{core}\n\n{sub_text}" if core else sub_text
+        else:
+            text = core
 
-        if not any(p.strip() for p in parts):
-            logger.warning(
-                "⚠️ Контента всё ещё нет — последний фолбэк: HTML страницы /watch",
-            )
-            raw_title, raw_desc = self._youtube_watch_page_description(
-                url.strip(),
-                video_id,
-                strict_rate_limit=True,
-            )
-            fb_title = _strip_youtube_title_text(raw_title) if raw_title else ""
-            fb_desc = _strip_youtube_description_text(raw_desc) if raw_desc else ""
-            if fb_title:
-                parts.append(fb_title)
-            if fb_desc:
-                parts.append(fb_desc)
-            if fb_title or fb_desc:
-                logger.info(
-                    "📄 Фолбэк HTML watch: заголовок %s симв., описание %s симв.",
-                    len(fb_title),
-                    len(fb_desc),
-                )
+        if not text.strip():
+            logger.error("❌ Не удалось извлечь текст из видео (пустой заголовок и описание)")
+            raise RuntimeError("Не удалось извлечь текст из видео")
 
-        if not any(p.strip() for p in parts):
-            logger.error("❌ %s", self._ERR_NO_TEXT)
-            raise RuntimeError(self._ERR_NO_TEXT)
-
-        text = "\n\n".join(p for p in parts if p and p.strip())
         if len(text) > self.MAX_TEXT_LENGTH:
             text = text[: self.MAX_TEXT_LENGTH]
         return text
-
-    def _load_subtitles_with_retry(
-        self, video_id: str, transcript_cookies: Optional[str]
-    ) -> Tuple[str, str, str]:
-        """Субтитры с повторами при лимите YouTube (429). После исчерпания — сообщение пользователю."""
-        delays = self._SUBTITLE_RETRY_DELAYS_SEC
-        for attempt in range(3):
-            try:
-                return self._load_subtitles(video_id, transcript_cookies)
-            except Exception as exc:
-                if not _exc_is_transcript_rate_limit(exc):
-                    raise
-                if attempt >= 2:
-                    logger.error(
-                        "❌ transcript-api: лимит запросов после 3 попыток: %s",
-                        exc,
-                    )
-                    raise RuntimeError(self._YOUTUBE_RATE_LIMIT_USER_MESSAGE) from exc
-                wait = delays[attempt]
-                logger.warning(
-                    "⚠️ transcript-api: лимит (429), пауза %.0f с перед повтором (%s/3)",
-                    wait,
-                    attempt + 2,
-                )
-                time.sleep(wait)
-
-    def _disable_ytdlp_cookies_for_session(self) -> None:
-        """Не использовать файл cookies для yt-dlp до перезапуска процесса бота."""
-        if not self.cookie_file:
-            return
-        logger.info(
-            "ℹ️ Путь cookies для yt-dlp сброшен до перезапуска "
-            "(ошибка запроса с cookies; следующие видео — без этого файла)",
-        )
-        self.cookie_file = None
-
-    def _resolved_cookie_file(self) -> Optional[str]:
-        """Путь к cookies.txt для yt-dlp или ``None`` (файл необязателен).
-
-        Без пути или при отсутствии файла парсер ведёт себя как раньше.
-        """
-        if not self.cookie_file:
-            return None
-        expanded = os.path.abspath(os.path.expanduser(self.cookie_file.strip()))
-        if os.path.isfile(expanded):
-            logger.info("🍪 Используются cookies из %s", expanded)
-            return expanded
-        logger.warning(
-            "⚠️ Файл cookies не найден: %s, работаем без cookies",
-            self.cookie_file,
-        )
-        return None
-
-    def _youtube_watch_page_description(
-        self,
-        url: str,
-        video_id: str,
-        *,
-        strict_rate_limit: bool = True,
-    ) -> Tuple[str, str]:
-        """Публичная страница ``/watch``: заголовок и описание из HTML (без yt-dlp / transcript-api).
-
-        Признаки страницы-заглушки (429 / лимит IP) обрабатываются до парсинга meta.
-        Если ``strict_rate_limit=True`` и обнаружена блокировка — ``RuntimeError`` с текстом для пользователя.
-
-        Args:
-            strict_rate_limit: Если False и страница похожа на блокировку — вернуть ``("", "")`` без исключения
-                (например, когда уже есть текст субтитров).
-        """
-        _ = url
-        msg = self._YOUTUBE_RATE_LIMIT_USER_MESSAGE
-        watch_url = f"https://www.youtube.com/watch?v={video_id}"
-        headers = {
-            "User-Agent": (
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/120.0.0.0 Safari/537.36"
-            ),
-            "Accept": "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
-        }
-        req = urllib.request.Request(watch_url, headers=headers)
-        try:
-            with urllib.request.urlopen(req, timeout=25) as resp:
-                raw_bytes = resp.read()
-        except urllib.error.HTTPError as exc:
-            if exc.code == 429:
-                logger.warning("⚠️ Фолбэк HTML watch: HTTP 429 для %s", watch_url)
-                if strict_rate_limit:
-                    raise RuntimeError(msg) from exc
-                return "", ""
-            logger.warning("⚠️ Фолбэк HTML watch: HTTP %s для %s", exc.code, watch_url)
-            return "", ""
-        except urllib.error.URLError as exc:
-            logger.warning("⚠️ Фолбэк HTML watch: ошибка URL %s (%s)", watch_url, exc)
-            return "", ""
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("⚠️ Фолбэк HTML watch: не удалось загрузить страницу: %s", exc)
-            return "", ""
-
-        html_text = raw_bytes.decode("utf-8", errors="replace")
-
-        if _youtube_watch_html_looks_rate_limited(html_text):
-            logger.warning(
-                "⚠️ Фолбэк HTML watch: похоже на блокировку/заглушку YouTube (429/sorry), не парсим og:-мета (%s)",
-                watch_url,
-            )
-            if strict_rate_limit:
-                raise RuntimeError(msg)
-            return "", ""
-
-        soup = BeautifulSoup(html_text, "lxml")
-
-        title_s = ""
-        og_title = soup.find("meta", attrs={"property": "og:title"})
-        if og_title and og_title.get("content"):
-            title_s = html.unescape(str(og_title["content"]).strip())
-        if not title_s:
-            meta_title = soup.find("meta", attrs={"name": "title"})
-            if meta_title and meta_title.get("content"):
-                title_s = html.unescape(str(meta_title["content"]).strip())
-
-        desc_s = ""
-        og_desc = soup.find("meta", attrs={"property": "og:description"})
-        if og_desc and og_desc.get("content"):
-            desc_s = html.unescape(str(og_desc["content"]).strip())
-        if not desc_s:
-            meta_desc = soup.find("meta", attrs={"name": "description"})
-            if meta_desc and meta_desc.get("content"):
-                desc_s = html.unescape(str(meta_desc["content"]).strip())
-
-        if not title_s and not desc_s:
-            logger.warning(
-                "⚠️ Фолбэк HTML watch: в разметке не найдены og:title / og:description (%s)",
-                watch_url,
-            )
-        return title_s, desc_s
-
-    def _load_subtitles(self, video_id: str, transcript_cookies: Optional[str] = None) -> Tuple[str, str, str]:
-        """Субтитры: (текст, язык, причина; пустая строка = OK).
-
-        При лимите YouTube (429 / :class:`~youtube_transcript_api._errors.TooManyRequests`)
-        исключение пробрасывается наверх для :meth:`_load_subtitles_with_retry`.
-
-        ``transcript_cookies`` — тот же Netscape cookies.txt, что и для yt-dlp (если задан).
-        """
-        from youtube_transcript_api import YouTubeTranscriptApi
-        from youtube_transcript_api._errors import (  # type: ignore[import-not-found]
-            NoTranscriptFound,
-            TooManyRequests,
-            TranscriptsDisabled,
-            VideoUnavailable,
-            YouTubeRequestFailed,
-        )
-
-        try:
-            tlist = _youtube_list_transcripts(video_id, transcript_cookies)
-        except TooManyRequests:
-            raise
-        except VideoUnavailable as exc:
-            msg = f"ролик недоступен (VideoUnavailable: {exc})"
-            logger.warning("⚠️ %s", msg)
-            return self._fallback_get_transcript_only(
-                video_id,
-                YouTubeTranscriptApi,
-                reason_prefix=msg,
-                transcript_cookies=transcript_cookies,
-            )
-        except TranscriptsDisabled as exc:
-            reason = f"субтитры отключены автором: {exc}"
-            logger.warning("⚠️ %s", reason)
-            return "", "", reason
-        except YouTubeRequestFailed as exc:
-            if _exc_is_transcript_rate_limit(exc):
-                raise
-            err_t = f"{type(exc).__name__}: {exc}"
-            logger.error("❌ list_transcripts: %s", err_t)
-            return self._fallback_get_transcript_only(
-                video_id,
-                YouTubeTranscriptApi,
-                reason_prefix=err_t,
-                transcript_cookies=transcript_cookies,
-            )
-        except Exception as exc:  # noqa: BLE001
-            if _exc_is_transcript_rate_limit(exc):
-                raise
-            err_t = f"{type(exc).__name__}: {exc}"
-            logger.error("❌ list_transcripts: %s", err_t)
-            return self._fallback_get_transcript_only(
-                video_id,
-                YouTubeTranscriptApi,
-                reason_prefix=err_t,
-                transcript_cookies=transcript_cookies,
-            )
-
-        all_tr: List[Any] = []
-        try:
-            for t in tlist:  # type: ignore[operator]
-                all_tr.append(t)
-        except Exception as exc:  # noqa: BLE001
-            logger.error("❌ обход списка дорожек: %s", exc)
-            all_tr = []
-
-        if not all_tr:
-            reason = "YouTube не вернул ни одной дорожки субтитров"
-            logger.warning("⚠️ %s", reason)
-            return "", "", reason
-
-        try:
-            tr_obj, sub_kind, pick_reason = _select_transcript_track(
-                tlist, all_tr, NoTranscriptFound
-            )
-        except RuntimeError as exc:
-            logger.error("❌ выбор дорожки субтитров: %s", exc)
-            return "", "", str(exc)
-        lang = _transcript_lang_code(tr_obj)
-        try:
-            raw = tr_obj.fetch()
-        except TooManyRequests:
-            raise
-        except YouTubeRequestFailed as exc:
-            if _exc_is_transcript_rate_limit(exc):
-                raise
-            logger.error("❌ fetch() субтитров: %s: %s", type(exc).__name__, exc)
-            return "", "", f"сбой fetch: {type(exc).__name__}"
-        except Exception as exc:  # noqa: BLE001
-            if _exc_is_transcript_rate_limit(exc):
-                raise
-            logger.error("❌ fetch() субтитров: %s: %s", type(exc).__name__, exc)
-            return "", "", f"сбой fetch: {type(exc).__name__}"
-
-        sub_text = _clean_subtitle_fetch(raw)
-        if not sub_text:
-            r = f"текст дорожки пуст ({pick_reason})"
-            logger.warning("⚠️ %s", r)
-            return "", "", r
-
-        nchars = self._format_number(len(sub_text))
-        if sub_kind == "auto":
-            logger.info("✅ Автосубтитры (%s), %s символов", lang, nchars)
-        else:
-            logger.info("⚠️ Ручные субтитры (%s), %s символов", lang, nchars)
-        logger.debug("Метка дорожки: %s", pick_reason)
-        return sub_text, lang, ""
-
-    def _fallback_get_transcript_only(
-        self,
-        video_id: str,
-        ytt: Any,
-        reason_prefix: str,
-        transcript_cookies: Optional[str] = None,
-    ) -> Tuple[str, str, str]:
-        try:
-            try:
-                raw = ytt.get_transcript(
-                    video_id,
-                    languages=["ru", "en"],
-                    proxies=None,
-                    cookies=transcript_cookies,
-                )  # type: ignore[attr-defined]
-            except Exception:  # noqa: BLE001
-                raw = ytt.get_transcript(
-                    video_id,
-                    proxies=None,
-                    cookies=transcript_cookies,
-                )  # type: ignore[attr-defined]
-        except Exception as exc2:  # noqa: BLE001
-            if _exc_is_transcript_rate_limit(exc2):
-                raise
-            r = f"{reason_prefix}; get_transcript: {type(exc2).__name__}: {exc2}"
-            logger.error("❌ %s", r)
-            return "", "", r
-        sub = _clean_subtitle_fetch(raw)
-        if sub:
-            logger.info(
-                "ℹ️ Субтитры (get_transcript, без деталей ASR/ручн.), %s символов",
-                self._format_number(len(sub)),
-            )
-            return sub, "mixed", ""
-        return "", "", f"{reason_prefix}; get_transcript вернул пустой текст"
-
-    @staticmethod
-    def _format_number(value: int) -> str:
-        return f"{value:,}".replace(",", " ")
 
 
 # --------------------------------------------------------------------------- #
@@ -959,18 +499,15 @@ class ParserRegistry:
 
 
 def create_parser_registry(cfg: Optional[object] = None) -> ParserRegistry:
-    """Реестр с YouTube (до Web). Поля ``youtube_api_key`` и связанные — для
-    обратной совместимости; ``YouTubeParser`` ключ API не использует.
-    Путь к cookies: ``cfg.youtube_cookie_file`` → ``YouTubeParser``.
-    """
+    """Реестр с YouTube (до Web). Передаются ``youtube_api_key`` и список прокси для субтитров."""
     if cfg is None:
         from config import config as _cfg
         cfg = _cfg
     api_key = str(getattr(cfg, "youtube_api_key", "") or "")
-    yt_cookie_raw = str(getattr(cfg, "youtube_cookie_file", "") or "").strip()
-    yt_cookie: str | None = yt_cookie_raw if yt_cookie_raw else None
+    raw_proxies = str(getattr(cfg, "youtube_proxy_url", "") or "")
+    proxy_list = [p.strip() for p in raw_proxies.split(",") if p.strip()]
     registry = ParserRegistry()
-    registry.register(YouTubeParser(youtube_api_key=api_key, cookie_file=yt_cookie))
+    registry.register(YouTubeParser(youtube_api_key=api_key, proxy_urls=proxy_list))
     registry.register(WebParser())
     return registry
 
@@ -980,20 +517,114 @@ def create_parser_registry(cfg: Optional[object] = None) -> ParserRegistry:
 # --------------------------------------------------------------------------- #
 
 if __name__ == "__main__":
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
+    import sys
+    from unittest.mock import MagicMock, patch
 
     async def _test() -> None:
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
+
         assert YouTubeParser.can_parse("https://www.youtube.com/watch?v=dQw4w9WgXcQ")
         assert YouTubeParser.can_parse("https://youtu.be/dQw4w9WgXcQ")
-        assert YouTubeParser.can_parse("https://m.youtube.com/shorts/abcdefghijk1")
+        assert YouTubeParser.can_parse("https://m.youtube.com/shorts/abcdefghijk")
         assert not YouTubeParser.can_parse("https://eda.ru/recept/123")
         assert not YouTubeParser.can_parse("")
-        assert _extract_youtube_video_id("https://www.youtube.com/watch?v=short") == ""
-        print("✅ YouTube can_parse / extract ok")
+        assert YouTubeParser._extract_youtube_video_id("https://www.youtube.com/watch?v=short") == ""
+        assert _normalize_youtube_proxy_url("http://user:pass@host:8080") == "http://user:pass@host:8080"
+        assert _normalize_youtube_proxy_url("user:pass@residential.host:80") == "http://user:pass@residential.host:80"
+        assert _normalize_youtube_proxy_url("  https://u:p@proxy.example:443  ") == "https://u:p@proxy.example:443"
+        _cli = _youtube_transcript_api_client("http://user:pass@127.0.0.1:8888")
+        assert _cli is not None
+        print("✅ YouTube can_parse / extract / прокси-URL")
+
+        no_key = YouTubeParser(youtube_api_key="")
+        try:
+            await no_key.parse("https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+        except RuntimeError as exc:
+            if "YOUTUBE_API_KEY" not in str(exc):
+                raise AssertionError(f"Ожидалось сообщение про ключ: {exc}") from exc
+            print("✅ Без API-ключа: понятный RuntimeError")
+        else:
+            raise AssertionError("Ожидался RuntimeError без YOUTUBE_API_KEY")
+
+        this_mod = sys.modules[__name__]
+        with patch.object(this_mod, "build") as mock_build, patch.object(
+            YouTubeParser,
+            "_fetch_subtitles_via_api",
+            return_value="Mock subtitle line",
+        ):
+            mock_yt = MagicMock()
+            mock_build.return_value = mock_yt
+            mock_req = MagicMock()
+            mock_yt.videos.return_value.list.return_value = mock_req
+            mock_req.execute.return_value = {
+                "items": [
+                    {
+                        "snippet": {
+                            "title": "Mock Recipe Video Title Here",
+                            "description": "Line one\n\nIngredients: test",
+                        },
+                        "contentDetails": {"duration": "PT5M30S"},
+                    }
+                ]
+            }
+            parsed = await YouTubeParser(youtube_api_key="test-key").parse(
+                "https://www.youtube.com/watch?v=abcdefghijk"
+            )
+            assert "Mock Recipe" in parsed
+            assert "Ingredients" in parsed
+            assert "Mock subtitle" in parsed
+            print("✅ parse() с моком Data API и субтитрами")
+
+        from youtube_transcript_api._errors import IpBlocked
+
+        with patch.object(this_mod, "build") as mock_build, patch.object(
+            YouTubeParser,
+            "_fetch_subtitles_via_api",
+            side_effect=[
+                IpBlocked("abcdefghijk"),
+                "Text after proxy rotation",
+            ],
+        ):
+            mock_yt = MagicMock()
+            mock_build.return_value = mock_yt
+            mock_req = MagicMock()
+            mock_yt.videos.return_value.list.return_value = mock_req
+            mock_req.execute.return_value = {
+                "items": [
+                    {
+                        "snippet": {"title": "T", "description": "D"},
+                        "contentDetails": {},
+                    }
+                ]
+            }
+            rotated = await YouTubeParser(
+                youtube_api_key="test-key",
+                proxy_urls=["http://proxy-a.example", "http://proxy-b.example"],
+            ).parse("https://www.youtube.com/watch?v=abcdefghijk")
+            assert "after proxy rotation" in rotated
+            print("✅ ротация прокси при блокировке (мок)")
+
+        import os
+
+        _live_key = os.getenv("YOUTUBE_API_KEY", "").strip()
+        _live_proxy = os.getenv("YOUTUBE_PROXY_URL", "").strip()
+        if _live_key:
+            try:
+                live_proxies = [p.strip() for p in _live_proxy.split(",") if p.strip()]
+                live_text = await YouTubeParser(
+                    youtube_api_key=_live_key,
+                    proxy_urls=live_proxies,
+                ).parse("https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+                print(
+                    f"✅ YouTube live (API"
+                    f"{' + прокси' if live_proxies else ''}): {len(live_text)} символов"
+                )
+            except Exception as exc:  # noqa: BLE001
+                print(f"⚠️  YouTube live: {exc}")
 
         registry = create_parser_registry()
         yt_p = registry.get_parser("https://www.youtube.com/watch?v=dQw4w9WgXcQ")
@@ -1010,22 +641,12 @@ if __name__ == "__main__":
         else:
             raise AssertionError("Ожидался ValueError")
 
-        yurl = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
-        class _Cfg:
-            youtube_api_key = ""
-        reg = create_parser_registry(_Cfg())
-        try:
-            tyt = await reg.parse(yurl)
-            print(f"✅ YouTube: {len(tyt)} символов")
-            if tyt:
-                print(f"📝 Начало: {tyt[:200]!r}…")
-        except Exception as exc:  # noqa: BLE001
-            print(f"⚠️  YouTube тест: {exc}")
-
         try:
             text = await registry.parse("https://eda.ru/recepty/supy/klassicheskij-borshh-34567")
             print(f"✅ Eda: {len(text)} символов")
         except Exception as exc:  # noqa: BLE001
             print(f"⚠️  Eda: {exc}")
 
-    asyncio.run(_test())
+    import asyncio as _asyncio
+
+    _asyncio.run(_test())
