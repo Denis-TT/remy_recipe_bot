@@ -299,6 +299,47 @@ def _apify_segments_from_transcript_list(tr_list: list) -> List[str]:
     return out
 
 
+def _apify_raw_segment_list(payload: Any, _depth: int = 0) -> List[str]:
+    """Плоский список текстов сегментов (без склейки), в т.ч. для ``item["data"]`` в списках."""
+    max_depth = 6
+    if _depth > max_depth or payload is None:
+        return []
+    try:
+        if isinstance(payload, str):
+            s = payload.strip()
+            return [s] if s else []
+        if isinstance(payload, dict):
+            if "data" in payload and payload.get("data") is not None:
+                return _apify_raw_segment_list(payload["data"], _depth + 1)
+            tr = payload.get("transcript")
+            if isinstance(tr, list) and tr:
+                return _apify_segments_from_transcript_list(tr)
+            for key in ("text", "subtitleText", "chunk"):
+                v = payload.get(key)
+                try:
+                    if isinstance(v, str) and v.strip():
+                        return [v.strip()]
+                    if v is not None and not isinstance(v, (dict, list)):
+                        s = str(v).strip()
+                        if s:
+                            return [s]
+                except (TypeError, ValueError, AttributeError):
+                    continue
+            return []
+        if isinstance(payload, list):
+            acc: List[str] = []
+            for it in payload:
+                if isinstance(it, str):
+                    if it.strip():
+                        acc.append(it.strip())
+                elif isinstance(it, dict):
+                    acc.extend(_apify_raw_segment_list(it, _depth + 1))
+            return acc
+        return []
+    except (TypeError, ValueError, AttributeError):
+        return []
+
+
 def _apify_extract_subtitles_payload(
     payload: Any,
     _depth: int = 0,
@@ -353,6 +394,7 @@ def _apify_extract_subtitles_payload(
 
             parts: List[str] = []
             list_only_strings = True
+            used_list_item_data = False
             for item in payload:
                 try:
                     if isinstance(item, str):
@@ -362,6 +404,12 @@ def _apify_extract_subtitles_payload(
                     list_only_strings = False
                     if not isinstance(item, dict):
                         continue
+                    if "data" in item and item.get("data") is not None:
+                        nested = _apify_raw_segment_list(item["data"], _depth + 1)
+                        if nested:
+                            used_list_item_data = True
+                            parts.extend(nested)
+                            continue
                     tr = item.get("transcript")
                     if isinstance(tr, list) and tr:
                         parts.extend(_apify_segments_from_transcript_list(tr))
@@ -380,7 +428,12 @@ def _apify_extract_subtitles_payload(
                     continue
 
             if parts:
-                fmt = "list[str]" if list_only_strings else "list[object]"
+                if list_only_strings:
+                    fmt = "list[str]"
+                elif used_list_item_data:
+                    fmt = "list[object.data]"
+                else:
+                    fmt = "list[object]"
                 return _apify_collapse_subtitle_text(parts), len(parts), fmt
 
         logger.warning(
@@ -670,6 +723,17 @@ if __name__ == "__main__":
         assert n_wr == 2
         t_wr2, n_wr2 = _apify_dataset_payload_to_subtitle_text({"data": ["x", "y"]})
         assert n_wr2 == 2
+        t_ld, n_ld = _apify_dataset_payload_to_subtitle_text(
+            [
+                {
+                    "data": [
+                        {"start": "0", "dur": "1", "text": "первый"},
+                        {"start": "1", "dur": "1", "text": "второй"},
+                    ]
+                }
+            ]
+        )
+        assert n_ld == 2 and "первый" in t_ld and "второй" in t_ld
         t_junk, n_junk = _apify_dataset_payload_to_subtitle_text({"foo": 1})
         assert n_junk == 0 and t_junk == ""
         print("✅ YouTube can_parse / extract + Apify форматы субтитров")
