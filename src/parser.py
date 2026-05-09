@@ -246,12 +246,21 @@ def _apify_http_json(
         data = json.dumps(body).encode("utf-8")
         headers["Content-Type"] = "application/json"
     req = urllib.request.Request(url, data=data, headers=headers, method=method.upper())
+    raw = ""
     try:
         with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
             raw = resp.read().decode("utf-8", errors="replace")
             if not raw.strip():
                 return None
-            return json.loads(raw)
+            try:
+                return json.loads(raw)
+            except json.JSONDecodeError as exc:
+                logger.error(
+                    "Apify: ответ не является JSON (%s). Первые 500 символов: %r",
+                    exc,
+                    raw[:500],
+                )
+                return None
     except urllib.error.HTTPError as exc:
         err = exc.read().decode("utf-8", errors="replace") if exc.fp else ""
         if exc.code == 401:
@@ -265,29 +274,136 @@ def _apify_http_json(
         else:
             logger.error("Apify HTTP %s для %s: %s", exc.code, url, err[:800])
         return None
-    except (urllib.error.URLError, json.JSONDecodeError, TimeoutError, OSError) as exc:
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
         logger.error("Apify запрос не удался (%s): %s", url, exc)
         return None
 
 
-def _join_apify_dataset_texts(items: Any) -> str:
-    """Склеить текст субтитров из элементов dataset (поле ``text`` или близкие ключи)."""
-    if not isinstance(items, list):
-        return ""
-    parts: List[str] = []
-    for it in items:
-        if not isinstance(it, dict):
+def _apify_collapse_subtitle_text(parts: List[str]) -> str:
+    return re.sub(r"\s+", " ", " ".join(parts)).strip()
+
+
+def _apify_segments_from_transcript_list(tr_list: list) -> List[str]:
+    """Извлечь строки из списка сегментов ``[{text: ...}, ...]``."""
+    out: List[str] = []
+    for seg in tr_list:
+        try:
+            if isinstance(seg, dict):
+                t = seg.get("text")
+                if t is not None and str(t).strip():
+                    out.append(str(t).strip())
+            elif isinstance(seg, str) and seg.strip():
+                out.append(seg.strip())
+        except (TypeError, ValueError, AttributeError):
             continue
-        chunk = (
-            it.get("text")
-            or it.get("transcript")
-            or it.get("subtitleText")
-            or it.get("chunk")
+    return out
+
+
+def _apify_extract_subtitles_payload(
+    payload: Any,
+    _depth: int = 0,
+) -> tuple[str, int, str]:
+    """Разобрать тело ответа dataset Apify в субтитры.
+
+    Поддерживаются вложенность ``data``, ``transcript``, списки объектов/строк,
+    одиночный объект с ``text``. При успехе: (текст, число сегментов, метка формата).
+
+    Не бросает исключений при мусорном входе — возвращает (\"\", 0, \"unrecognized\").
+    """
+    tag_unrecognized = "unrecognized"
+    max_depth = 6
+    if _depth > max_depth:
+        logger.warning("Apify субтитры: слишком глубокая вложенность (%s), разбор остановлен", _depth)
+        return "", 0, tag_unrecognized
+    try:
+        if payload is None:
+            return "", 0, tag_unrecognized
+
+        # Обёртка { "data": ... }
+        if isinstance(payload, dict) and "data" in payload:
+            inner = payload.get("data")
+            text, n, inner_tag = _apify_extract_subtitles_payload(inner, _depth + 1)
+            if n > 0 and text:
+                return text, n, f"data→{inner_tag}"
+
+        # Объект с transcript
+        if isinstance(payload, dict):
+            tr = payload.get("transcript")
+            if isinstance(tr, list) and tr:
+                parts = _apify_segments_from_transcript_list(tr)
+                if parts:
+                    return _apify_collapse_subtitle_text(parts), len(parts), "object.transcript"
+
+            for key in ("text", "subtitleText", "chunk"):
+                v = payload.get(key)
+                try:
+                    if isinstance(v, str) and v.strip():
+                        return _apify_collapse_subtitle_text([v.strip()]), 1, f"object.{key}"
+                    if v is not None and not isinstance(v, (dict, list)):
+                        s = str(v).strip()
+                        if s:
+                            return _apify_collapse_subtitle_text([s]), 1, f"object.{key}"
+                except (TypeError, ValueError, AttributeError):
+                    continue
+
+        # Список
+        if isinstance(payload, list):
+            if not payload:
+                return "", 0, "empty_list"
+
+            parts: List[str] = []
+            list_only_strings = True
+            for item in payload:
+                try:
+                    if isinstance(item, str):
+                        if item.strip():
+                            parts.append(item.strip())
+                        continue
+                    list_only_strings = False
+                    if not isinstance(item, dict):
+                        continue
+                    tr = item.get("transcript")
+                    if isinstance(tr, list) and tr:
+                        parts.extend(_apify_segments_from_transcript_list(tr))
+                        continue
+                    for key in ("text", "subtitleText", "chunk"):
+                        v = item.get(key)
+                        if isinstance(v, str) and v.strip():
+                            parts.append(v.strip())
+                            break
+                        if v is not None and not isinstance(v, (dict, list)):
+                            s = str(v).strip()
+                            if s:
+                                parts.append(s)
+                                break
+                except (TypeError, ValueError, AttributeError):
+                    continue
+
+            if parts:
+                fmt = "list[str]" if list_only_strings else "list[object]"
+                return _apify_collapse_subtitle_text(parts), len(parts), fmt
+
+        logger.warning(
+            "Apify субтитры: формат не распознан (тип %s, превью: %r)",
+            type(payload).__name__,
+            repr(payload)[:220],
         )
-        if chunk:
-            parts.append(str(chunk).replace("\n", " ").strip())
-    out = " ".join(parts)
-    return re.sub(r"\s+", " ", out).strip()
+        return "", 0, tag_unrecognized
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Apify субтитры: неожиданная ошибка разбора: %s", exc)
+        return "", 0, tag_unrecognized
+
+
+def _apify_dataset_payload_to_subtitle_text(payload: Any) -> tuple[str, int]:
+    """Внешняя обёртка: (полный текст, число сегментов) и лог успешного формата."""
+    text, n, fmt = _apify_extract_subtitles_payload(payload, 0)
+    if n > 0 and text:
+        logger.info(
+            "Apify: распознан формат «%s», получено %s сегментов субтитров",
+            fmt,
+            n,
+        )
+    return text, n
 
 
 class YouTubeParser(BaseParser):
@@ -374,10 +490,7 @@ class YouTubeParser(BaseParser):
 
         items_url = f"https://api.apify.com/v2/actor-runs/{run_id}/dataset/items?format=json"
         items_payload = _apify_http_json("GET", items_url, token, None)
-        if isinstance(items_payload, list):
-            texts = _join_apify_dataset_texts(items_payload)
-        else:
-            texts = ""
+        texts, n_segments = _apify_dataset_payload_to_subtitle_text(items_payload)
 
         if texts:
             logger.info("Получены субтитры через Apify (%s символов)", len(texts))
@@ -528,7 +641,38 @@ if __name__ == "__main__":
         assert not YouTubeParser.can_parse("https://eda.ru/recept/123")
         assert not YouTubeParser.can_parse("")
         assert YouTubeParser._extract_youtube_video_id("https://www.youtube.com/watch?v=short") == ""
-        print("✅ YouTube can_parse / extract")
+        tx, n = _apify_dataset_payload_to_subtitle_text(
+            [
+                {
+                    "transcript": [
+                        {"start": 0, "dur": 1, "text": " Hello "},
+                        {"start": 1, "dur": 1, "text": "world"},
+                    ]
+                }
+            ]
+        )
+        assert n == 2 and "Hello" in tx and "world" in tx
+        tx2, n2 = _apify_dataset_payload_to_subtitle_text([{"text": "flat caption"}])
+        assert n2 == 1 and "flat" in tx2
+        tx3, n3 = _apify_dataset_payload_to_subtitle_text([])
+        assert n3 == 0 and tx3 == ""
+        t_tr, n_tr = _apify_dataset_payload_to_subtitle_text(
+            {"transcript": [{"text": "новый"}, {"text": "формат"}]}
+        )
+        assert n_tr == 2 and "новый" in t_tr
+        t_arr, n_arr = _apify_dataset_payload_to_subtitle_text(["один", "два"])
+        assert n_arr == 2 and "один" in t_arr and "два" in t_arr
+        t_one, n_one = _apify_dataset_payload_to_subtitle_text({"text": "одиночка"})
+        assert n_one == 1 and t_one == "одиночка"
+        t_wr, n_wr = _apify_dataset_payload_to_subtitle_text(
+            {"data": [{"text": "в"}, {"text": "data"}]}
+        )
+        assert n_wr == 2
+        t_wr2, n_wr2 = _apify_dataset_payload_to_subtitle_text({"data": ["x", "y"]})
+        assert n_wr2 == 2
+        t_junk, n_junk = _apify_dataset_payload_to_subtitle_text({"foo": 1})
+        assert n_junk == 0 and t_junk == ""
+        print("✅ YouTube can_parse / extract + Apify форматы субтитров")
 
         no_key = YouTubeParser(youtube_api_key="")
         try:
