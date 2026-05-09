@@ -5,6 +5,7 @@
 * `WebParser` — обычные HTTP(S)-страницы с рецептами.
 * `YouTubeParser` — заголовок и описание через YouTube Data API v3; субтитры — Apify Actor
   ``pintostudio~youtube-transcript-scraper`` (при наличии ``APIFY_API_TOKEN``).
+* `InstagramParser` — Reels и посты через Apify Actor ``agentx~video-transcript`` (тело ``video_url``).
 * `ParserRegistry` / `create_parser_registry` — маршрутизация и фабрика.
 """
 
@@ -222,6 +223,8 @@ def _strip_youtube_title_text(text: str) -> str:
 
 # Apify Actor (субтитры YouTube). Официальный список items: GET /v2/actor-runs/{runId}/dataset/items
 APIFY_TRANSCRIPT_ACTOR = "pintostudio~youtube-transcript-scraper"
+# Instagram Reels / посты: метаданные и транскрипт (тело POST: ``video_url``).
+APIFY_INSTAGRAM_VIDEO_ACTOR = "agentx~video-transcript"
 APIFY_WAIT_FINISH_SEC = 120
 
 
@@ -623,6 +626,154 @@ class YouTubeParser(BaseParser):
             text = text[: self.MAX_TEXT_LENGTH]
         return text
 
+
+def _instagram_safe_str(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    return str(value).strip()
+
+
+def _instagram_transcript_to_text(transcript: Any) -> str:
+    if transcript is None:
+        return ""
+    if isinstance(transcript, str):
+        return transcript.strip()
+    if isinstance(transcript, dict):
+        t = transcript.get("text")
+        return _instagram_safe_str(t)
+    if isinstance(transcript, list):
+        parts: List[str] = []
+        for seg in transcript:
+            if isinstance(seg, dict):
+                parts.append(_instagram_safe_str(seg.get("text")))
+            elif isinstance(seg, str) and seg.strip():
+                parts.append(seg.strip())
+        return " ".join(p for p in parts if p)
+    return str(transcript).strip()
+
+
+def _instagram_unwrap_record(obj: dict) -> dict:
+    inner = obj.get("data")
+    if isinstance(inner, dict):
+        return inner
+    return obj
+
+
+def _instagram_first_dataset_record(items_payload: Any) -> Optional[dict]:
+    if isinstance(items_payload, list):
+        for item in items_payload:
+            if isinstance(item, dict):
+                rec = _instagram_unwrap_record(item)
+                if rec:
+                    return rec
+        return None
+    if isinstance(items_payload, dict):
+        rec = _instagram_unwrap_record(items_payload)
+        return rec if rec else None
+    return None
+
+
+def _instagram_fields_from_record(rec: dict) -> tuple[str, str, str]:
+    title = _instagram_safe_str(rec.get("title"))
+    description = _instagram_safe_str(rec.get("description"))
+    transcript_text = _instagram_transcript_to_text(rec.get("transcript"))
+    return title, description, transcript_text
+
+
+class InstagramParser(BaseParser):
+    """Instagram Reels и посты /p/… через Apify ``agentx~video-transcript``."""
+
+    source_type: str = "instagram"
+    MAX_TEXT_LENGTH: int = 50_000
+
+    def __init__(self, apify_api_token: str = "") -> None:
+        self._apify_api_token = (apify_api_token or "").strip()
+
+    @staticmethod
+    def _extract_shortcode(url: str) -> str:
+        m = re.search(
+            r"instagram\.com/(?:reel|p)/([A-Za-z0-9_-]+)",
+            (url or "").strip(),
+            re.IGNORECASE,
+        )
+        return m.group(1) if m else ""
+
+    @staticmethod
+    def can_parse(url: str) -> bool:
+        if not isinstance(url, str) or not url.strip():
+            return False
+        u = url.lower()
+        return "instagram.com/reel/" in u or "instagram.com/p/" in u
+
+    async def parse(self, url: str) -> str:
+        if not self.can_parse(url):
+            raise ValueError(f"InstagramParser не поддерживает URL: {url!r}")
+        return await asyncio.to_thread(self._parse_sync, url)
+
+    def _fetch_via_apify(self, url: str) -> tuple[str, str, str]:
+        """Вернуть (title, description, transcript_text) или три пустые строки при сбое."""
+        token = (self._apify_api_token or "").strip()
+        if not token:
+            logger.error("Ошибка получения Instagram субтитров")
+            return "", "", ""
+
+        run_url = (
+            f"https://api.apify.com/v2/acts/{APIFY_INSTAGRAM_VIDEO_ACTOR}/runs"
+            f"?waitForFinish={APIFY_WAIT_FINISH_SEC}"
+        )
+        envelope = _apify_http_json("POST", run_url, token, {"video_url": url})
+        if not isinstance(envelope, dict):
+            logger.error("Ошибка получения Instagram субтитров")
+            return "", "", ""
+
+        run = envelope.get("data")
+        if not isinstance(run, dict):
+            logger.error("Ошибка получения Instagram субтитров")
+            return "", "", ""
+
+        run_id = run.get("id")
+        if not run_id:
+            logger.error("Ошибка получения Instagram субтитров")
+            return "", "", ""
+
+        items_url = f"https://api.apify.com/v2/actor-runs/{run_id}/dataset/items?format=json"
+        items_payload = _apify_http_json("GET", items_url, token, None)
+        rec = _instagram_first_dataset_record(items_payload)
+        if not rec:
+            logger.error("Ошибка получения Instagram субтитров")
+            return "", "", ""
+
+        title, description, transcript_text = _instagram_fields_from_record(rec)
+        if not (title or description or transcript_text):
+            logger.error("Ошибка получения Instagram субтитров")
+            return "", "", ""
+
+        logger.info("Получены данные через Apify Video Transcript")
+        return title, description, transcript_text
+
+    def _parse_sync(self, url: str) -> str:
+        shortcode = self._extract_shortcode(url)
+        if not shortcode:
+            raise ValueError("Некорректный Instagram URL")
+
+        logger.info("📸 Обнаружено Instagram видео: %s", shortcode)
+
+        title, description, transcript_text = self._fetch_via_apify(url)
+
+        chunks = [title, description, transcript_text]
+        text = "\n\n".join(c for c in chunks if c and str(c).strip())
+
+        if not text.strip():
+            logger.error("Ошибка получения Instagram субтитров")
+            raise RuntimeError("Не удалось извлечь текст из Instagram (пустой ответ Apify)")
+
+        if len(text) > self.MAX_TEXT_LENGTH:
+            text = text[: self.MAX_TEXT_LENGTH]
+        return text
+
+
 # --------------------------------------------------------------------------- #
 # Реестр
 # --------------------------------------------------------------------------- #
@@ -660,7 +811,7 @@ class ParserRegistry:
 
 
 def create_parser_registry(cfg: Optional[object] = None) -> ParserRegistry:
-    """Реестр с YouTube (до Web). Передаются ``youtube_api_key`` и ``apify_api_token``."""
+    """Реестр: YouTube, Instagram, Web. Передаются ``youtube_api_key`` и ``apify_api_token``."""
     if cfg is None:
         from config import config as _cfg
         cfg = _cfg
@@ -668,6 +819,7 @@ def create_parser_registry(cfg: Optional[object] = None) -> ParserRegistry:
     apify_tok = str(getattr(cfg, "apify_api_token", "") or "")
     registry = ParserRegistry()
     registry.register(YouTubeParser(youtube_api_key=api_key, apify_api_token=apify_tok))
+    registry.register(InstagramParser(apify_api_token=apify_tok))
     registry.register(WebParser())
     return registry
 
@@ -737,6 +889,27 @@ if __name__ == "__main__":
         t_junk, n_junk = _apify_dataset_payload_to_subtitle_text({"foo": 1})
         assert n_junk == 0 and t_junk == ""
         print("✅ YouTube can_parse / extract + Apify форматы субтитров")
+
+        assert InstagramParser.can_parse("https://www.instagram.com/reel/ABCxyz12/")
+        assert InstagramParser.can_parse("https://instagram.com/p/XYZ_ab-1/")
+        assert InstagramParser._extract_shortcode(
+            "https://www.instagram.com/reel/AbCd123/?utm=x",
+        ) == "AbCd123"
+        assert InstagramParser._extract_shortcode("https://www.instagram.com/p/xY9_/") == "xY9_"
+        assert not InstagramParser.can_parse("https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+        assert not InstagramParser.can_parse("")
+        print("✅ Instagram can_parse / shortcode")
+
+        with patch.object(
+            InstagramParser,
+            "_fetch_via_apify",
+            return_value=("IG Title", "Описание и ингредиенты", "текст субтитров"),
+        ):
+            ig_out = await InstagramParser(apify_api_token="dummy").parse(
+                "https://www.instagram.com/reel/xyz123xxxxx/",
+            )
+        assert "IG Title" in ig_out and "Описание" in ig_out and "субтитров" in ig_out
+        print("✅ Instagram parse() с моком Apify")
 
         no_key = YouTubeParser(youtube_api_key="")
         try:
@@ -816,6 +989,8 @@ if __name__ == "__main__":
         registry = create_parser_registry()
         yt_p = registry.get_parser("https://www.youtube.com/watch?v=dQw4w9WgXcQ")
         assert yt_p is not None and getattr(yt_p, "source_type", None) == "youtube"
+        ig_p = registry.get_parser("https://www.instagram.com/reel/abcd1234567/")
+        assert ig_p is not None and getattr(ig_p, "source_type", None) == "instagram"
         assert registry.get_parser("https://eda.ru/test") is not None
         assert registry.get_parser("not-a-url") is None
         print("✅ can_parse / реестр")
