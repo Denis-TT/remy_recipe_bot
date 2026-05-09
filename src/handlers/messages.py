@@ -1,10 +1,11 @@
 """
 Обработчик текстовых сообщений Remy Bot.
 
-Маршрутизирует любое входящее текстовое сообщение:
+Маршрутизирует входящие сообщения:
 
 * Нажатия на кнопки Reply-клавиатуры («📋 Меню», «📚 Сохраненные рецепты»,
   «ℹ️ Помощь») — открывают соответствующий экран;
+* Фото — анализ через GitHub Models (vision), нормализация, карточка с кнопками;
 * URL (http/https) — запускает цепочку «парсинг → нормализация →
   отображение с кнопками Сохранить/Не сохранять»;
 * Любой другой текст — короткая подсказка отправить ссылку.
@@ -15,6 +16,7 @@
 
 from __future__ import annotations
 
+import base64
 import logging
 import re
 import time
@@ -33,7 +35,7 @@ from ..keyboards import (
     main_menu_keyboard,
     save_recipe_keyboard,
 )
-from . import callbacks, commands
+from ..normalizer import MAX_IMAGE_BYTES
 
 if TYPE_CHECKING:
     from ..bot import RemyBot
@@ -117,6 +119,105 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         _NOT_A_URL_HINT,
         reply_markup=main_menu_keyboard(),
     )
+
+
+def _guess_image_mime(head: bytes) -> str:
+    """Определить MIME по сигнатуре (Telegram обычно JPEG)."""
+    if head.startswith(b"\xff\xd8"):
+        return "image/jpeg"
+    if head.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if head.startswith(b"GIF87a") or head.startswith(b"GIF89a"):
+        return "image/gif"
+    if head.startswith(b"RIFF") and len(head) >= 12 and head[8:12] == b"WEBP":
+        return "image/webp"
+    return "image/jpeg"
+
+
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Скачать фото, отправить в vision API, показать рецепт или отказ."""
+    message = update.effective_message
+    user = update.effective_user
+    if message is None or user is None or not message.photo:
+        return
+
+    logger.info("📷 Получено изображение от user %s", user.id)
+
+    photo = message.photo[-1]
+    status: Message = await message.reply_text("🔍 Анализирую изображение...")
+    bot = _get_bot(context)
+
+    try:
+        file = await context.bot.get_file(photo.file_id)
+        raw = bytes(await file.download_as_bytearray())
+    except Exception as exc:  # noqa: BLE001
+        logger.error("❌ Не удалось скачать изображение: %s", exc)
+        await _safe_edit(
+            status,
+            f"❌ Не удалось загрузить фото:\n<code>{_html_escape(str(exc))}</code>",
+        )
+        return
+
+    if len(raw) > MAX_IMAGE_BYTES:
+        logger.error("❌ Изображение слишком большое (%s байт)", len(raw))
+        await _safe_edit(status, "❌ Изображение слишком большое. Отправьте файл поменьше.")
+        return
+
+    b64 = base64.standard_b64encode(raw).decode("ascii")
+    mime = _guess_image_mime(raw[:32])
+
+    logger.info("🤖 Анализ изображения через AI...")
+    try:
+        result = await bot.normalizer.analyze_image(b64, mime_type=mime)
+    except ValueError as exc:
+        logger.error("❌ Ошибка анализа изображения: %s", exc)
+        await _safe_edit(
+            status,
+            f"❌ Не удалось обработать изображение:\n<code>{_html_escape(str(exc))}</code>",
+        )
+        return
+
+    if result.get("is_recipe") is False:
+        if result.get("error"):
+            logger.error("❌ Ошибка API при анализе изображения: %s", result.get("reason"))
+            await _safe_edit(
+                status,
+                "❌ Не удалось проанализировать изображение. Попробуйте позже.",
+            )
+        else:
+            logger.info("ℹ️ Изображение не содержит рецепт")
+            await _safe_edit(status, "❌ На этом изображении не удалось найти рецепт.")
+        return
+
+    title_ok = bool((result.get("title") or "").strip())
+    ingredients_ok = bool(result.get("ingredients"))
+    if not (title_ok and ingredients_ok):
+        logger.info("ℹ️ Изображение не содержит рецепт (валидация)")
+        await _safe_edit(status, "❌ На этом изображении не удалось найти рецепт.")
+        return
+
+    result["source_url"] = ""
+    bot.temp_recipes[user.id] = {"recipe": result, "timestamp": time.time()}
+    bot.cleanup_expired_temp_recipes()
+
+    logger.info("✅ Рецепт извлечён из изображения")
+
+    formatted = format_recipe(result, bot)
+    try:
+        await status.edit_text(
+            formatted,
+            reply_markup=save_recipe_keyboard(),
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+    except BadRequest as exc:
+        logger.warning("⚠️  Ошибка edit_text с HTML (фото): %s — отправляю без разметки", exc)
+        plain = re.sub(r"<[^>]+>", "", formatted)
+        await status.edit_text(
+            plain[:_TG_MESSAGE_LIMIT],
+            reply_markup=save_recipe_keyboard(),
+            disable_web_page_preview=True,
+        )
 
 
 # --------------------------------------------------------------------------- #

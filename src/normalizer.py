@@ -118,6 +118,15 @@ ALLOWED VALUES:
 """
 
 
+IMAGE_VISION_SYSTEM_PROMPT = """\
+Ты — анализатор изображений. Определи, содержит ли изображение кулинарный рецепт (ингредиенты, шаги приготовления). \
+Если да — извлеки всю информацию и верни в стандартном JSON формате рецепта (как в SYSTEM_PROMPT: title, description, cuisine, \
+meal_type, dish_type, main_ingredient, difficulty, времена, servings, ingredients, steps, nutrition_per_serving, nutrition, \
+tips, storage, tags, confidence, флаги диет) и добавь поле "is_recipe": true. \
+Если нет — верни только JSON с полем "is_recipe": false и "explanation" (пояснение по-русски). \
+Все текстовые поля рецепта на русском. Только валидный JSON, без markdown."""
+
+
 #: Дисклеймер при низкой уверенности в ингредиентах/шагах (источник — видео и т. п.).
 _LOW_CONFIDENCE_VIDEO_DISCLAIMER = (
     "⚠️ Низкая точность: данные собраны из видео, возможны ошибки"
@@ -153,6 +162,9 @@ DEFAULT_API_URL = "https://models.inference.ai.azure.com/chat/completions"
 
 #: Максимальная длина текста, отправляемого в AI (защита от переполнения контекста).
 MAX_INPUT_CHARS = 30_000
+
+#: Максимальный размер изображения (байты), отправляемого в vision API.
+MAX_IMAGE_BYTES = 10 * 1024 * 1024
 
 #: Таймаут HTTP-запроса к AI. Большой, потому что длинные рецепты
 #: с расчётом КБЖУ могут генерироваться до минуты.
@@ -280,6 +292,89 @@ class RecipeNormalizer:
         )
         return data
 
+    async def analyze_image(
+        self,
+        image_base64: str,
+        *,
+        mime_type: str = "image/jpeg",
+    ) -> Dict[str, Any]:
+        """Проанализировать изображение через vision API.
+
+        Returns:
+            Либо полный словарь рецепта (как у ``normalize``), без ключа ``is_recipe``,
+            либо заглушку ``{"is_recipe": false, "reason": str}``,
+            либо ``{"is_recipe": false, "reason": str, "error": True}`` при сбое API/разбора.
+
+        Raises:
+            ValueError: пустой ``image_base64``.
+        """
+        b64 = (image_base64 or "").strip()
+        if not b64:
+            raise ValueError("Пустое изображение")
+
+        raw_placeholder = "[изображение]"
+        models_try: List[str] = []
+        for cand in (self.model, "gpt-4o"):
+            if cand and cand not in models_try:
+                models_try.append(cand)
+
+        last_http_error: Optional[RuntimeError] = None
+        raw_content: Optional[str] = None
+        used_model: Optional[str] = None
+
+        for model in models_try:
+            try:
+                raw_content = await self._call_api_vision(b64, mime_type, model=model)
+                used_model = model
+                break
+            except RuntimeError as exc:
+                last_http_error = exc
+                logger.warning(
+                    "⚠️ Vision-модель %s: %s — пробую следующую при наличии",
+                    model,
+                    exc,
+                )
+                continue
+
+        if raw_content is None:
+            logger.error("❌ Vision: все модели вернули ошибку: %s", last_http_error)
+            return {
+                "is_recipe": False,
+                "reason": str(last_http_error) if last_http_error else "api",
+                "error": True,
+            }
+
+        try:
+            data = self._parse_json(raw_content)
+        except json.JSONDecodeError as exc:
+            logger.error("❌ Vision: невалидный JSON от AI: %s", exc)
+            return {"is_recipe": False, "reason": "invalid_json", "error": True}
+
+        if data.get("is_recipe") is False:
+            expl = (
+                data.get("explanation")
+                or data.get("reason")
+                or data.get("message")
+                or ""
+            )
+            return {
+                "is_recipe": False,
+                "reason": str(expl).strip(),
+            }
+
+        for key in ("is_recipe", "explanation", "message"):
+            data.pop(key, None)
+
+        data = self._postprocess(data, raw_placeholder)
+        data = Localization.normalize_recipe(data)
+
+        logger.info(
+            "✅ Рецепт из изображения нормализован («%s», модель %s)",
+            data.get("title", ""),
+            used_model or self.model,
+        )
+        return data
+
     # ------------------------------------------------------------------ #
     # HTTP-слой
     # ------------------------------------------------------------------ #
@@ -345,6 +440,68 @@ class RecipeNormalizer:
         except aiohttp.ClientError as exc:
             logger.error("❌ Сетевая ошибка при обращении к AI: %s", exc)
             raise RuntimeError(f"Сетевая ошибка при обращении к AI: {exc}") from exc
+
+    async def _call_api_vision(
+        self,
+        image_base64: str,
+        mime_type: str,
+        *,
+        model: str,
+    ) -> str:
+        """Vision-запрос (image URL data-uri + текст). ``max_tokens`` по ТЗ — 2000."""
+        data_url = f"data:{mime_type};base64,{image_base64}"
+        payload: Dict[str, Any] = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": IMAGE_VISION_SYSTEM_PROMPT},
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "Проанализируй это изображение на наличие рецепта.",
+                        },
+                        {"type": "image_url", "image_url": {"url": data_url}},
+                    ],
+                },
+            ],
+            "temperature": 0.2,
+            "max_tokens": 2000,
+        }
+        headers = {
+            "Authorization": f"Bearer {self.github_token}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        }
+        timeout = aiohttp.ClientTimeout(total=API_TIMEOUT_SECONDS)
+
+        logger.info("🤖 Отправка vision-запроса к GitHub Models API (модель: %s)", model)
+
+        try:
+            async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+                async with session.post(self.api_url, json=payload) as response:
+                    body = await response.text(errors="replace")
+                    logger.info(
+                        "📡 Vision-ответ (статус: %d, %d символов)",
+                        response.status,
+                        len(body),
+                    )
+                    if response.status >= 400:
+                        logger.error(
+                            "❌ Vision API (статус %d): %s",
+                            response.status,
+                            self._truncate(body, 500),
+                        )
+                        raise RuntimeError(
+                            f"Ошибка GitHub Models vision API (статус {response.status})"
+                        )
+                    return self._extract_content(body)
+        except asyncio.TimeoutError:
+            logger.error("❌ Таймаут vision-запроса к AI (%.0f с)", API_TIMEOUT_SECONDS)
+            raise RuntimeError("Таймаут при обращении к AI (vision)") from None
+        except aiohttp.ClientError as exc:
+            logger.error("❌ Сетевая ошибка vision: %s", exc)
+            raise RuntimeError(f"Сетевая ошибка при vision: {exc}") from exc
 
     @staticmethod
     def _extract_content(response_body: str) -> str:
@@ -733,6 +890,7 @@ class RecipeNormalizer:
 if __name__ == "__main__":
     import os
     from dotenv import load_dotenv
+    from unittest.mock import AsyncMock, patch
 
     load_dotenv()
 
@@ -750,6 +908,53 @@ if __name__ == "__main__":
             print("❌ Должна быть ошибка на пустом тексте")
         except ValueError as exc:
             print(f"✅ Пустой текст: {exc}")
+
+        # ---- analyze_image (мок vision) ----
+        with patch.object(RecipeNormalizer, "_call_api_vision", new_callable=AsyncMock) as mock_v:
+            mock_v.return_value = '{"is_recipe": false, "explanation": "на фото нет рецепта"}'
+            r_img = await temp_normalizer.analyze_image("dGVzdA==")
+            assert r_img.get("is_recipe") is False
+            assert r_img.get("error") is not True
+
+            mock_v.return_value = json.dumps({
+                "is_recipe": True,
+                "title": "Борщ тестовый",
+                "description": "Описание",
+                "cuisine": "russian",
+                "meal_type": "lunch",
+                "dish_type": "soup",
+                "main_ingredient": "beef",
+                "difficulty": "medium",
+                "prep_time": 10,
+                "cook_time": 50,
+                "total_time": 60,
+                "servings": 4,
+                "ingredients": [{"name": "Вода", "amount": 1, "unit": "л", "notes": ""}],
+                "steps": [{"step_number": 1, "description": "Варить."}],
+                "nutrition_per_serving": {"calories": 0, "protein": 0, "fat": 0, "carbs": 0},
+                "nutrition": {"calories": 0, "protein": 0, "fat": 0, "carbs": 0},
+                "tips": [],
+                "storage": "",
+                "tags": [],
+                "confidence": {
+                    "title": "high",
+                    "description": "high",
+                    "ingredients": "high",
+                    "steps": "high",
+                    "times": "medium",
+                    "nutrition": "low",
+                },
+                "is_vegetarian": False,
+                "is_vegan": False,
+                "is_gluten_free": False,
+                "is_lactose_free": False,
+            })
+            r_ok = await temp_normalizer.analyze_image("dGVzdA==", mime_type="image/png")
+            assert r_ok.get("is_recipe") is not False
+            assert (r_ok.get("title") or "").startswith("Борщ")
+            assert r_ok.get("ingredients")
+
+        print("✅ analyze_image: мок vision API")
 
         # ---- Тест 1 (с API): реальная нормализация ----
         token = os.getenv("GITHUB_TOKEN")

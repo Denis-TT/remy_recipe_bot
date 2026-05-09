@@ -5,7 +5,7 @@
 * `WebParser` — обычные HTTP(S)-страницы с рецептами.
 * `YouTubeParser` — заголовок и описание через YouTube Data API v3; субтитры — Apify Actor
   ``pintostudio~youtube-transcript-scraper`` (при наличии ``APIFY_API_TOKEN``).
-* `InstagramParser` — Reels и посты через Apify Actor ``agentx~video-transcript`` (тело ``video_url``).
+* `InstagramParser` — Reels и посты через Apify Actor ``crawlerbros~instagram-transcript-scraper`` (ввод ``videoUrls``).
 * `ParserRegistry` / `create_parser_registry` — маршрутизация и фабрика.
 """
 
@@ -223,8 +223,10 @@ def _strip_youtube_title_text(text: str) -> str:
 
 # Apify Actor (субтитры YouTube). Официальный список items: GET /v2/actor-runs/{runId}/dataset/items
 APIFY_TRANSCRIPT_ACTOR = "pintostudio~youtube-transcript-scraper"
-# Instagram Reels / посты: метаданные и транскрипт (тело POST: ``video_url``).
-APIFY_INSTAGRAM_VIDEO_ACTOR = "agentx~video-transcript"
+# Instagram: краулер `crawlerbros~instagram-transcript-scraper` (ввод: ``videoUrls``: [url]).
+APIFY_INSTAGRAM_TRANSCRIPT_ACTOR = "crawlerbros~instagram-transcript-scraper"
+# Дольше, чем YouTube — транскрипт Instagram может обрабатываться минутами.
+APIFY_INSTAGRAM_WAIT_FINISH_SEC = 300
 APIFY_WAIT_FINISH_SEC = 120
 
 
@@ -661,29 +663,107 @@ def _instagram_unwrap_record(obj: dict) -> dict:
     return obj
 
 
-def _instagram_first_dataset_record(items_payload: Any) -> Optional[dict]:
-    if isinstance(items_payload, list):
-        for item in items_payload:
-            if isinstance(item, dict):
-                rec = _instagram_unwrap_record(item)
-                if rec:
-                    return rec
-        return None
-    if isinstance(items_payload, dict):
-        rec = _instagram_unwrap_record(items_payload)
-        return rec if rec else None
-    return None
-
-
 def _instagram_fields_from_record(rec: dict) -> tuple[str, str, str]:
-    title = _instagram_safe_str(rec.get("title"))
-    description = _instagram_safe_str(rec.get("description"))
+    title = _instagram_safe_str(
+        rec.get("title")
+        or rec.get("captionTitle")
+        or rec.get("videoTitle")
+        or rec.get("postTitle")
+        or rec.get("headline")
+    )
+    description = _instagram_safe_str(
+        rec.get("description")
+        or rec.get("caption")
+        or rec.get("postDescription")
+        or rec.get("post_text")
+        or rec.get("text")
+    )
     transcript_text = _instagram_transcript_to_text(rec.get("transcript"))
+    if not transcript_text:
+        transcript_text = _instagram_safe_str(
+            rec.get("fullText")
+            or rec.get("transcriptText")
+            or rec.get("subtitleText")
+        )
     return title, description, transcript_text
 
 
+def _instagram_items_look_like_segment_rows(rows: List[dict]) -> bool:
+    """Строки датасета `crawlerbros~instagram-transcript-scraper` (сегменты)."""
+    if not rows:
+        return False
+    d0 = rows[0]
+    return any(
+        k in d0
+        for k in ("fullText", "segmentText", "segmentIndex", "totalSegments", "transcriptionMethod")
+    )
+
+
+def _instagram_fields_from_segment_rows(rows: List[dict]) -> tuple[str, str, str]:
+    """Собрать title / description / транскрипт из нескольких строк сегментов."""
+    ok = [r for r in rows if isinstance(r, dict) and not (str(r.get("errMsg") or "").strip())]
+    if not ok:
+        ok = [r for r in rows if isinstance(r, dict)]
+    if not ok:
+        return "", "", ""
+
+    first = ok[0]
+    caption = _instagram_safe_str(first.get("title"))
+    user = _instagram_safe_str(first.get("userName"))
+    full_name = _instagram_safe_str(first.get("userFullName"))
+    desc_parts = [p for p in (f"@{user}" if user else "", full_name) if p]
+    description = " · ".join(desc_parts)
+    title = caption if caption else (f"@{user}" if user else "")
+
+    full_text = _instagram_safe_str(first.get("fullText"))
+    if not full_text:
+        indexed: List[tuple[tuple[int, int], str]] = []
+        for ord_i, r in enumerate(ok):
+            st = _instagram_safe_str(r.get("segmentText"))
+            if not st:
+                continue
+            idx_raw = r.get("segmentIndex")
+            try:
+                idx_int = int(idx_raw)  # type: ignore[arg-type]
+            except (TypeError, ValueError):
+                idx_int = ord_i
+            indexed.append(((idx_int, ord_i), st))
+        indexed.sort(key=lambda x: x[0])
+        full_text = " ".join(s for _, s in indexed)
+
+    return title, description, full_text
+
+
+def _instagram_extract_from_items(items_payload: Any) -> Optional[tuple[str, str, str]]:
+    """Разобрать тело GET dataset items: один объект, legacy или список сегментов."""
+    if items_payload is None:
+        return None
+    if isinstance(items_payload, dict):
+        rec = _instagram_unwrap_record(items_payload)
+        return _instagram_fields_from_record(rec) if rec else None
+
+    if isinstance(items_payload, list):
+        dicts: List[dict] = []
+        for x in items_payload:
+            if isinstance(x, dict):
+                u = _instagram_unwrap_record(x)
+                if u:
+                    dicts.append(u)
+        if not dicts:
+            return None
+        if _instagram_items_look_like_segment_rows(dicts):
+            return _instagram_fields_from_segment_rows(dicts)
+        for d in dicts:
+            tup = _instagram_fields_from_record(d)
+            if tup[0] or tup[1] or tup[2]:
+                return tup
+        return _instagram_fields_from_record(dicts[0])
+
+    return None
+
+
 class InstagramParser(BaseParser):
-    """Instagram Reels и посты /p/… через Apify ``agentx~video-transcript``."""
+    """Instagram Reels и посты через Apify ``crawlerbros~instagram-transcript-scraper``."""
 
     source_type: str = "instagram"
     MAX_TEXT_LENGTH: int = 50_000
@@ -720,10 +800,15 @@ class InstagramParser(BaseParser):
             return "", "", ""
 
         run_url = (
-            f"https://api.apify.com/v2/acts/{APIFY_INSTAGRAM_VIDEO_ACTOR}/runs"
-            f"?waitForFinish={APIFY_WAIT_FINISH_SEC}"
+            f"https://api.apify.com/v2/acts/{APIFY_INSTAGRAM_TRANSCRIPT_ACTOR}/runs"
+            f"?waitForFinish={APIFY_INSTAGRAM_WAIT_FINISH_SEC}"
         )
-        envelope = _apify_http_json("POST", run_url, token, {"video_url": url})
+        envelope = _apify_http_json(
+            "POST",
+            run_url,
+            token,
+            {"videoUrls": [url]},
+        )
         if not isinstance(envelope, dict):
             logger.error("Ошибка получения Instagram субтитров")
             return "", "", ""
@@ -740,17 +825,17 @@ class InstagramParser(BaseParser):
 
         items_url = f"https://api.apify.com/v2/actor-runs/{run_id}/dataset/items?format=json"
         items_payload = _apify_http_json("GET", items_url, token, None)
-        rec = _instagram_first_dataset_record(items_payload)
-        if not rec:
+        triple = _instagram_extract_from_items(items_payload)
+        if not triple:
             logger.error("Ошибка получения Instagram субтитров")
             return "", "", ""
 
-        title, description, transcript_text = _instagram_fields_from_record(rec)
+        title, description, transcript_text = triple
         if not (title or description or transcript_text):
             logger.error("Ошибка получения Instagram субтитров")
             return "", "", ""
 
-        logger.info("Получены данные через Apify Video Transcript")
+        logger.info("Получены данные через Apify Instagram Transcript Scraper")
         return title, description, transcript_text
 
     def _parse_sync(self, url: str) -> str:
@@ -898,7 +983,33 @@ if __name__ == "__main__":
         assert InstagramParser._extract_shortcode("https://www.instagram.com/p/xY9_/") == "xY9_"
         assert not InstagramParser.can_parse("https://www.youtube.com/watch?v=dQw4w9WgXcQ")
         assert not InstagramParser.can_parse("")
-        print("✅ Instagram can_parse / shortcode")
+        ig_actor_ds = [
+            {
+                "url": "https://www.instagram.com/reel/TEST123/",
+                "code": "TEST123",
+                "title": "Шоколадный торт #рецепт",
+                "userName": "baker_maria",
+                "userFullName": "Мария П.",
+                "fullText": "Смешать яйца и сахар. Добавить муку.",
+                "segmentIndex": 0,
+                "segmentText": "Смешать яйца и сахар.",
+                "errMsg": "",
+            },
+            {
+                "title": "Шоколадный торт #рецепт",
+                "userName": "baker_maria",
+                "userFullName": "Мария П.",
+                "fullText": "Смешать яйца и сахар. Добавить муку.",
+                "segmentIndex": 1,
+                "segmentText": "Добавить муку.",
+                "errMsg": "",
+            },
+        ]
+        ig_t, ig_d, ig_tr = _instagram_extract_from_items(ig_actor_ds)
+        assert "торт" in ig_t
+        assert "baker_maria" in ig_d
+        assert "муку" in ig_tr
+        print("✅ Instagram can_parse / shortcode + мок crawlerbros dataset")
 
         with patch.object(
             InstagramParser,

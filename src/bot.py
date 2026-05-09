@@ -64,8 +64,8 @@ class RemyBot:
         config: Конфигурация приложения.
         loc: Экземпляр :class:`Localization` для текущего языка (`"ru"`).
         parser: Реестр парсеров (веб и будущие — YouTube/Instagram).
-        normalizer: AI-нормализатор сырого текста в структурированный
-            рецепт.
+        normalizer: AI-нормализатор сырого текста или изображения (vision)
+            в структурированный рецепт.
         storage: Реализация :class:`BaseStorage` (по умолчанию Supabase).
         temp_recipes: Временный кэш распарсенных рецептов,
             ключ — Telegram user id.
@@ -141,6 +141,9 @@ class RemyBot:
 
         # --- Callback-кнопки --------------------------------------------
         app.add_handler(CallbackQueryHandler(callbacks.handle_callback))
+
+        # --- Фото (vision) -----------------------------------------------
+        app.add_handler(MessageHandler(filters.PHOTO, messages.handle_photo))
 
         # --- Произвольный текст ------------------------------------------
         app.add_handler(
@@ -297,6 +300,8 @@ if __name__ == "__main__":
     save_kb = save_recipe_keyboard()
     data_values = {btn.callback_data for row in save_kb.inline_keyboard for btn in row}
     assert data_values == {"save", "dont_save"}
+
+    assert callable(messages.handle_photo)
 
     cats_kb = categories_keyboard(
         bot.loc,
