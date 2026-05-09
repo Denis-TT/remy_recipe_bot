@@ -233,6 +233,10 @@ def _apify_http_json(
     timeout_sec: float = 180.0,
 ) -> Any:
     """Синхронный JSON-запрос к Apify API. При ошибке возвращает None (ошибка залогирована)."""
+    token = (token or "").strip()
+    if not token:
+        logger.error("Apify: токен пустой — заголовок Authorization не сформирован")
+        return None
     headers = {
         "Authorization": f"Bearer {token}",
         "Accept": "application/json",
@@ -250,7 +254,16 @@ def _apify_http_json(
             return json.loads(raw)
     except urllib.error.HTTPError as exc:
         err = exc.read().decode("utf-8", errors="replace") if exc.fp else ""
-        logger.error("Apify HTTP %s для %s: %s", exc.code, url, err[:800])
+        if exc.code == 401:
+            logger.error(
+                "Apify HTTP 401 Unauthorized: неверный или пустой API-токен. "
+                "Проверьте APIFY_API_TOKEN в .env (токен из Apify Console → "
+                "Settings → API & Integrations, без лишних пробелов и префикса Bearer). "
+                "Ответ сервера: %s",
+                err[:600],
+            )
+        else:
+            logger.error("Apify HTTP %s для %s: %s", exc.code, url, err[:800])
         return None
     except (urllib.error.URLError, json.JSONDecodeError, TimeoutError, OSError) as exc:
         logger.error("Apify запрос не удался (%s): %s", url, exc)
@@ -328,10 +341,15 @@ class YouTubeParser(BaseParser):
 
     def _fetch_subtitles_apify(self, video_id: str) -> str:
         """Субтитры через Apify POST run + GET dataset items (без HTTP, если токен пуст)."""
-        token = self._apify_api_token
+        token = (self._apify_api_token or "").strip()
         if not token:
             logger.info("APIFY_API_TOKEN не задан — запрос субтитров в Apify не выполняется")
             return ""
+        if len(token) < 8:
+            logger.warning(
+                "APIFY_API_TOKEN слишком короткий (%s симв.) — ожидается полный Apify API token",
+                len(token),
+            )
 
         run_url = (
             f"https://api.apify.com/v2/acts/{APIFY_TRANSCRIPT_ACTOR}/runs"

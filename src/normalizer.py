@@ -91,6 +91,10 @@ Return ONLY a valid JSON object with this EXACT structure:
 
 Each value in "confidence" MUST be exactly one of: high, medium, low — reflecting how well that block is supported by the source text.
 
+STEPS FROM VIDEO OR SPARSE TEXT:
+Если в тексте нет чётких шагов приготовления, попытайся извлечь их из описания. Если это невозможно, верни в steps один объект: {"step_number": 1, "description": "Пошаговая инструкция отсутствует в источнике. Рекомендую посмотреть видео."}
+Never paste the full description or a raw ingredient list into "steps". Each step must be a short actionable cooking instruction, or use exactly that single fallback object.
+
 GROUNDING RULES (mandatory):
 1. Use ONLY information that appears in the provided source text. Do not invent facts.
 2. If a parameter is missing in the text, you may give a realistic estimate ONLY if necessary for valid JSON; set the corresponding confidence key to "low" or "medium" and mention the assumption briefly in "description" or in ingredient/step "notes".
@@ -117,6 +121,26 @@ ALLOWED VALUES:
 #: Дисклеймер при низкой уверенности в ингредиентах/шагах (источник — видео и т. п.).
 _LOW_CONFIDENCE_VIDEO_DISCLAIMER = (
     "⚠️ Низкая точность: данные собраны из видео, возможны ошибки"
+)
+
+#: Единственный шаг, если в источнике нет пошаговой инструкции (согласовано с SYSTEM_PROMPT).
+_STEPS_MISSING_SOURCE_MESSAGE = (
+    "Пошаговая инструкция отсутствует в источнике. Рекомендую посмотреть видео."
+)
+
+#: Глаголы действия в типичных шагах рецепта (рус.).
+_STEPS_ACTION_VERBS_RE = re.compile(
+    r"(?:^|\s)(?:нарез|смеш|вари|жар|запек|добав|полож|снят|подава|разогре|взбив|полей|обжар|"
+    r"туши|отвар|остуд|охлад|порез|очист|натер|вылож|смаза|посып|соли|перч|перемеш|залей|вскипяти|"
+    r"достань|вынь|уклад|формир|готов|убери|мешай|отправ|вымеш|замес|сформ|укрась|украс|раздел|"
+    r"разлей|слей|слить|свари|пожар|отдел|отдели|взбей|залив|заполн|выли|перелож|сбрызг)\w*",
+    re.IGNORECASE,
+)
+
+#: Количество + единица — признак списка ингредиентов внутри «шага».
+_STEPS_QUANTITY_UNITS_RE = re.compile(
+    r"\d+\s*(?:г|кг|мл|л|шт|ст\.?\s*л|ч\.?\s*л)\b",
+    re.IGNORECASE,
 )
 
 
@@ -432,6 +456,7 @@ class RecipeNormalizer:
             logger.warning("⚠️  AI не вернул steps, пытаюсь извлечь из текста...")
             steps = self._extract_steps_from_text(raw_text)
         data["steps"] = [self._normalize_step(s, i) for i, s in enumerate(steps, 1)]
+        self._replace_steps_if_not_actionable(data)
 
         # ---- nutrition ----
         data["nutrition_per_serving"] = self._normalize_nutrition(
@@ -451,6 +476,65 @@ class RecipeNormalizer:
         # dish_type / main_ingredient нормализуются один раз в normalize_recipe()
         self._apply_low_confidence_video_disclaimer(data)
         return data
+
+    @staticmethod
+    def _compact_text_for_compare(text: str) -> str:
+        return re.sub(r"\s+", " ", (text or "").lower().strip())
+
+    @staticmethod
+    def _steps_look_like_ingredients_or_description(
+        steps: List[Dict[str, Any]],
+        description: str,
+    ) -> bool:
+        """Эвристика: шаги — список продуктов или копия описания, а не действия."""
+        parts = [
+            str(s.get("description") or "").strip()
+            for s in steps
+            if isinstance(s, dict)
+        ]
+        combined = " ".join(parts).strip()
+        if len(combined) < 40:
+            return False
+        if _STEPS_MISSING_SOURCE_MESSAGE.lower() in combined.lower():
+            return False
+
+        desc_c = RecipeNormalizer._compact_text_for_compare(description)
+        comb_c = RecipeNormalizer._compact_text_for_compare(combined)
+        if desc_c and comb_c:
+            if comb_c in desc_c or desc_c in comb_c:
+                return True
+            dw = set(desc_c.split())
+            cw = set(comb_c.split())
+            if len(cw) >= 10 and len(dw & cw) / max(len(cw), 1) >= 0.55:
+                return True
+
+        unit_hits = len(_STEPS_QUANTITY_UNITS_RE.findall(combined))
+        verb_hits = len(_STEPS_ACTION_VERBS_RE.findall(combined))
+        if unit_hits >= 4 and verb_hits <= 1:
+            return True
+        if unit_hits >= 3 and verb_hits == 0:
+            return True
+        return False
+
+    def _replace_steps_if_not_actionable(self, data: Dict[str, Any]) -> None:
+        """Заменить подозрительные шаги на дисклеймер (видео / нет чёткой инструкции)."""
+        steps = data.get("steps")
+        if not isinstance(steps, list) or not steps:
+            return
+        desc = str(data.get("description") or "")
+        if not self._steps_look_like_ingredients_or_description(steps, desc):
+            return
+        logger.warning(
+            "⚠️  Шаги похожи на ингредиенты или дублируют описание — подставлен дисклеймер"
+        )
+        data["steps"] = [
+            {"step_number": 1, "description": _STEPS_MISSING_SOURCE_MESSAGE},
+        ]
+        conf = data.get("confidence")
+        if not isinstance(conf, dict):
+            data["confidence"] = {}
+            conf = data["confidence"]
+        conf["steps"] = "low"
 
     @staticmethod
     def _confidence_is_low(value: Any) -> bool:

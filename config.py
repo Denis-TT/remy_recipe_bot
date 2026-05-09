@@ -59,6 +59,17 @@ class Config:
         """Возвращает True, если приложение работает в prod-окружении."""
         return self.environment == "production"
 
+    @staticmethod
+    def _env_optional_secret(env_name: str) -> str:
+        """Считать необязательный секрет: trim, снять внешние кавычки, убрать префикс ``Bearer ``."""
+        v = (os.getenv(env_name, "") or "").strip()
+        if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
+            v = v[1:-1].strip()
+        low = v.lower()
+        if low.startswith("bearer "):
+            v = v[7:].strip()
+        return v
+
     @classmethod
     def from_env(cls) -> "Config":
         """Построить конфиг из переменных окружения с валидацией.
@@ -98,9 +109,9 @@ class Config:
 
         webapp_url = os.getenv("WEBAPP_URL", "").strip()
 
-        youtube_api_key = os.getenv("YOUTUBE_API_KEY", "").strip()
+        youtube_api_key = cls._env_optional_secret("YOUTUBE_API_KEY")
 
-        apify_api_token = os.getenv("APIFY_API_TOKEN", "").strip()
+        apify_api_token = cls._env_optional_secret("APIFY_API_TOKEN")
 
         youtube_cookie_file = os.getenv("YOUTUBE_COOKIE_FILE", "").strip()
 
