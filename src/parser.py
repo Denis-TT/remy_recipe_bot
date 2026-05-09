@@ -3,32 +3,26 @@
 
 * `BaseParser` — абстрактный контракт (`can_parse`, `parse`, `source_type`).
 * `WebParser` — обычные HTTP(S)-страницы с рецептами.
-* `YouTubeParser` — заголовок и описание через YouTube Data API v3; субтитры — `youtube-transcript-api`
-  (опционально через HTTP(S) прокси из конфига с ротацией при 429).
+* `YouTubeParser` — заголовок и описание через YouTube Data API v3; субтитры — Apify Actor
+  ``compass~youtube-transcript-scraper`` (при наличии ``APIFY_API_TOKEN``).
 * `ParserRegistry` / `create_parser_registry` — маршрутизация и фабрика.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
+import urllib.error
+import urllib.request
 from abc import ABC, abstractmethod
-from typing import List, Optional
+from typing import Any, List, Optional
 
 import aiohttp
 from bs4 import BeautifulSoup
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
-from youtube_transcript_api import YouTubeTranscriptApi
-from youtube_transcript_api._errors import (
-    IpBlocked,
-    NoTranscriptFound,
-    RequestBlocked,
-    TranscriptsDisabled,
-    VideoUnavailable,
-    YouTubeRequestFailed,
-)
 
 try:
     from readability import Document as _ReadabilityDocument
@@ -226,62 +220,70 @@ def _strip_youtube_title_text(text: str) -> str:
     return s
 
 
-def _normalize_youtube_proxy_url(proxy_url: str) -> str:
-    """Приводит URL прокси к виду, который ожидает requests (как в документации библиотеки).
-
-    Поддерживается ``http://user:pass@host:port`` и ``https://...``. Если схема не указана,
-    добавляется ``http://`` (резидентские прокси вроде Webshare обычно идут по HTTP).
-    """
-    u = (proxy_url or "").strip()
-    if not u:
-        return u
-    if "://" not in u:
-        u = f"http://{u}"
-    return u
+# Apify Actor (субтитры YouTube). Официальный список items: GET /v2/actor-runs/{runId}/dataset/items
+APIFY_TRANSCRIPT_ACTOR = "compass~youtube-transcript-scraper"
+APIFY_WAIT_FINISH_SEC = 120
 
 
-def _youtube_transcript_api_client(proxy_url: str | None) -> YouTubeTranscriptApi:
-    """Клиент youtube-transcript-api: без прокси или с ``requests.Session.proxies``.
+def _apify_http_json(
+    method: str,
+    url: str,
+    token: str,
+    body: Optional[dict[str, Any]] = None,
+    timeout_sec: float = 180.0,
+) -> Any:
+    """Синхронный JSON-запрос к Apify API. При ошибке возвращает None (ошибка залогирована)."""
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/json",
+    }
+    data: Optional[bytes] = None
+    if body is not None:
+        data = json.dumps(body).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=data, headers=headers, method=method.upper())
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+            if not raw.strip():
+                return None
+            return json.loads(raw)
+    except urllib.error.HTTPError as exc:
+        err = exc.read().decode("utf-8", errors="replace") if exc.fp else ""
+        logger.error("Apify HTTP %s для %s: %s", exc.code, url, err[:800])
+        return None
+    except (urllib.error.URLError, json.JSONDecodeError, TimeoutError, OSError) as exc:
+        logger.error("Apify запрос не удался (%s): %s", url, exc)
+        return None
 
-    Явная настройка Session эквивалентна ``GenericProxyConfig.to_requests_dict()`` из библиотеки
-    и стабильно работает с ``http://user:pass@host:port``. Заголовок ``Connection: close`` снижает
-    залипание на одном IP при ротируемых резидентских прокси.
-    """
-    if not (proxy_url or "").strip():
-        return YouTubeTranscriptApi()
-    from requests import Session
 
-    u = _normalize_youtube_proxy_url(proxy_url)
-    session = Session()
-    session.proxies = {"http": u, "https": u}
-    session.headers.update(
-        {
-            "Accept-Language": "en-US",
-            "Connection": "close",
-        }
-    )
-    return YouTubeTranscriptApi(http_client=session)
-
-
-def _is_subtitles_unavailable(exc: BaseException) -> bool:
-    return isinstance(exc, (TranscriptsDisabled, NoTranscriptFound, VideoUnavailable))
-
-
-def _is_youtube_transcript_rate_limit(exc: BaseException) -> bool:
-    """Ошибки блокировки / 429 — переключение прокси или немедленная ошибка без прокси."""
-    if isinstance(exc, (RequestBlocked, IpBlocked)):
-        return True
-    if isinstance(exc, YouTubeRequestFailed):
-        r = str(getattr(exc, "reason", exc))
-        low = r.lower()
-        return "429" in r or "too many requests" in low
-    s = f"{type(exc).__name__}: {exc}"
-    low = s.lower()
-    return "429" in s or "too many requests" in low
+def _join_apify_dataset_texts(items: Any) -> str:
+    """Склеить текст субтитров из элементов dataset (поле ``text`` или близкие ключи)."""
+    if not isinstance(items, list):
+        return ""
+    parts: List[str] = []
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        chunk = (
+            it.get("text")
+            or it.get("transcript")
+            or it.get("subtitleText")
+            or it.get("chunk")
+        )
+        if chunk:
+            parts.append(str(chunk).replace("\n", " ").strip())
+    out = " ".join(parts)
+    return re.sub(r"\s+", " ", out).strip()
 
 
 class YouTubeParser(BaseParser):
-    """YouTube: Data API v3 — заголовок и описание; субтитры — transcript-api (опционально через прокси)."""
+    """YouTube: Data API v3 — заголовок и описание; субтитры — Apify (опционально).
+
+    Биллинг Apify (ориентиры для планирования; актуальные цены — на apify.com/pricing и у Actor):
+    бесплатный tier даёт около $5 кредита в месяц; один запуск YouTube Transcript Scraper
+    обычно порядка $0.02 за видео; на месячный кредит ориентировочно выходит 250+ видео.
+    """
 
     source_type: str = "youtube"
     MAX_TEXT_LENGTH: int = 50_000
@@ -289,10 +291,10 @@ class YouTubeParser(BaseParser):
     def __init__(
         self,
         youtube_api_key: str = "",
-        proxy_urls: list[str] | None = None,
+        apify_api_token: str = "",
     ) -> None:
         self.youtube_api_key = (youtube_api_key or "").strip()
-        self._proxy_urls: list[str] = list(proxy_urls) if proxy_urls else []
+        self._apify_api_token = (apify_api_token or "").strip()
 
     @staticmethod
     def _extract_youtube_video_id(url: str) -> str:
@@ -324,70 +326,41 @@ class YouTubeParser(BaseParser):
             raise ValueError(f"YouTubeParser не поддерживает URL: {url!r}")
         return await asyncio.to_thread(self._parse_sync, url)
 
-    def _fetch_subtitles_via_api(self, video_id: str, proxy_url: str | None) -> str:
-        api = _youtube_transcript_api_client(proxy_url)
-        ft = api.fetch(video_id, languages=("ru", "en"))
-        parts: List[str] = []
-        for snippet in ft.snippets:
-            t = (snippet.text or "").replace("\n", " ").strip()
-            if t:
-                parts.append(t)
-        text = " ".join(parts)
-        return re.sub(r"\s+", " ", text).strip()
-
-    def _load_subtitles_no_proxy(self, video_id: str) -> str:
-        try:
-            return self._fetch_subtitles_via_api(video_id, None)
-        except Exception as exc:  # noqa: BLE001
-            if _is_subtitles_unavailable(exc):
-                return ""
-            if _is_youtube_transcript_rate_limit(exc):
-                raise RuntimeError(
-                    "YouTube временно ограничил доступ. Попробуйте позже."
-                ) from exc
-            logger.warning("Субтитры без прокси не получены: %s", exc)
+    def _fetch_subtitles_apify(self, video_id: str) -> str:
+        """Субтитры через Apify POST run + GET dataset items (без HTTP, если токен пуст)."""
+        token = self._apify_api_token
+        if not token:
+            logger.info("APIFY_API_TOKEN не задан — запрос субтитров в Apify не выполняется")
             return ""
 
-    def _load_subtitles_with_proxies(self, video_id: str, proxies: list[str]) -> str:
-        for idx, proxy in enumerate(proxies):
-            try:
-                text = self._fetch_subtitles_via_api(video_id, proxy)
-                if text:
-                    logger.info(
-                        "Получены субтитры через прокси %s (%s символов)",
-                        proxy,
-                        len(text),
-                    )
-                return text
-            except Exception as exc:  # noqa: BLE001
-                if _is_subtitles_unavailable(exc):
-                    return ""
-                if _is_youtube_transcript_rate_limit(exc):
-                    if idx < len(proxies) - 1:
-                        logger.warning(
-                            "Прокси %s недоступен (429), переключаю на следующий",
-                            proxy,
-                        )
-                        continue
-                    logger.error("Все прокси исчерпаны, субтитры не получены")
-                    raise RuntimeError(
-                        "YouTube временно ограничил доступ. Попробуйте позже."
-                    ) from exc
-                if idx < len(proxies) - 1:
-                    logger.warning(
-                        "Прокси %s: субтитры не получены (%s), пробую следующий",
-                        proxy,
-                        type(exc).__name__,
-                    )
-                    continue
-                logger.warning("Субтитры не получены после перебора прокси: %s", exc)
-                return ""
-        return ""
+        run_url = (
+            f"https://api.apify.com/v2/acts/{APIFY_TRANSCRIPT_ACTOR}/runs"
+            f"?waitForFinish={APIFY_WAIT_FINISH_SEC}"
+        )
+        envelope = _apify_http_json("POST", run_url, token, {"videoId": video_id})
+        if not isinstance(envelope, dict):
+            return ""
 
-    def _load_subtitles_best_effort(self, video_id: str) -> str:
-        if not self._proxy_urls:
-            return self._load_subtitles_no_proxy(video_id)
-        return self._load_subtitles_with_proxies(video_id, self._proxy_urls)
+        run = envelope.get("data")
+        if not isinstance(run, dict):
+            return ""
+        run_id = run.get("id")
+        if not run_id:
+            logger.warning("Apify: в ответе run нет id")
+            return ""
+
+        items_url = f"https://api.apify.com/v2/actor-runs/{run_id}/dataset/items?format=json"
+        items_payload = _apify_http_json("GET", items_url, token, None)
+        if isinstance(items_payload, list):
+            texts = _join_apify_dataset_texts(items_payload)
+        else:
+            texts = ""
+
+        if texts:
+            logger.info("Получены субтитры через Apify (%s символов)", len(texts))
+        else:
+            logger.info("Apify не вернул текста субтитров для видео %s", video_id)
+        return texts
 
     def _parse_sync(self, url: str) -> str:
         video_id = self._extract_youtube_video_id(url)
@@ -440,7 +413,7 @@ class YouTubeParser(BaseParser):
             title_preview,
         )
 
-        sub_text = self._load_subtitles_best_effort(video_id)
+        sub_text = self._fetch_subtitles_apify(video_id)
 
         parts_out: List[str] = []
         if clean_title:
@@ -460,7 +433,6 @@ class YouTubeParser(BaseParser):
         if len(text) > self.MAX_TEXT_LENGTH:
             text = text[: self.MAX_TEXT_LENGTH]
         return text
-
 
 # --------------------------------------------------------------------------- #
 # Реестр
@@ -499,15 +471,14 @@ class ParserRegistry:
 
 
 def create_parser_registry(cfg: Optional[object] = None) -> ParserRegistry:
-    """Реестр с YouTube (до Web). Передаются ``youtube_api_key`` и список прокси для субтитров."""
+    """Реестр с YouTube (до Web). Передаются ``youtube_api_key`` и ``apify_api_token``."""
     if cfg is None:
         from config import config as _cfg
         cfg = _cfg
     api_key = str(getattr(cfg, "youtube_api_key", "") or "")
-    raw_proxies = str(getattr(cfg, "youtube_proxy_url", "") or "")
-    proxy_list = [p.strip() for p in raw_proxies.split(",") if p.strip()]
+    apify_tok = str(getattr(cfg, "apify_api_token", "") or "")
     registry = ParserRegistry()
-    registry.register(YouTubeParser(youtube_api_key=api_key, proxy_urls=proxy_list))
+    registry.register(YouTubeParser(youtube_api_key=api_key, apify_api_token=apify_tok))
     registry.register(WebParser())
     return registry
 
@@ -517,6 +488,7 @@ def create_parser_registry(cfg: Optional[object] = None) -> ParserRegistry:
 # --------------------------------------------------------------------------- #
 
 if __name__ == "__main__":
+    import os
     import sys
     from unittest.mock import MagicMock, patch
 
@@ -533,12 +505,7 @@ if __name__ == "__main__":
         assert not YouTubeParser.can_parse("https://eda.ru/recept/123")
         assert not YouTubeParser.can_parse("")
         assert YouTubeParser._extract_youtube_video_id("https://www.youtube.com/watch?v=short") == ""
-        assert _normalize_youtube_proxy_url("http://user:pass@host:8080") == "http://user:pass@host:8080"
-        assert _normalize_youtube_proxy_url("user:pass@residential.host:80") == "http://user:pass@residential.host:80"
-        assert _normalize_youtube_proxy_url("  https://u:p@proxy.example:443  ") == "https://u:p@proxy.example:443"
-        _cli = _youtube_transcript_api_client("http://user:pass@127.0.0.1:8888")
-        assert _cli is not None
-        print("✅ YouTube can_parse / extract / прокси-URL")
+        print("✅ YouTube can_parse / extract")
 
         no_key = YouTubeParser(youtube_api_key="")
         try:
@@ -546,15 +513,15 @@ if __name__ == "__main__":
         except RuntimeError as exc:
             if "YOUTUBE_API_KEY" not in str(exc):
                 raise AssertionError(f"Ожидалось сообщение про ключ: {exc}") from exc
-            print("✅ Без API-ключа: понятный RuntimeError")
+            print("✅ Без YouTube API-ключа: понятный RuntimeError")
         else:
             raise AssertionError("Ожидался RuntimeError без YOUTUBE_API_KEY")
 
         this_mod = sys.modules[__name__]
         with patch.object(this_mod, "build") as mock_build, patch.object(
             YouTubeParser,
-            "_fetch_subtitles_via_api",
-            return_value="Mock subtitle line",
+            "_fetch_subtitles_apify",
+            return_value="Mock Apify subtitle text",
         ):
             mock_yt = MagicMock()
             mock_build.return_value = mock_yt
@@ -571,60 +538,49 @@ if __name__ == "__main__":
                     }
                 ]
             }
-            parsed = await YouTubeParser(youtube_api_key="test-key").parse(
-                "https://www.youtube.com/watch?v=abcdefghijk"
-            )
+            parsed = await YouTubeParser(
+                youtube_api_key="test-key",
+                apify_api_token="dummy-apify",
+            ).parse("https://www.youtube.com/watch?v=abcdefghijk")
             assert "Mock Recipe" in parsed
             assert "Ingredients" in parsed
-            assert "Mock subtitle" in parsed
-            print("✅ parse() с моком Data API и субтитрами")
+            assert "Apify subtitle" in parsed
+            print("✅ parse() с моком Data API и Apify")
 
-        from youtube_transcript_api._errors import IpBlocked
-
-        with patch.object(this_mod, "build") as mock_build, patch.object(
-            YouTubeParser,
-            "_fetch_subtitles_via_api",
-            side_effect=[
-                IpBlocked("abcdefghijk"),
-                "Text after proxy rotation",
-            ],
-        ):
+        with patch("urllib.request.urlopen") as urlopen_mock:
             mock_yt = MagicMock()
-            mock_build.return_value = mock_yt
+            mock_build = MagicMock(return_value=mock_yt)
             mock_req = MagicMock()
             mock_yt.videos.return_value.list.return_value = mock_req
             mock_req.execute.return_value = {
                 "items": [
                     {
-                        "snippet": {"title": "T", "description": "D"},
+                        "snippet": {"title": "T2", "description": "D2"},
                         "contentDetails": {},
                     }
                 ]
             }
-            rotated = await YouTubeParser(
-                youtube_api_key="test-key",
-                proxy_urls=["http://proxy-a.example", "http://proxy-b.example"],
-            ).parse("https://www.youtube.com/watch?v=abcdefghijk")
-            assert "after proxy rotation" in rotated
-            print("✅ ротация прокси при блокировке (мок)")
-
-        import os
+            with patch.object(this_mod, "build", mock_build):
+                out_nop = await YouTubeParser(youtube_api_key="k", apify_api_token="").parse(
+                    "https://www.youtube.com/watch?v=abcdefghijk"
+                )
+            urlopen_mock.assert_not_called()
+            assert "T2" in out_nop
+            print("✅ без APIFY_API_TOKEN нет HTTP-запросов к Apify")
 
         _live_key = os.getenv("YOUTUBE_API_KEY", "").strip()
-        _live_proxy = os.getenv("YOUTUBE_PROXY_URL", "").strip()
-        if _live_key:
+        _live_apify = os.getenv("APIFY_API_TOKEN", "").strip()
+        if _live_key and _live_apify:
             try:
-                live_proxies = [p.strip() for p in _live_proxy.split(",") if p.strip()]
                 live_text = await YouTubeParser(
                     youtube_api_key=_live_key,
-                    proxy_urls=live_proxies,
+                    apify_api_token=_live_apify,
                 ).parse("https://www.youtube.com/watch?v=dQw4w9WgXcQ")
-                print(
-                    f"✅ YouTube live (API"
-                    f"{' + прокси' if live_proxies else ''}): {len(live_text)} символов"
-                )
+                print(f"✅ YouTube live (Data API + Apify): {len(live_text)} символов")
             except Exception as exc:  # noqa: BLE001
                 print(f"⚠️  YouTube live: {exc}")
+        elif _live_key:
+            print("⚠️  Только YOUTUBE_API_KEY — пропуск live Apify (нужен APIFY_API_TOKEN)")
 
         registry = create_parser_registry()
         yt_p = registry.get_parser("https://www.youtube.com/watch?v=dQw4w9WgXcQ")

@@ -44,10 +44,8 @@ class Config:
     environment: str = "production"
     # YouTube Data API v3: заголовок и описание (для YouTube URL без ключа parse() не выполнить).
     youtube_api_key: str = ""
-    # Субтитры: HTTP(S) прокси для youtube-transcript-api. Несколько URL через запятую — ротация при 429.
-    # Формат как в requests: http://user:pass@host:port (для резидентских провайдеров вроде Webshare чаще http).
-    # Спецсимволы в user/password — процент-кодирование (RFC 3986). Пример Webshare: ...@p.webshare.io:80/
-    youtube_proxy_url: str = ""
+    # Apify API token: субтитры YouTube через Actor ``compass~youtube-transcript-scraper``.
+    apify_api_token: str = ""
     # Устарело: ранее yt-dlp; поле оставлено для совместимости существующих .env.
     youtube_cookie_file: str = ""
 
@@ -102,7 +100,7 @@ class Config:
 
         youtube_api_key = os.getenv("YOUTUBE_API_KEY", "").strip()
 
-        youtube_proxy_url = os.getenv("YOUTUBE_PROXY_URL", "").strip()
+        apify_api_token = os.getenv("APIFY_API_TOKEN", "").strip()
 
         youtube_cookie_file = os.getenv("YOUTUBE_COOKIE_FILE", "").strip()
 
@@ -124,7 +122,7 @@ class Config:
             webapp_url=webapp_url,
             environment=environment,
             youtube_api_key=youtube_api_key,
-            youtube_proxy_url=youtube_proxy_url,
+            apify_api_token=apify_api_token,
             youtube_cookie_file=youtube_cookie_file,
         )
 

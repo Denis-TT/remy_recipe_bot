@@ -6,9 +6,8 @@ beautifulsoup4==4.12.3
 lxml==5.3.0
 readability-lxml==0.8.1
 
-# YouTube Data API v3 + субтитры (youtube-transcript-api; на PyPI последняя стабильная 1.2.x — 1.2.4).
+# YouTube Data API v3; субтитры — через Apify (HTTP, см. src/parser.py).
 google-api-python-client==2.149.0
-youtube-transcript-api==1.2.4
 
 # Telegram bot framework (block 6: bot)
 python-telegram-bot==22.7

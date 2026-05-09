@@ -14,9 +14,11 @@ GitHub Models API (совместимый с OpenAI Chat Completions) и
 * булевы флаги диет (`is_vegetarian`, `is_vegan`, ...).
 
 После получения JSON от AI выполняется пост-обработка:
-пустые/подозрительные значения заменяются безопасными, а
-строковые поля (в т.ч. `meal_type`, `dish_type`, `main_ingredient`) приводятся
-к латинице в `Localization.normalize_recipe` после `_postprocess`.
+пустые/подозрительные значения заменяются безопасными; при низкой
+уверенности AI в блоках ``ingredients`` / ``steps`` (поле ``confidence``)
+в начало ``description`` добавляется дисклеймер о точности.
+Строковые поля (в т.ч. ``meal_type``, ``dish_type``, ``main_ingredient``)
+приводятся к латинице в ``Localization.normalize_recipe`` после ``_postprocess``.
 
 Использование:
 
@@ -47,7 +49,7 @@ logger = logging.getLogger(__name__)
 # --------------------------------------------------------------------------- #
 
 SYSTEM_PROMPT = """\
-You are a professional chef and nutritionist. Extract recipe from the text.
+You are a professional chef and nutritionist. Extract a recipe STRICTLY from the user-provided source text.
 
 Return ONLY a valid JSON object with this EXACT structure:
 {
@@ -73,11 +75,35 @@ Return ONLY a valid JSON object with this EXACT structure:
     "tips": ["Совет 1", "Совет 2"],
     "storage": "How to store",
     "tags": ["паста", "италия", "быстро"],
+    "confidence": {
+        "title": "high",
+        "description": "high",
+        "ingredients": "high",
+        "steps": "high",
+        "times": "medium",
+        "nutrition": "medium"
+    },
     "is_vegetarian": false,
     "is_vegan": false,
     "is_gluten_free": false,
     "is_lactose_free": false
 }
+
+Each value in "confidence" MUST be exactly one of: high, medium, low — reflecting how well that block is supported by the source text.
+
+GROUNDING RULES (mandatory):
+1. Use ONLY information that appears in the provided source text. Do not invent facts.
+2. If a parameter is missing in the text, you may give a realistic estimate ONLY if necessary for valid JSON; set the corresponding confidence key to "low" or "medium" and mention the assumption briefly in "description" or in ingredient/step "notes".
+3. Do NOT invent ingredients, cooking steps, or times that are not implied by the source. If the text does not list ingredients or steps, return minimal empty lists and set confidence.ingredients / confidence.steps to "low".
+4. Do NOT fabricate nutrition numbers: if the source does not allow a grounded estimate, use zeros and set confidence.nutrition to "low".
+5. If the source is contradictory, choose the most probable interpretation, set confidence for affected blocks to "medium" or "low", and briefly note the ambiguity in "description".
+6. ALL text fields (title, description, ingredients, steps, tips, storage) MUST be in Russian.
+7. meal_type MUST be one of the allowed values below.
+8. dish_type and main_ingredient MUST be lower-case English keys from the lists below; infer only from what the source supports.
+9. difficulty MUST be one of: easy, medium, hard.
+10. cuisine MUST be in lower case English from the allowed list.
+11. prep_time + cook_time MUST equal total_time when all three are grounded; if times are uncertain, estimate conservatively and set confidence.times to "low" or "medium".
+12. Return ONLY valid JSON, no markdown, no additional text.
 
 ALLOWED VALUES:
 - cuisine: italian, russian, japanese, french, chinese, georgian, korean, indian, thai, mexican, mediterranean, american, european, asian, other
@@ -85,19 +111,13 @@ ALLOWED VALUES:
 - dish_type (Latin only): soup, side, salad, appetizer, main, dessert, drink, baking, sauce, preserve
 - main_ingredient (Latin only): chicken, beef, pork, fish, seafood, vegetables, mushrooms, eggs, grains, pasta, cheese, fruits, nuts, dough, other
 - difficulty: easy, medium, hard
-
-CRITICAL RULES:
-1. ALL text fields (title, description, ingredients, steps, tips, storage) MUST be in Russian.
-2. meal_type MUST be one of the allowed values.
-3. dish_type and main_ingredient MUST be lower-case English keys from the lists above; infer from recipe.
-4. difficulty MUST be one of: easy, medium, hard.
-5. cuisine MUST be in lower case English from the allowed list.
-6. Calculate REALISTIC nutrition based on ingredients and servings.
-7. prep_time + cook_time MUST equal total_time.
-8. DO NOT use placeholder values like "Untitled" or 0 for required fields.
-9. If information is missing, make an EDUCATED GUESS based on similar recipes.
-10. Return ONLY valid JSON, no markdown, no additional text.
 """
+
+
+#: Дисклеймер при низкой уверенности в ингредиентах/шагах (источник — видео и т. п.).
+_LOW_CONFIDENCE_VIDEO_DISCLAIMER = (
+    "⚠️ Низкая точность: данные собраны из видео, возможны ошибки"
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -258,7 +278,7 @@ class RecipeNormalizer:
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": user_text},
             ],
-            "temperature": 0.3,
+            "temperature": 0.2,
             "max_tokens": 2500,
             "response_format": {"type": "json_object"},
         }
@@ -429,7 +449,28 @@ class RecipeNormalizer:
             data[flag] = bool(data.get(flag, False))
 
         # dish_type / main_ingredient нормализуются один раз в normalize_recipe()
+        self._apply_low_confidence_video_disclaimer(data)
         return data
+
+    @staticmethod
+    def _confidence_is_low(value: Any) -> bool:
+        return str(value or "").strip().lower() == "low"
+
+    def _apply_low_confidence_video_disclaimer(self, data: Dict[str, Any]) -> None:
+        """Если AI пометил ингредиенты или шаги как low — добавить дисклеймер в описание."""
+        conf = data.get("confidence")
+        if not isinstance(conf, dict):
+            return
+        if not (
+            self._confidence_is_low(conf.get("ingredients"))
+            or self._confidence_is_low(conf.get("steps"))
+        ):
+            return
+        desc = str(data.get("description") or "").strip()
+        prefix = _LOW_CONFIDENCE_VIDEO_DISCLAIMER
+        if desc.startswith(prefix):
+            return
+        data["description"] = f"{prefix}\n\n{desc}" if desc else prefix
 
     # ------------------------------------------------------------------ #
     # Эвристики-фолбэки
