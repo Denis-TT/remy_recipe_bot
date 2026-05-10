@@ -6,8 +6,8 @@
 * Нажатия на кнопки Reply-клавиатуры («📋 Меню», «📚 Сохраненные рецепты»,
   «ℹ️ Помощь») — открывают соответствующий экран;
 * Фото — анализ через GitHub Models (vision), нормализация, карточка с кнопками;
-* URL (http/https) — запускает цепочку «парсинг → нормализация →
-  отображение с кнопками Сохранить/Не сохранять»;
+* URL (http/https) — цепочка «парсинг → нормализация → одно сообщение с кнопками»
+  (при наличии картинки — фото с HTML-подписью до 1024 символов и те же кнопки);
 * Любой другой текст — короткая подсказка отправить ссылку.
 
 Дополнительно: :func:`format_recipe` и псевдоним :func:`format_recipe_for_telegram`
@@ -78,13 +78,16 @@ _NOT_A_URL_HINT: str = (
 # Лимит подписи к фото (Telegram).
 _TG_PHOTO_CAPTION_LIMIT: int = 1024
 
+# Целевая длина основного текста подписи до «…», чтобы с запасом влезли закрывающие теги.
+_TG_PHOTO_CAPTION_BODY_MAX: int = 1000
+
 # Уменьшение превью перед sendPhoto (стабильнее на Railway).
 _TG_PHOTO_MAX_SIDE: int = 512
 _TG_PHOTO_JPEG_QUALITY: int = 85
 
 
 # --------------------------------------------------------------------------- #
-# Показ рецепта (фото + полный текст)
+# Показ рецепта (с фото — одно сообщение; без фото — правка статуса)
 # --------------------------------------------------------------------------- #
 
 
@@ -115,14 +118,56 @@ def _jpeg_bytes_for_telegram_photo(image_path: str) -> bytes:
 
 
 # --------------------------------------------------------------------------- #
-# Показ рецепта (фото + полный текст) — реализация
+# Показ рецепта (фото + подпись) — реализация
 # --------------------------------------------------------------------------- #
 
 
-def _plain_caption_from_html(formatted_html: str, max_len: int = _TG_PHOTO_CAPTION_LIMIT) -> str:
-    plain = re.sub(r"<[^>]+>", "", formatted_html)
-    plain = re.sub(r"\s+", " ", plain).strip()
-    return plain[:max_len]
+_HTML_TAG_TOKEN_RE = re.compile(r"<(/?)\s*([a-zA-Z][a-zA-Z0-9]*)\b[^>]*>", re.IGNORECASE)
+
+# Теги без тела в Telegram HTML (и обычные void) — не кладём в стек.
+_HTML_VOID_TAGS = frozenset({"br", "tg-emoji"})
+
+
+def _close_open_html_tags(fragment: str) -> str:
+    """Дозакрыть незакрытые открывающие теги в конце HTML-фрагмента."""
+    stack: List[str] = []
+    for m in _HTML_TAG_TOKEN_RE.finditer(fragment):
+        is_close = m.group(1) == "/"
+        name = m.group(2).lower()
+        if not is_close and name in _HTML_VOID_TAGS:
+            continue
+        if is_close:
+            while stack and stack[-1] != name:
+                stack.pop()
+            if stack and stack[-1] == name:
+                stack.pop()
+        else:
+            stack.append(name)
+    if not stack:
+        return fragment
+    return fragment + "".join(f"</{t}>" for t in reversed(stack))
+
+
+def _html_caption_for_photo(formatted_html: str) -> str:
+    """Подпись к фото: HTML, не длиннее лимита Telegram; при обрезке — «…» и целые теги."""
+    if len(formatted_html) <= _TG_PHOTO_CAPTION_LIMIT:
+        return formatted_html
+
+    ell = "…"
+    reserve = len(ell) + 48
+    budget = max(100, min(_TG_PHOTO_CAPTION_BODY_MAX, _TG_PHOTO_CAPTION_LIMIT - reserve))
+    cut = formatted_html[: budget]
+    sp = cut.rfind(" ")
+    if sp > budget // 2:
+        cut = cut[:sp]
+    cut = re.sub(r"<[^>]*$", "", cut)
+    cut = _close_open_html_tags(cut).strip()
+    out = cut + ell
+    if len(out) > _TG_PHOTO_CAPTION_LIMIT:
+        plain = re.sub(r"<[^>]+>", "", formatted_html)
+        plain = plain[: _TG_PHOTO_CAPTION_LIMIT - len(ell)].rsplit(" ", 1)[0].strip()
+        return _html_escape(plain) + ell
+    return out
 
 
 async def _present_recipe_with_optional_photo(
@@ -132,16 +177,19 @@ async def _present_recipe_with_optional_photo(
     bot: "RemyBot",
 ) -> None:
     formatted = format_recipe(recipe, bot)
+    kb = save_recipe_keyboard()
     img_path = recipe.get("image_url") or recipe.get("image_path")
     if img_path and os.path.isfile(str(img_path)):
-        cap = _plain_caption_from_html(formatted)
+        caption_html = _html_caption_for_photo(formatted)
         try:
             blob = _jpeg_bytes_for_telegram_photo(str(img_path))
             bio = BytesIO(blob)
             bio.seek(0)
             await message.reply_photo(
                 photo=InputFile(bio, filename="recipe.jpg"),
-                caption=cap or " ",
+                caption=caption_html or " ",
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb,
                 read_timeout=15.0,
                 write_timeout=60.0,
             )
@@ -155,21 +203,21 @@ async def _present_recipe_with_optional_photo(
                 "Не удалось отправить фото рецепта: %s. Отправляю карточку текстом.",
                 exc,
             )
-        try:
-            await message.reply_text(
-                formatted,
-                reply_markup=save_recipe_keyboard(),
-                parse_mode=ParseMode.HTML,
-                disable_web_page_preview=True,
-            )
-        except BadRequest as exc:
-            logger.warning("⚠️  reply_text HTML: %s — без разметки", exc)
-            plain = re.sub(r"<[^>]+>", "", formatted)
-            await message.reply_text(
-                plain[:_TG_MESSAGE_LIMIT],
-                reply_markup=save_recipe_keyboard(),
-                disable_web_page_preview=True,
-            )
+            try:
+                await message.reply_text(
+                    formatted,
+                    reply_markup=kb,
+                    parse_mode=ParseMode.HTML,
+                    disable_web_page_preview=True,
+                )
+            except BadRequest as rb_exc:
+                logger.warning("⚠️  reply_text HTML (фолбэк): %s — без разметки", rb_exc)
+                plain = re.sub(r"<[^>]+>", "", formatted)
+                await message.reply_text(
+                    plain[:_TG_MESSAGE_LIMIT],
+                    reply_markup=kb,
+                    disable_web_page_preview=True,
+                )
         try:
             await status.delete()
         except BadRequest:
@@ -179,7 +227,7 @@ async def _present_recipe_with_optional_photo(
     try:
         await status.edit_text(
             formatted,
-            reply_markup=save_recipe_keyboard(),
+            reply_markup=kb,
             parse_mode=ParseMode.HTML,
             disable_web_page_preview=True,
         )
@@ -188,7 +236,7 @@ async def _present_recipe_with_optional_photo(
         plain = re.sub(r"<[^>]+>", "", formatted)
         await status.edit_text(
             plain[:_TG_MESSAGE_LIMIT],
-            reply_markup=save_recipe_keyboard(),
+            reply_markup=kb,
             disable_web_page_preview=True,
         )
 
@@ -665,8 +713,19 @@ if __name__ == "__main__":
 
         asyncio.run(_run_present())
         _mock_msg.reply_photo.assert_called_once()
-        _mock_msg.reply_text.assert_called_once()
+        _kwargs = _mock_msg.reply_photo.call_args.kwargs
+        assert _kwargs.get("parse_mode") == ParseMode.HTML
+        assert _kwargs.get("reply_markup") is not None
+        assert len(_kwargs.get("caption") or "") <= _TG_PHOTO_CAPTION_LIMIT
+        _mock_msg.reply_text.assert_not_called()
     finally:
         os.unlink(_tmp_img.name)
+
+    _huge = dict(_demo)
+    _huge["steps"] = [{"step_number": 1, "description": "Шаг " + "длинный " * 800}]
+    _cap_src = format_recipe(_huge, _bot)
+    _cap = _html_caption_for_photo(_cap_src)
+    assert len(_cap) <= _TG_PHOTO_CAPTION_LIMIT
+    assert "…" in _cap or len(_cap_src) <= _TG_PHOTO_CAPTION_LIMIT
 
     print("✅ format_recipe + _present_recipe_with_optional_photo (мок)")
