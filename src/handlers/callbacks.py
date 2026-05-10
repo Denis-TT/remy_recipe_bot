@@ -159,7 +159,10 @@ async def _callback_save(query: CallbackQuery, bot: "RemyBot", user_id: int) -> 
         )
         return
 
-    recipe = entry["recipe"]
+    recipe = dict(entry["recipe"])
+    if (recipe.get("image_url") in (None, "")) and recipe.get("image_path"):
+        recipe["image_url"] = str(recipe["image_path"]).strip()
+    recipe.pop("image_path", None)
     try:
         saved = await bot.storage.save_recipe(user_id, recipe)
     except Exception as exc:  # noqa: BLE001

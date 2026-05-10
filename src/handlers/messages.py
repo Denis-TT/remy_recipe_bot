@@ -24,7 +24,7 @@ import time
 from html import escape as _html_escape
 from typing import TYPE_CHECKING, Any, List, Mapping, Optional
 
-from telegram import InputFile, Message, Update
+from telegram import Message, Update
 from telegram.constants import ParseMode
 from telegram.error import BadRequest
 from telegram.ext import ContextTypes
@@ -96,15 +96,14 @@ async def _present_recipe_with_optional_photo(
     bot: "RemyBot",
 ) -> None:
     formatted = format_recipe(recipe, bot)
-    img_path = recipe.get("image_path")
+    img_path = recipe.get("image_url") or recipe.get("image_path")
     if img_path and os.path.isfile(str(img_path)):
         cap = _plain_caption_from_html(formatted)
         try:
-            with open(str(img_path), "rb") as img_fh:
-                await message.reply_photo(
-                    photo=InputFile(img_fh, filename="recipe.jpg"),
-                    caption=cap or " ",
-                )
+            with open(str(img_path), "rb") as photo:
+                await message.reply_photo(photo=photo, caption=cap or " ")
+            t = recipe.get("title")
+            logger.info("Фото отправлено для рецепта %s", t if isinstance(t, str) and t.strip() else "без названия")
         except (OSError, BadRequest) as exc:
             logger.warning("⚠️  Не удалось отправить изображение рецепта: %s", exc)
         try:
@@ -269,15 +268,14 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     result["source_url"] = ""
-    if not result.get("image_path") and (bot.config.hf_api_key or "").strip():
+    if not result.get("image_url") and not result.get("image_path"):
         from ..parser import _generate_and_save_image
 
         gen_path = await _generate_and_save_image(
             str(result.get("title") or "блюдо")[:400],
-            hf_api_key=bot.config.hf_api_key,
         )
         if gen_path:
-            result["image_path"] = gen_path
+            result["image_url"] = gen_path
 
     bot.temp_recipes[user.id] = {"recipe": result, "timestamp": time.time()}
     bot.cleanup_expired_temp_recipes()
@@ -320,11 +318,11 @@ async def _handle_url(
 
     recipe_data: dict[str, Any] = {
         "raw_text": raw_text,
-        "image_path": parsed.image_path,
+        "image_url": parsed.image_url,
     }
     src_parser = bot.parser.get_parser(url)
     if src_parser is not None:
-        await src_parser.generate_image_if_needed(recipe_data, hf_api_key=bot.config.hf_api_key)
+        await src_parser.generate_image_if_needed(recipe_data)
 
     # 2) Нормализация
     await _safe_edit(status, "🤖 Анализирую рецепт...")
@@ -332,7 +330,7 @@ async def _handle_url(
     try:
         recipe = await bot.normalizer.normalize(
             recipe_data["raw_text"],
-            image_path=recipe_data.get("image_path"),
+            image_url=recipe_data.get("image_url"),
         )
     except Exception as exc:  # noqa: BLE001
         logger.error("❌ Ошибка нормализации: %s", exc)
@@ -611,7 +609,7 @@ if __name__ == "__main__":
         _mock_status = MagicMock()
         _mock_status.delete = AsyncMock()
         _demo_img = dict(_demo)
-        _demo_img["image_path"] = _tmp_img.name
+        _demo_img["image_url"] = _tmp_img.name
 
         async def _run_present() -> None:
             await _present_recipe_with_optional_photo(_mock_msg, _mock_status, _demo_img, _bot)

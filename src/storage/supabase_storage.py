@@ -45,6 +45,7 @@ _ALLOWED_COLUMNS = frozenset({
     "storage",
     "is_vegetarian", "is_vegan", "is_gluten_free", "is_lactose_free",
     "source_url",
+    "image_url",
 })
 
 #: Таймаут одного HTTP-запроса (секунды). Supabase обычно отвечает
@@ -457,6 +458,8 @@ if __name__ == "__main__":
                 "⚠️  SUPABASE_URL/SUPABASE_KEY не заданы (или это плейсхолдеры) — "
                 "пропускаю интеграционный тест"
             )
+            assert "image_url" in _ALLOWED_COLUMNS
+            print("✅ Колонка image_url разрешена в save_recipe (_ALLOWED_COLUMNS)")
             return
 
         storage = SupabaseStorage(url, key)
@@ -476,11 +479,17 @@ if __name__ == "__main__":
             "nutrition_per_serving": {
                 "calories": 100, "protein": 5, "fat": 3, "carbs": 15,
             },
+            "image_url": "https://example.com/recipe-hero.jpg",
         }
 
         saved = await storage.save_recipe(12345, test_recipe)
         print(f"✅ Сохранён рецепт: {saved.get('id')}")
         print(f"✅ meal_type в БД: {saved.get('meal_type')}")  # ожидаем 'lunch'
+        img_stored = saved.get("image_url")
+        if img_stored != test_recipe["image_url"]:
+            print(f"⚠️  image_url в ответе сохранения: ожидалось {test_recipe['image_url']!r}, получено {img_stored!r}")
+        else:
+            print(f"✅ image_url сохранён: {img_stored}")
 
         fetched = await storage.get_recipe(saved["id"])
         assert fetched is not None and fetched["id"] == saved["id"]

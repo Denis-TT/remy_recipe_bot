@@ -75,7 +75,7 @@ Return ONLY a valid JSON object with this EXACT structure:
     "tips": ["Совет 1", "Совет 2"],
     "storage": "How to store",
     "tags": ["паста", "италия", "быстро"],
-    "image_path": "",
+    "image_url": "",
     "confidence": {
         "title": "high",
         "description": "high",
@@ -109,7 +109,7 @@ GROUNDING RULES (mandatory):
 10. cuisine MUST be in lower case English from the allowed list.
 11. prep_time + cook_time MUST equal total_time when all three are grounded; if times are uncertain, estimate conservatively and set confidence.times to "low" or "medium".
 12. Return ONLY valid JSON, no markdown, no additional text.
-13. The field \"image_path\" is an optional string: absolute filesystem path to a hero image already stored on the server. If the user message includes a line starting with `[SERVER image_path — copy verbatim...]`, set \"image_path\" in your JSON to that exact path string. Otherwise use an empty string \"\". Never invent paths.
+13. The field \"image_url\" is an optional string: public URL or absolute filesystem path to a hero image already stored on the server. If the user message includes a line starting with `[SERVER image_url — copy verbatim...]`, set \"image_url\" in your JSON to that exact string. Otherwise use an empty string \"\". Never invent URLs or paths.
 
 ALLOWED VALUES:
 - cuisine: italian, russian, japanese, french, chinese, georgian, korean, indian, thai, mexican, mediterranean, american, european, asian, other
@@ -230,13 +230,13 @@ class RecipeNormalizer:
     # Основной публичный метод
     # ------------------------------------------------------------------ #
 
-    async def normalize(self, raw_text: str, *, image_path: Optional[str] = None) -> Dict[str, Any]:
+    async def normalize(self, raw_text: str, *, image_url: Optional[str] = None) -> Dict[str, Any]:
         """Превратить сырой текст рецепта в структурированный `dict`.
 
         Args:
             raw_text: Текст рецепта, обычно полученный от парсера
                 (`WebParser.parse`).
-            image_path: Необязательный локальный путь к изображению — попадает в JSON.
+            image_url: Необязательный URL или локальный путь к изображению — попадает в JSON.
 
         Returns:
             Словарь с полями рецепта, гарантированно содержащий
@@ -264,7 +264,7 @@ class RecipeNormalizer:
         last_parse_error: Optional[Exception] = None
 
         for attempt in range(1, MAX_ATTEMPTS + 1):
-            raw_content = await self._call_api(raw_text, image_path=image_path)
+            raw_content = await self._call_api(raw_text, image_url=image_url)
 
             try:
                 data = self._parse_json(raw_content)
@@ -285,8 +285,8 @@ class RecipeNormalizer:
 
         data = self._postprocess(data, raw_text)
         data = Localization.normalize_recipe(data)
-        if image_path:
-            data["image_path"] = str(image_path).strip()
+        if image_url and str(image_url).strip():
+            data["image_url"] = str(image_url).strip()
 
         logger.info(
             "✅ Рецепт нормализован: «%s», meal_type=%s, %d ингредиентов, %d шагов",
@@ -384,7 +384,7 @@ class RecipeNormalizer:
     # HTTP-слой
     # ------------------------------------------------------------------ #
 
-    async def _call_api(self, user_text: str, image_path: Optional[str] = None) -> str:
+    async def _call_api(self, user_text: str, image_url: Optional[str] = None) -> str:
         """Выполнить POST-запрос к Chat Completions и вернуть `content`.
 
         Возвращает *строку* — содержимое `choices[0].message.content`,
@@ -397,10 +397,10 @@ class RecipeNormalizer:
                 ≥ 400.
         """
         user_content = user_text
-        if image_path and str(image_path).strip():
+        if image_url and str(image_url).strip():
             user_content = (
-                f"{user_text}\n\n[SERVER image_path — copy verbatim to JSON field \"image_path\"]: "
-                f"{json.dumps(str(image_path).strip(), ensure_ascii=True)}"
+                f"{user_text}\n\n[SERVER image_url — copy verbatim to JSON field \"image_url\"]: "
+                f"{json.dumps(str(image_url).strip(), ensure_ascii=True)}"
             )
         payload = {
             "model": self.model,
@@ -638,6 +638,11 @@ class RecipeNormalizer:
 
         # ---- остальное ----
         data["storage"] = str(data.get("storage") or "").strip()
+        img = str(data.get("image_url") or "").strip()
+        if not img:
+            img = str(data.get("image_path") or "").strip()
+        data["image_url"] = img
+        data.pop("image_path", None)
         for flag in ("is_vegetarian", "is_vegan", "is_gluten_free", "is_lactose_free"):
             data[flag] = bool(data.get(flag, False))
 

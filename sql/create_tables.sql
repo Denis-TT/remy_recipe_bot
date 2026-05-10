@@ -58,9 +58,14 @@ CREATE TABLE IF NOT EXISTS recipes (
 
     -- Метаданные источника
     source_url             TEXT        DEFAULT '',
+    image_url              TEXT        DEFAULT '',
     created_at             TIMESTAMPTZ DEFAULT NOW(),
     updated_at             TIMESTAMPTZ DEFAULT NOW()
 );
+
+
+-- Существующие проекты без колонки — безопасное добавление.
+ALTER TABLE recipes ADD COLUMN IF NOT EXISTS image_url TEXT DEFAULT '';
 
 
 -- --------------------------------------------------------------------
