@@ -22,9 +22,10 @@ import os
 import re
 import time
 from html import escape as _html_escape
+from io import BytesIO
 from typing import TYPE_CHECKING, Any, List, Mapping, Optional
 
-from telegram import Message, Update
+from telegram import InputFile, Message, Update
 from telegram.constants import ParseMode
 from telegram.error import BadRequest
 from telegram.ext import ContextTypes
@@ -77,9 +78,44 @@ _NOT_A_URL_HINT: str = (
 # Лимит подписи к фото (Telegram).
 _TG_PHOTO_CAPTION_LIMIT: int = 1024
 
+# Уменьшение превью перед sendPhoto (стабильнее на Railway).
+_TG_PHOTO_MAX_SIDE: int = 512
+_TG_PHOTO_JPEG_QUALITY: int = 85
+
 
 # --------------------------------------------------------------------------- #
 # Показ рецепта (фото + полный текст)
+# --------------------------------------------------------------------------- #
+
+
+def _jpeg_bytes_for_telegram_photo(image_path: str) -> bytes:
+    """Вписать изображение в квадрат до ``_TG_PHOTO_MAX_SIDE`` и вернуть JPEG в памяти."""
+    try:
+        from PIL import Image
+    except ImportError:
+        with open(image_path, "rb") as fh:
+            return fh.read()
+    try:
+        with Image.open(image_path) as im:
+            im = im.convert("RGB")
+            im.thumbnail(
+                (_TG_PHOTO_MAX_SIDE, _TG_PHOTO_MAX_SIDE),
+                Image.Resampling.LANCZOS,
+            )
+            buf = BytesIO()
+            im.save(buf, format="JPEG", quality=_TG_PHOTO_JPEG_QUALITY, optimize=True)
+            return buf.getvalue()
+    except (OSError, ValueError) as exc:
+        logger.warning(
+            "⚠️  Не удалось сжать изображение для Telegram, читаю файл как есть: %s",
+            exc,
+        )
+        with open(image_path, "rb") as fh:
+            return fh.read()
+
+
+# --------------------------------------------------------------------------- #
+# Показ рецепта (фото + полный текст) — реализация
 # --------------------------------------------------------------------------- #
 
 
@@ -100,12 +136,25 @@ async def _present_recipe_with_optional_photo(
     if img_path and os.path.isfile(str(img_path)):
         cap = _plain_caption_from_html(formatted)
         try:
-            with open(str(img_path), "rb") as photo:
-                await message.reply_photo(photo=photo, caption=cap or " ")
+            blob = _jpeg_bytes_for_telegram_photo(str(img_path))
+            bio = BytesIO(blob)
+            bio.seek(0)
+            await message.reply_photo(
+                photo=InputFile(bio, filename="recipe.jpg"),
+                caption=cap or " ",
+                read_timeout=15.0,
+                write_timeout=60.0,
+            )
             t = recipe.get("title")
-            logger.info("Фото отправлено для рецепта %s", t if isinstance(t, str) and t.strip() else "без названия")
-        except (OSError, BadRequest) as exc:
-            logger.warning("⚠️  Не удалось отправить изображение рецепта: %s", exc)
+            logger.info(
+                "Фото отправлено для рецепта %s",
+                t if isinstance(t, str) and t.strip() else "без названия",
+            )
+        except Exception as exc:  # noqa: BLE001 — таймауты httpx/Telegram и I/O
+            logger.warning(
+                "Не удалось отправить фото рецепта: %s. Отправляю карточку текстом.",
+                exc,
+            )
         try:
             await message.reply_text(
                 formatted,

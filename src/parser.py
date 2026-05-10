@@ -531,9 +531,21 @@ def _apify_extract_subtitles_payload(
         # Обёртка { "data": ... }
         if isinstance(payload, dict) and "data" in payload:
             inner = payload.get("data")
+            if inner is None:
+                logger.info("Apify: субтитры не найдены (пустой data)")
+                return "", 0, "empty_data"
+            if isinstance(inner, list) and len(inner) == 0:
+                logger.info("Apify: субтитры не найдены (пустой data)")
+                return "", 0, "empty_data"
+            if isinstance(inner, dict) and len(inner) == 0:
+                logger.info("Apify: субтитры не найдены (пустой data)")
+                return "", 0, "empty_data"
             text, n, inner_tag = _apify_extract_subtitles_payload(inner, _depth + 1)
             if n > 0 and text:
                 return text, n, f"data→{inner_tag}"
+            # Пустые субтитры внутри data (например [{ "data": [] }]) — не «формат не распознан»
+            if n == 0 and inner_tag in ("empty_data", "list[empty_data]", "empty_list"):
+                return "", 0, f"data→{inner_tag}"
 
         # Объект с transcript
         if isinstance(payload, dict):
@@ -555,29 +567,53 @@ def _apify_extract_subtitles_payload(
                 except (TypeError, ValueError, AttributeError):
                     continue
 
-        # Список
+        # Список (иногда Apify отдаёт [[{...}]] — сначала снимаем лишнюю обёртку)
         if isinstance(payload, list):
+            pl: Any = payload
+            while len(pl) == 1 and isinstance(pl[0], list):
+                pl = pl[0]
+            payload = pl
             if not payload:
                 return "", 0, "empty_list"
 
             parts: List[str] = []
             list_only_strings = True
             used_list_item_data = False
+            saw_empty_data = False
             for item in payload:
                 try:
                     if isinstance(item, str):
                         if item.strip():
                             parts.append(item.strip())
                         continue
+                    if isinstance(item, list):
+                        sub_t, sub_n, sub_tag = _apify_extract_subtitles_payload(item, _depth + 1)
+                        list_only_strings = False
+                        if sub_n > 0 and sub_t:
+                            parts.append(sub_t)
+                        elif sub_tag in ("empty_data", "list[empty_data]", "empty_list"):
+                            saw_empty_data = True
+                        continue
                     list_only_strings = False
                     if not isinstance(item, dict):
                         continue
-                    if "data" in item and item.get("data") is not None:
-                        nested = _apify_raw_segment_list(item["data"], _depth + 1)
-                        if nested:
-                            used_list_item_data = True
-                            parts.extend(nested)
+                    if "data" in item:
+                        data_val = item.get("data")
+                        if data_val is None:
+                            saw_empty_data = True
                             continue
+                        if isinstance(data_val, list) and len(data_val) == 0:
+                            saw_empty_data = True
+                            continue
+                        if isinstance(data_val, dict) and len(data_val) == 0:
+                            saw_empty_data = True
+                            continue
+                        if data_val is not None:
+                            nested = _apify_raw_segment_list(data_val, _depth + 1)
+                            if nested:
+                                used_list_item_data = True
+                                parts.extend(nested)
+                                continue
                     tr = item.get("transcript")
                     if isinstance(tr, list) and tr:
                         parts.extend(_apify_segments_from_transcript_list(tr))
@@ -594,6 +630,10 @@ def _apify_extract_subtitles_payload(
                                 break
                 except (TypeError, ValueError, AttributeError):
                     continue
+
+            if not parts and saw_empty_data:
+                logger.info("Apify: субтитры не найдены (пустой data)")
+                return "", 0, "list[empty_data]"
 
             if parts:
                 if list_only_strings:
@@ -765,6 +805,10 @@ class YouTubeParser(BaseParser):
 
         clean_title = _strip_youtube_title_text(raw_title)
         clean_desc = _strip_youtube_description_text(raw_desc) if raw_desc else ""
+        title_for_text = clean_title or (raw_title or "").strip()
+        desc_for_text = clean_desc or (
+            (raw_desc or "").replace("\r\n", "\n").strip() if raw_desc else ""
+        )
 
         title_preview = raw_title[:50] + ("..." if len(raw_title) > 50 else "")
         logger.info(
@@ -775,15 +819,17 @@ class YouTubeParser(BaseParser):
         sub_text = self._fetch_subtitles_apify(video_id)
 
         parts_out: List[str] = []
-        if clean_title:
-            parts_out.append(clean_title)
-        if clean_desc:
-            parts_out.append(clean_desc)
+        if title_for_text:
+            parts_out.append(title_for_text)
+        if desc_for_text:
+            parts_out.append(desc_for_text)
         core = "\n\n".join(parts_out)
         if sub_text:
             text = f"{core}\n\n{sub_text}" if core else sub_text
         else:
             text = core
+            if core.strip():
+                logger.info("Данные YouTube Data API переданы без субтитров")
 
         if not text.strip():
             logger.error("❌ Не удалось извлечь текст из видео (пустой заголовок и описание)")
@@ -1139,6 +1185,14 @@ if __name__ == "__main__":
             ]
         )
         assert n_ld == 2 and "первый" in t_ld and "второй" in t_ld
+        t_ed, n_ed = _apify_dataset_payload_to_subtitle_text([{"data": []}])
+        assert n_ed == 0 and t_ed == ""
+        t_ed2, n_ed2 = _apify_dataset_payload_to_subtitle_text({"data": []})
+        assert n_ed2 == 0 and t_ed2 == ""
+        t_ed3, n_ed3 = _apify_dataset_payload_to_subtitle_text([[{"data": []}]])
+        assert n_ed3 == 0 and t_ed3 == ""
+        t_ed4, n_ed4 = _apify_dataset_payload_to_subtitle_text({"data": {}})
+        assert n_ed4 == 0 and t_ed4 == ""
         t_junk, n_junk = _apify_dataset_payload_to_subtitle_text({"foo": 1})
         assert n_junk == 0 and t_junk == ""
         print("✅ YouTube can_parse / extract + Apify форматы субтитров")
@@ -1298,6 +1352,34 @@ if __name__ == "__main__":
             assert "Ingredients" in parsed.text
             assert "Apify subtitle" in parsed.text
             print("✅ parse() с моком Data API и Apify")
+
+        with patch.object(this_mod, "build") as mock_build_ns, patch.object(
+            YouTubeParser,
+            "_fetch_subtitles_apify",
+            return_value="",
+        ):
+            mock_yt_ns = MagicMock()
+            mock_build_ns.return_value = mock_yt_ns
+            mock_req_ns = MagicMock()
+            mock_yt_ns.videos.return_value.list.return_value = mock_req_ns
+            mock_req_ns.execute.return_value = {
+                "items": [
+                    {
+                        "snippet": {
+                            "title": "Video Sans Subs",
+                            "description": "Ингредиенты: мука 200 г, вода",
+                        },
+                        "contentDetails": {"duration": "PT1M"},
+                    }
+                ]
+            }
+            parsed_ns = await YouTubeParser(
+                youtube_api_key="test-key",
+                apify_api_token="dummy-apify",
+            ).parse("https://www.youtube.com/watch?v=abcdefghijk")
+            assert "Video Sans Subs" in parsed_ns.text
+            assert "Ингредиенты" in parsed_ns.text
+        print("✅ YouTube: данные Data API без субтитров Apify")
 
         with patch("urllib.request.urlopen") as urlopen_mock:
             mock_yt = MagicMock()

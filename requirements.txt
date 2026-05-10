@@ -11,3 +11,6 @@ google-api-python-client==2.149.0
 
 # Telegram bot framework (block 6: bot)
 python-telegram-bot==22.7
+
+# Превью рецептов: уменьшение JPEG перед sendPhoto (Railway / нестабильная сеть)
+Pillow==11.0.0
