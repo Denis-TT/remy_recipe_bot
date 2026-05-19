@@ -49,8 +49,8 @@ logger = logging.getLogger(__name__)
 
 IMAGES_DIR: str = str(_remy_config.images_dir or "/images").rstrip("/") or "/images"
 
-HF_IMAGE_MODEL_ID = "prompthero/openjourney-v4"
-HF_INFERENCE_URL = f"https://api-inference.huggingface.co/models/{HF_IMAGE_MODEL_ID}"
+HF_IMAGE_MODEL_ID = "black-forest-labs/FLUX.1-dev"
+HF_INFERENCE_URL = "https://api-inference.huggingface.co/models/black-forest-labs/FLUX.1-dev"
 
 
 def ensure_images_dir() -> None:
@@ -92,17 +92,18 @@ class ParseResult:
 
 
 async def _generate_and_save_image(title: str, *, hf_api_key: str) -> Optional[str]:
-    """Сгенерировать изображение через Hugging Face Inference API и сохранить под ``IMAGES_DIR``."""
+    """Сгенерировать изображение через Hugging Face (FLUX.1-dev) и сохранить под ``IMAGES_DIR``."""
     key = (hf_api_key or "").strip()
     if not key:
         logger.info("Генерация изображений отключена (нет HF_API_KEY)")
         return None
 
     ensure_images_dir()
-    base = (title or "").strip() or "delicious meal"
+    dish_title = (title or "").strip() or "delicious meal"
     prompt = (
-        f"Professional food photography of {base}, restaurant plating, "
-        "natural lighting, high detail, appetizing"
+        f"Professional food photography of {dish_title}, soft natural lighting, "
+        "shallow depth of field, restaurant quality presentation, high detail, "
+        "delicious and appetizing, shot from above on a beautiful plate"
     )
     headers = {"Authorization": f"Bearer {key}"}
     payload = {"inputs": prompt}
@@ -117,7 +118,7 @@ async def _generate_and_save_image(title: str, *, hf_api_key: str) -> Optional[s
                         ct = (resp.headers.get("Content-Type") or "").lower()
                         if "application/json" in ct:
                             logger.warning(
-                                "Попытка %d: HF вернул JSON вместо изображения: %s",
+                                "Попытка %d: FLUX.1-dev вернул JSON вместо изображения: %s",
                                 attempt + 1,
                                 body[:300].decode("utf-8", errors="replace"),
                             )
@@ -126,24 +127,29 @@ async def _generate_and_save_image(title: str, *, hf_api_key: str) -> Optional[s
                             path = os.path.join(IMAGES_DIR, f"{uid}.jpg")
                             with open(path, "wb") as f:
                                 f.write(body)
-                            logger.info("Изображение сгенерировано через Hugging Face: %s", path)
+                            logger.info("Изображение сгенерировано через FLUX.1-dev: %s", path)
                             return path
+                    elif resp.status == 404:
+                        logger.warning(
+                            "FLUX.1-dev не активирован. Примите условия на "
+                            "https://huggingface.co/black-forest-labs/FLUX.1-dev"
+                        )
                     elif resp.status >= 400:
                         logger.warning(
-                            "Попытка %d: Hugging Face HTTP %s: %s",
+                            "Попытка %d: FLUX.1-dev HTTP %s: %s",
                             attempt + 1,
                             resp.status,
                             body[:300].decode("utf-8", errors="replace"),
                         )
                     else:
-                        logger.warning("Попытка %d: пустой ответ Hugging Face", attempt + 1)
+                        logger.warning("Попытка %d: пустой ответ FLUX.1-dev", attempt + 1)
         except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
             logger.warning("Попытка %d генерации изображения не удалась: %s", attempt + 1, exc)
         except Exception as exc:  # noqa: BLE001
             logger.warning("Попытка %d генерации изображения не удалась: %s", attempt + 1, exc)
         await asyncio.sleep(2)
 
-    logger.error("Не удалось сгенерировать изображение для %s после 3 попыток", base[:200])
+    logger.error("Не удалось сгенерировать изображение для %s после 3 попыток", dish_title[:200])
     return None
 
 
@@ -1284,6 +1290,8 @@ if __name__ == "__main__":
         print("✅ WebParser og:image скачивание (мок)")
 
         assert await mod._generate_and_save_image("тест", hf_api_key="") is None
+        assert mod.HF_IMAGE_MODEL_ID == "black-forest-labs/FLUX.1-dev"
+        assert "black-forest-labs/FLUX.1-dev" in mod.HF_INFERENCE_URL
 
         td_pol = tempfile.mkdtemp()
         with patch.object(mod, "IMAGES_DIR", td_pol):
@@ -1303,7 +1311,24 @@ if __name__ == "__main__":
                 hf_path = await mod._generate_and_save_image("Борщ тест", hf_api_key="hf_test")
             assert hf_path is not None and hf_path.startswith(td_pol) and hf_path.endswith(".jpg")
             assert os.path.isfile(hf_path)
-        print("✅ Hugging Face _generate_and_save_image (мок aiohttp)")
+            call_url = mock_sess.post.call_args[0][0]
+            assert "black-forest-labs/FLUX.1-dev" in call_url
+
+            mock_resp_404 = AsyncMock()
+            mock_resp_404.status = 404
+            mock_resp_404.read = AsyncMock(return_value=b'{"error":"not found"}')
+            post_ctx_404 = MagicMock()
+            post_ctx_404.__aenter__ = AsyncMock(return_value=mock_resp_404)
+            post_ctx_404.__aexit__ = AsyncMock(return_value=None)
+            mock_sess_404 = MagicMock()
+            mock_sess_404.post = MagicMock(return_value=post_ctx_404)
+            sess_ctx_404 = MagicMock()
+            sess_ctx_404.__aenter__ = AsyncMock(return_value=mock_sess_404)
+            sess_ctx_404.__aexit__ = AsyncMock(return_value=None)
+            with patch.object(aiohttp, "ClientSession", return_value=sess_ctx_404):
+                path_404 = await mod._generate_and_save_image("Суп", hf_api_key="hf_test")
+            assert path_404 is None
+        print("✅ FLUX.1-dev _generate_and_save_image (мок aiohttp)")
 
         rd: dict = {"raw_text": "Суп дня", "image_url": None}
         await WebParser().generate_image_if_needed(rd, hf_api_key="hf")

@@ -48,7 +48,7 @@ class Config:
     apify_api_token: str = ""
     # Каталог для сохранения изображений рецептов (том на Railway: /images).
     images_dir: str = "/images"
-    # Hugging Face Inference API — генерация изображений блюд (YouTube / Instagram / фото).
+    # Hugging Face Inference API (FLUX.1-dev) — генерация изображений блюд.
     hf_api_key: str = ""
     # Устарело: ранее yt-dlp; поле оставлено для совместимости существующих .env.
     youtube_cookie_file: str = ""
