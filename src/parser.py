@@ -22,8 +22,11 @@ import urllib.request
 import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Any, List, Optional
-from urllib.parse import quote, urljoin
+from typing import TYPE_CHECKING, Any, List, Optional
+from urllib.parse import urljoin
+
+if TYPE_CHECKING:
+    from .storage.supabase_storage import SupabaseStorage
 
 import aiohttp
 from bs4 import BeautifulSoup
@@ -45,6 +48,9 @@ logger = logging.getLogger(__name__)
 # --------------------------------------------------------------------------- #
 
 IMAGES_DIR: str = str(_remy_config.images_dir or "/images").rstrip("/") or "/images"
+
+HF_IMAGE_MODEL_ID = "prompthero/openjourney-v4"
+HF_INFERENCE_URL = f"https://api-inference.huggingface.co/models/{HF_IMAGE_MODEL_ID}"
 
 
 def ensure_images_dir() -> None:
@@ -85,48 +91,83 @@ class ParseResult:
     image_url: Optional[str] = None
 
 
-async def _generate_and_save_image(title: str) -> Optional[str]:
-    """Сгенерировать изображение через Pollinations.ai и сохранить под ``IMAGES_DIR``."""
+async def _generate_and_save_image(title: str, *, hf_api_key: str) -> Optional[str]:
+    """Сгенерировать изображение через Hugging Face Inference API и сохранить под ``IMAGES_DIR``."""
+    key = (hf_api_key or "").strip()
+    if not key:
+        logger.info("Генерация изображений отключена (нет HF_API_KEY)")
+        return None
+
     ensure_images_dir()
     base = (title or "").strip() or "delicious meal"
     prompt = (
         f"Professional food photography of {base}, restaurant plating, "
         "natural lighting, high detail, appetizing"
     )
-    encoded = quote(prompt, safe="")
-    url = f"https://image.pollinations.ai/prompt/{encoded}?width=512&height=512&nologo=true"
+    headers = {"Authorization": f"Bearer {key}"}
+    payload = {"inputs": prompt}
     timeout = aiohttp.ClientTimeout(total=30)
+
     for attempt in range(3):
         try:
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.get(url, allow_redirects=True) as resp:
-                    if resp.status == 200:
-                        image_bytes = await resp.read()
-                        if not image_bytes:
+            async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+                async with session.post(HF_INFERENCE_URL, json=payload) as resp:
+                    body = await resp.read()
+                    if resp.status == 200 and body:
+                        ct = (resp.headers.get("Content-Type") or "").lower()
+                        if "application/json" in ct:
                             logger.warning(
-                                "Попытка %d: пустое тело ответа Pollinations.ai",
+                                "Попытка %d: HF вернул JSON вместо изображения: %s",
                                 attempt + 1,
+                                body[:300].decode("utf-8", errors="replace"),
                             )
-                            await asyncio.sleep(2)
-                            continue
-                        uid = uuid.uuid4().hex
-                        path = os.path.join(IMAGES_DIR, f"{uid}.jpg")
-                        with open(path, "wb") as f:
-                            f.write(image_bytes)
-                        logger.info("Изображение сгенерировано через Pollinations.ai: %s", path)
-                        return path
-                    logger.warning(
-                        "Попытка %d: Pollinations.ai HTTP %s",
-                        attempt + 1,
-                        resp.status,
-                    )
+                        else:
+                            uid = uuid.uuid4().hex
+                            path = os.path.join(IMAGES_DIR, f"{uid}.jpg")
+                            with open(path, "wb") as f:
+                                f.write(body)
+                            logger.info("Изображение сгенерировано через Hugging Face: %s", path)
+                            return path
+                    elif resp.status >= 400:
+                        logger.warning(
+                            "Попытка %d: Hugging Face HTTP %s: %s",
+                            attempt + 1,
+                            resp.status,
+                            body[:300].decode("utf-8", errors="replace"),
+                        )
+                    else:
+                        logger.warning("Попытка %d: пустой ответ Hugging Face", attempt + 1)
         except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
             logger.warning("Попытка %d генерации изображения не удалась: %s", attempt + 1, exc)
         except Exception as exc:  # noqa: BLE001
             logger.warning("Попытка %d генерации изображения не удалась: %s", attempt + 1, exc)
         await asyncio.sleep(2)
+
     logger.error("Не удалось сгенерировать изображение для %s после 3 попыток", base[:200])
     return None
+
+
+async def attach_recipe_image(
+    recipe_data: dict[str, Any],
+    local_path: str,
+    storage: Optional["SupabaseStorage"] = None,
+) -> None:
+    """Привязать локальный файл к рецепту; при возможности загрузить в Supabase Storage."""
+    path = (local_path or "").strip()
+    if not path or not os.path.isfile(path):
+        return
+
+    recipe_data["image_path"] = path
+
+    if storage is None:
+        recipe_data["image_url"] = path
+        return
+
+    public_url = await storage.upload_image(path)
+    if public_url:
+        recipe_data["image_url"] = public_url
+    else:
+        recipe_data["image_url"] = path
 
 
 # --------------------------------------------------------------------------- #
@@ -153,17 +194,23 @@ class BaseParser(ABC):
     async def parse(self, url: str) -> ParseResult:
         """Извлечь сырой текст рецепта (и при наличии — путь или URL изображения)."""
 
-    async def generate_image_if_needed(self, recipe_data: dict[str, Any]) -> dict[str, Any]:
-        """Если источнику нужна AI-картинка и пути ещё нет — сгенерировать и записать ``image_url``."""
+    async def generate_image_if_needed(
+        self,
+        recipe_data: dict[str, Any],
+        *,
+        hf_api_key: str = "",
+        storage: Optional["SupabaseStorage"] = None,
+    ) -> dict[str, Any]:
+        """Если источнику нужна AI-картинка — сгенерировать, загрузить в Storage, записать ``image_url``."""
         if not self.generate_image_default:
             return recipe_data
-        if recipe_data.get("image_url"):
+        if recipe_data.get("image_url") or recipe_data.get("image_path"):
             return recipe_data
         raw = (recipe_data.get("raw_text") or "").strip()
         prompt = raw.split("\n", 1)[0][:400] if raw else "Вкусное домашнее блюдо, еда на тарелке, фуд-фото"
-        path = await _generate_and_save_image(prompt)
+        path = await _generate_and_save_image(prompt, hf_api_key=hf_api_key)
         if path:
-            recipe_data["image_url"] = path
+            await attach_recipe_image(recipe_data, path, storage)
         return recipe_data
 
 
@@ -1236,34 +1283,39 @@ if __name__ == "__main__":
             assert wpo.last_image_url == "https://static/x.jpg"
         print("✅ WebParser og:image скачивание (мок)")
 
+        assert await mod._generate_and_save_image("тест", hf_api_key="") is None
+
         td_pol = tempfile.mkdtemp()
         with patch.object(mod, "IMAGES_DIR", td_pol):
             mock_resp = AsyncMock()
             mock_resp.status = 200
             mock_resp.read = AsyncMock(return_value=b"\xff\xd8\xff\xd9")
-            get_ctx = MagicMock()
-            get_ctx.__aenter__ = AsyncMock(return_value=mock_resp)
-            get_ctx.__aexit__ = AsyncMock(return_value=None)
+            mock_resp.headers = {"Content-Type": "image/jpeg"}
+            post_ctx = MagicMock()
+            post_ctx.__aenter__ = AsyncMock(return_value=mock_resp)
+            post_ctx.__aexit__ = AsyncMock(return_value=None)
             mock_sess = MagicMock()
-            mock_sess.get = MagicMock(return_value=get_ctx)
+            mock_sess.post = MagicMock(return_value=post_ctx)
             sess_ctx = MagicMock()
             sess_ctx.__aenter__ = AsyncMock(return_value=mock_sess)
             sess_ctx.__aexit__ = AsyncMock(return_value=None)
             with patch.object(aiohttp, "ClientSession", return_value=sess_ctx):
-                pol_path = await mod._generate_and_save_image("Борщ тест")
-            assert pol_path is not None and pol_path.startswith(td_pol) and pol_path.endswith(".jpg")
-            assert os.path.isfile(pol_path)
-        print("✅ Pollinations.ai _generate_and_save_image (мок aiohttp)")
+                hf_path = await mod._generate_and_save_image("Борщ тест", hf_api_key="hf_test")
+            assert hf_path is not None and hf_path.startswith(td_pol) and hf_path.endswith(".jpg")
+            assert os.path.isfile(hf_path)
+        print("✅ Hugging Face _generate_and_save_image (мок aiohttp)")
 
         rd: dict = {"raw_text": "Суп дня", "image_url": None}
-        await WebParser().generate_image_if_needed(rd)
+        await WebParser().generate_image_if_needed(rd, hf_api_key="hf")
         assert rd.get("image_url") is None
         with patch.object(mod, "_generate_and_save_image", new_callable=AsyncMock) as gm:
-            gm.return_value = os.path.join(td_pol, "mock.jpg")
+            mock_path = os.path.join(td_pol, "mock.jpg")
+            gm.return_value = mock_path
             yt_dummy = YouTubeParser(youtube_api_key="x", apify_api_token="")
             rd2 = {"raw_text": "Плов узбекский", "image_url": None}
-            await yt_dummy.generate_image_if_needed(rd2)
-            assert rd2.get("image_url") == os.path.join(td_pol, "mock.jpg")
+            await yt_dummy.generate_image_if_needed(rd2, hf_api_key="hf")
+            assert rd2.get("image_path") == mock_path
+            assert rd2.get("image_url") == mock_path
         print("✅ generate_image_if_needed / флаги парсеров")
 
         assert InstagramParser.can_parse("https://www.instagram.com/reel/ABCxyz12/")

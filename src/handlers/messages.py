@@ -148,6 +148,17 @@ def _close_open_html_tags(fragment: str) -> str:
     return fragment + "".join(f"</{t}>" for t in reversed(stack))
 
 
+def _local_recipe_image_path(recipe: Mapping[str, Any]) -> Optional[str]:
+    """Локальный путь к файлу для ``reply_photo`` (не HTTP URL из Storage)."""
+    for key in ("image_path", "image_url"):
+        p = str(recipe.get(key) or "").strip()
+        if not p or p.startswith(("http://", "https://")):
+            continue
+        if os.path.isfile(p):
+            return p
+    return None
+
+
 def _html_caption_for_photo(formatted_html: str) -> str:
     """Подпись к фото: HTML, не длиннее лимита Telegram; при обрезке — «…» и целые теги."""
     if len(formatted_html) <= _TG_PHOTO_CAPTION_LIMIT:
@@ -178,8 +189,8 @@ async def _present_recipe_with_optional_photo(
 ) -> None:
     formatted = format_recipe(recipe, bot)
     kb = save_recipe_keyboard()
-    img_path = recipe.get("image_url") or recipe.get("image_path")
-    if img_path and os.path.isfile(str(img_path)):
+    img_path = _local_recipe_image_path(recipe)
+    if img_path:
         caption_html = _html_caption_for_photo(formatted)
         try:
             blob = _jpeg_bytes_for_telegram_photo(str(img_path))
@@ -366,13 +377,14 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     result["source_url"] = ""
     if not result.get("image_url") and not result.get("image_path"):
-        from ..parser import _generate_and_save_image
+        from ..parser import _generate_and_save_image, attach_recipe_image
 
         gen_path = await _generate_and_save_image(
             str(result.get("title") or "блюдо")[:400],
+            hf_api_key=bot.config.hf_api_key,
         )
         if gen_path:
-            result["image_url"] = gen_path
+            await attach_recipe_image(result, gen_path, bot.storage)
 
     bot.temp_recipes[user.id] = {"recipe": result, "timestamp": time.time()}
     bot.cleanup_expired_temp_recipes()
@@ -413,13 +425,21 @@ async def _handle_url(
         await _safe_edit(status, "❌ Со страницы не удалось извлечь текст")
         return
 
-    recipe_data: dict[str, Any] = {
-        "raw_text": raw_text,
-        "image_url": parsed.image_url,
-    }
+    from ..parser import attach_recipe_image
+
+    recipe_data: dict[str, Any] = {"raw_text": raw_text}
+    if parsed.image_url and os.path.isfile(str(parsed.image_url)):
+        await attach_recipe_image(recipe_data, str(parsed.image_url), bot.storage)
+    elif parsed.image_url:
+        recipe_data["image_url"] = parsed.image_url
+
     src_parser = bot.parser.get_parser(url)
     if src_parser is not None:
-        await src_parser.generate_image_if_needed(recipe_data)
+        await src_parser.generate_image_if_needed(
+            recipe_data,
+            hf_api_key=bot.config.hf_api_key,
+            storage=bot.storage,
+        )
 
     # 2) Нормализация
     await _safe_edit(status, "🤖 Анализирую рецепт...")
@@ -452,6 +472,12 @@ async def _handle_url(
 
     # 4) Сохраняем во временный кэш и показываем пользователю
     recipe["source_url"] = url
+    if recipe_data.get("image_path"):
+        recipe["image_path"] = recipe_data["image_path"]
+    img_pub = recipe_data.get("image_url")
+    if img_pub and str(img_pub).startswith(("http://", "https://")):
+        recipe["image_url"] = str(img_pub).strip()
+
     bot.temp_recipes[user_id] = {"recipe": recipe, "timestamp": time.time()}
     bot.cleanup_expired_temp_recipes()
 

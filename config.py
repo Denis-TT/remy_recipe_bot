@@ -48,6 +48,8 @@ class Config:
     apify_api_token: str = ""
     # Каталог для сохранения изображений рецептов (том на Railway: /images).
     images_dir: str = "/images"
+    # Hugging Face Inference API — генерация изображений блюд (YouTube / Instagram / фото).
+    hf_api_key: str = ""
     # Устарело: ранее yt-dlp; поле оставлено для совместимости существующих .env.
     youtube_cookie_file: str = ""
 
@@ -118,6 +120,8 @@ class Config:
         _img = (os.getenv("IMAGES_DIR") or os.getenv("REMY_IMAGES_DIR") or "/images").strip()
         images_dir = _img.rstrip("/") or "/images"
 
+        hf_api_key = cls._env_optional_secret("HF_API_KEY")
+
         youtube_cookie_file = os.getenv("YOUTUBE_COOKIE_FILE", "").strip()
 
         environment = os.getenv("ENVIRONMENT", "production").strip().lower() or "production"
@@ -140,6 +144,7 @@ class Config:
             youtube_api_key=youtube_api_key,
             apify_api_token=apify_api_token,
             images_dir=images_dir,
+            hf_api_key=hf_api_key,
             youtube_cookie_file=youtube_cookie_file,
         )
 

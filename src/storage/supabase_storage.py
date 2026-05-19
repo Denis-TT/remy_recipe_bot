@@ -16,6 +16,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
+import uuid
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 import aiohttp
@@ -55,6 +57,9 @@ _TIMEOUT_SECONDS = 30.0
 #: Символы, которые могут разрушить синтаксис PostgREST в `or=(...)`.
 #: Вырезаем их из пользовательского поискового запроса.
 _POSTGREST_UNSAFE_CHARS = str.maketrans({c: " " for c in "(),"})
+
+#: Публичный бакет для обложек рецептов (создать в Supabase Dashboard → Storage).
+STORAGE_BUCKET_RECIPE_IMAGES = "recipe-images"
 
 
 # --------------------------------------------------------------------------- #
@@ -312,6 +317,75 @@ class SupabaseStorage(BaseStorage):
         return ok
 
     # ------------------------------------------------------------------ #
+    # Storage: изображения рецептов
+    # ------------------------------------------------------------------ #
+
+    async def upload_image(self, local_path: str) -> Optional[str]:
+        """Загрузить файл в бакет ``recipe-images`` и вернуть публичный URL.
+
+        Args:
+            local_path: Абсолютный или относительный путь к JPEG/PNG на диске.
+
+        Returns:
+            Публичный URL вида ``{supabase_url}/storage/v1/object/public/recipe-images/...``
+            или ``None`` при ошибке.
+        """
+        path = (local_path or "").strip()
+        if not path or not os.path.isfile(path):
+            logger.warning("upload_image: локальный файл не найден: %s", path or "(пусто)")
+            return None
+
+        filename = os.path.basename(path) or f"{uuid.uuid4().hex}.jpg"
+        try:
+            with open(path, "rb") as fh:
+                body = fh.read()
+        except OSError as exc:
+            logger.error("upload_image: не удалось прочитать %s: %s", path, exc)
+            return None
+
+        if not body:
+            logger.warning("upload_image: пустой файл %s", path)
+            return None
+
+        content_type = "image/jpeg"
+        low = filename.lower()
+        if low.endswith(".png"):
+            content_type = "image/png"
+        elif low.endswith(".webp"):
+            content_type = "image/webp"
+
+        object_path = f"{STORAGE_BUCKET_RECIPE_IMAGES}/{filename}"
+        upload_url = f"{self.url}/storage/v1/object/{object_path}"
+        public_url = f"{self.url}/storage/v1/object/public/{object_path}"
+
+        headers = {
+            "apikey": self.key,
+            "Authorization": f"Bearer {self.key}",
+            "Content-Type": content_type,
+        }
+        timeout = aiohttp.ClientTimeout(total=_TIMEOUT_SECONDS)
+
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(upload_url, data=body, headers=headers) as response:
+                    resp_text = await response.text(errors="replace")
+                    if response.status not in (200, 201):
+                        logger.error(
+                            "Не удалось загрузить изображение в Storage (HTTP %s): %s",
+                            response.status,
+                            self._truncate(resp_text, 300),
+                        )
+                        return None
+            logger.info("Изображение загружено в Supabase Storage: %s", public_url)
+            return public_url
+        except asyncio.TimeoutError:
+            logger.error("Таймаут загрузки изображения в Storage: %s", path)
+            return None
+        except aiohttp.ClientError as exc:
+            logger.error("Ошибка загрузки изображения в Storage: %s", exc)
+            return None
+
+    # ------------------------------------------------------------------ #
     # Внутренности: HTTP
     # ------------------------------------------------------------------ #
 
@@ -448,6 +522,31 @@ if __name__ == "__main__":
     )
 
     async def _test() -> None:
+        import tempfile
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        td = tempfile.mkdtemp()
+        img_file = os.path.join(td, "test_upload.jpg")
+        with open(img_file, "wb") as fh:
+            fh.write(b"\xff\xd8\xff\xd9")
+        storage_mock = SupabaseStorage("https://test.supabase.co", "test-key")
+        mock_resp = MagicMock()
+        mock_resp.status = 200
+        mock_resp.text = AsyncMock(return_value="")
+        post_ctx = MagicMock()
+        post_ctx.__aenter__ = AsyncMock(return_value=mock_resp)
+        post_ctx.__aexit__ = AsyncMock(return_value=None)
+        mock_sess = MagicMock()
+        mock_sess.post = MagicMock(return_value=post_ctx)
+        sess_ctx = MagicMock()
+        sess_ctx.__aenter__ = AsyncMock(return_value=mock_sess)
+        sess_ctx.__aexit__ = AsyncMock(return_value=None)
+        with patch("aiohttp.ClientSession", return_value=sess_ctx):
+            public = await storage_mock.upload_image(img_file)
+        assert public is not None and "recipe-images" in public
+        assert public.startswith("https://test.supabase.co/storage/v1/object/public/")
+        print("✅ upload_image (мок aiohttp)")
+
         url = os.getenv("SUPABASE_URL", "")
         key = os.getenv("SUPABASE_KEY", "")
 

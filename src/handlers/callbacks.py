@@ -160,8 +160,9 @@ async def _callback_save(query: CallbackQuery, bot: "RemyBot", user_id: int) -> 
         return
 
     recipe = dict(entry["recipe"])
-    if (recipe.get("image_url") in (None, "")) and recipe.get("image_path"):
-        recipe["image_url"] = str(recipe["image_path"]).strip()
+    img_url = str(recipe.get("image_url") or "").strip()
+    if not img_url.startswith(("http://", "https://")):
+        recipe["image_url"] = ""
     recipe.pop("image_path", None)
     try:
         saved = await bot.storage.save_recipe(user_id, recipe)

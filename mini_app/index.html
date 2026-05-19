@@ -1713,7 +1713,7 @@
         //  Экран 3 — детальный рецепт
         //
         //  Дизайн:
-        //   - hero: фото из `r.image_url` или плейсхолдер «Нет фото»
+        //   - hero: публичный `image_url` (https) или плейсхолдер «Нет фото»
         //   - крупный заголовок, описание серым
         //   - бейджи (тип / кухня / сложность / время / порции)
         //   - КБЖУ — горизонтальная сетка из 4 колонок
@@ -1783,7 +1783,8 @@
         // Принимает уже созданный `screen` и кладёт в него блоки.
         function renderRecipeBody(screen, r) {
             const imgUrl = (r.image_url || "").trim();
-            if (imgUrl) {
+            const isHttpImage = /^https?:\/\//i.test(imgUrl);
+            if (isHttpImage) {
                 const hero = el("div", { class: "recipe-hero recipe-hero-photo" });
                 const img = el("img", {
                     class: "hero-img",
