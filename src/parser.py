@@ -49,8 +49,9 @@ logger = logging.getLogger(__name__)
 
 IMAGES_DIR: str = str(_remy_config.images_dir or "/images").rstrip("/") or "/images"
 
-HF_IMAGE_MODEL_ID = "black-forest-labs/FLUX.1-dev"
-HF_INFERENCE_URL = "https://api-inference.huggingface.co/models/black-forest-labs/FLUX.1-dev"
+# Модель FLUX.1-dev — через ``InferenceClient(provider="fal-ai")``, не serverless Inference API.
+HF_FLUX_MODEL_ID = "black-forest-labs/FLUX.1-dev"
+HF_FLUX_PROVIDER = "fal-ai"
 
 
 def ensure_images_dir() -> None:
@@ -91,8 +92,19 @@ class ParseResult:
     image_url: Optional[str] = None
 
 
+def _flux_text_to_image_and_save_sync(prompt: str, hf_api_key: str, dest_path: str) -> None:
+    """Синхронный вызов FLUX.1-dev через ``InferenceClient`` (провайдер fal-ai)."""
+    from huggingface_hub import InferenceClient
+
+    client = InferenceClient(provider=HF_FLUX_PROVIDER, api_key=hf_api_key)
+    image = client.text_to_image(prompt=prompt, model=HF_FLUX_MODEL_ID)
+    if image is None:
+        raise RuntimeError("FLUX.1-dev вернул пустое изображение")
+    image.save(dest_path, "JPEG", quality=90)
+
+
 async def _generate_and_save_image(title: str, *, hf_api_key: str) -> Optional[str]:
-    """Сгенерировать изображение через Hugging Face (FLUX.1-dev) и сохранить под ``IMAGES_DIR``."""
+    """Сгенерировать изображение через FLUX.1-dev (fal-ai) и сохранить под ``IMAGES_DIR``."""
     key = (hf_api_key or "").strip()
     if not key:
         logger.info("Генерация изображений отключена (нет HF_API_KEY)")
@@ -105,48 +117,20 @@ async def _generate_and_save_image(title: str, *, hf_api_key: str) -> Optional[s
         "shallow depth of field, restaurant quality presentation, high detail, "
         "delicious and appetizing, shot from above on a beautiful plate"
     )
-    headers = {"Authorization": f"Bearer {key}"}
-    payload = {"inputs": prompt}
-    timeout = aiohttp.ClientTimeout(total=30)
 
     for attempt in range(3):
+        path = os.path.join(IMAGES_DIR, f"{uuid.uuid4().hex}.jpg")
         try:
-            async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
-                async with session.post(HF_INFERENCE_URL, json=payload) as resp:
-                    body = await resp.read()
-                    if resp.status == 200 and body:
-                        ct = (resp.headers.get("Content-Type") or "").lower()
-                        if "application/json" in ct:
-                            logger.warning(
-                                "Попытка %d: FLUX.1-dev вернул JSON вместо изображения: %s",
-                                attempt + 1,
-                                body[:300].decode("utf-8", errors="replace"),
-                            )
-                        else:
-                            uid = uuid.uuid4().hex
-                            path = os.path.join(IMAGES_DIR, f"{uid}.jpg")
-                            with open(path, "wb") as f:
-                                f.write(body)
-                            logger.info("Изображение сгенерировано через FLUX.1-dev: %s", path)
-                            return path
-                    elif resp.status == 404:
-                        logger.warning(
-                            "FLUX.1-dev не активирован. Примите условия на "
-                            "https://huggingface.co/black-forest-labs/FLUX.1-dev"
-                        )
-                    elif resp.status >= 400:
-                        logger.warning(
-                            "Попытка %d: FLUX.1-dev HTTP %s: %s",
-                            attempt + 1,
-                            resp.status,
-                            body[:300].decode("utf-8", errors="replace"),
-                        )
-                    else:
-                        logger.warning("Попытка %d: пустой ответ FLUX.1-dev", attempt + 1)
-        except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
-            logger.warning("Попытка %d генерации изображения не удалась: %s", attempt + 1, exc)
+            await asyncio.to_thread(_flux_text_to_image_and_save_sync, prompt, key, path)
+            logger.info("Изображение сгенерировано через FLUX.1-dev (fal-ai): %s", path)
+            return path
         except Exception as exc:  # noqa: BLE001
-            logger.warning("Попытка %d генерации изображения не удалась: %s", attempt + 1, exc)
+            logger.warning("Попытка %d генерации FLUX.1-dev не удалась: %s", attempt + 1, exc)
+            if os.path.isfile(path):
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
         await asyncio.sleep(2)
 
     logger.error("Не удалось сгенерировать изображение для %s после 3 попыток", dish_title[:200])
@@ -1290,45 +1274,31 @@ if __name__ == "__main__":
         print("✅ WebParser og:image скачивание (мок)")
 
         assert await mod._generate_and_save_image("тест", hf_api_key="") is None
-        assert mod.HF_IMAGE_MODEL_ID == "black-forest-labs/FLUX.1-dev"
-        assert "black-forest-labs/FLUX.1-dev" in mod.HF_INFERENCE_URL
+        assert mod.HF_FLUX_MODEL_ID == "black-forest-labs/FLUX.1-dev"
+        assert mod.HF_FLUX_PROVIDER == "fal-ai"
 
         td_pol = tempfile.mkdtemp()
         with patch.object(mod, "IMAGES_DIR", td_pol):
-            mock_resp = AsyncMock()
-            mock_resp.status = 200
-            mock_resp.read = AsyncMock(return_value=b"\xff\xd8\xff\xd9")
-            mock_resp.headers = {"Content-Type": "image/jpeg"}
-            post_ctx = MagicMock()
-            post_ctx.__aenter__ = AsyncMock(return_value=mock_resp)
-            post_ctx.__aexit__ = AsyncMock(return_value=None)
-            mock_sess = MagicMock()
-            mock_sess.post = MagicMock(return_value=post_ctx)
-            sess_ctx = MagicMock()
-            sess_ctx.__aenter__ = AsyncMock(return_value=mock_sess)
-            sess_ctx.__aexit__ = AsyncMock(return_value=None)
-            with patch.object(aiohttp, "ClientSession", return_value=sess_ctx):
+            from PIL import Image as PILImage
+
+            mock_pil = PILImage.new("RGB", (64, 64), color=(200, 100, 50))
+            mock_client = MagicMock()
+            mock_client.text_to_image.return_value = mock_pil
+
+            with patch("huggingface_hub.InferenceClient", return_value=mock_client) as mock_cls:
                 hf_path = await mod._generate_and_save_image("Борщ тест", hf_api_key="hf_test")
             assert hf_path is not None and hf_path.startswith(td_pol) and hf_path.endswith(".jpg")
             assert os.path.isfile(hf_path)
-            call_url = mock_sess.post.call_args[0][0]
-            assert "black-forest-labs/FLUX.1-dev" in call_url
+            mock_cls.assert_called_with(provider="fal-ai", api_key="hf_test")
+            mock_client.text_to_image.assert_called_once()
+            call_kw = mock_client.text_to_image.call_args.kwargs
+            assert call_kw.get("model") == "black-forest-labs/FLUX.1-dev"
+            assert "Борщ" in call_kw.get("prompt", "")
 
-            mock_resp_404 = AsyncMock()
-            mock_resp_404.status = 404
-            mock_resp_404.read = AsyncMock(return_value=b'{"error":"not found"}')
-            post_ctx_404 = MagicMock()
-            post_ctx_404.__aenter__ = AsyncMock(return_value=mock_resp_404)
-            post_ctx_404.__aexit__ = AsyncMock(return_value=None)
-            mock_sess_404 = MagicMock()
-            mock_sess_404.post = MagicMock(return_value=post_ctx_404)
-            sess_ctx_404 = MagicMock()
-            sess_ctx_404.__aenter__ = AsyncMock(return_value=mock_sess_404)
-            sess_ctx_404.__aexit__ = AsyncMock(return_value=None)
-            with patch.object(aiohttp, "ClientSession", return_value=sess_ctx_404):
-                path_404 = await mod._generate_and_save_image("Суп", hf_api_key="hf_test")
-            assert path_404 is None
-        print("✅ FLUX.1-dev _generate_and_save_image (мок aiohttp)")
+            mock_client.text_to_image.side_effect = RuntimeError("fal-ai недоступен")
+            path_fail = await mod._generate_and_save_image("Суп", hf_api_key="hf_test")
+            assert path_fail is None
+        print("✅ FLUX.1-dev _generate_and_save_image (мок InferenceClient)")
 
         rd: dict = {"raw_text": "Суп дня", "image_url": None}
         await WebParser().generate_image_if_needed(rd, hf_api_key="hf")

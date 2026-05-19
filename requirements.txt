@@ -14,3 +14,6 @@ python-telegram-bot==22.7
 
 # Превью рецептов: уменьшение JPEG перед sendPhoto (Railway / нестабильная сеть)
 Pillow==11.0.0
+
+# FLUX.1-dev через Hugging Face InferenceClient (провайдер fal-ai)
+huggingface_hub>=0.20.0
