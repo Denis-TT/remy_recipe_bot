@@ -211,12 +211,13 @@ class BaseParser(ABC):
 
 
 class WebParser(BaseParser):
-    """Парсер веб-страниц: aiohttp + readability + BeautifulSoup."""
+    """Парсер веб-страниц: aiohttp + readability + requests-html fallback."""
 
     source_type: str = "website"
     generate_image_default: bool = False
     MAX_TEXT_LENGTH: int = 50_000
     TIMEOUT_SECONDS: float = 30.0
+    MIN_USEFUL_TEXT_LENGTH: int = 1_000
 
     HEADERS: dict = {
         "User-Agent": (
@@ -228,8 +229,19 @@ class WebParser(BaseParser):
             "text/html,application/xhtml+xml,application/xml;q=0.9,"
             "image/avif,image/webp,*/*;q=0.8"
         ),
-        "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
+        "Accept-Language": "ru-RU, ru;q=0.9",
     }
+
+    _RECIPE_KEYWORDS_RE = re.compile(
+        r"(ингредиент|рецепт|приготовлен|приготовление|способ приготовления)",
+        re.IGNORECASE,
+    )
+    _TEXT_STOP_WORDS_RE = re.compile(
+        r"(?:^|\b)(войти|регистрация|зарегистрироваться|подписаться|комментарий|"
+        r"комментарии|поделиться|читать далее|реклама|личный кабинет|"
+        r"политика конфиденциальности|условия использования)(?:\b|$)",
+        re.IGNORECASE,
+    )
 
     _TAGS_TO_REMOVE: tuple = (
         "script", "style", "nav", "footer", "header",
@@ -254,14 +266,45 @@ class WebParser(BaseParser):
         self.last_image_url = None
         html = await self._fetch(url)
         image_url = await self._extract_og_image(html, url)
-        text = self._extract_text(html)
+        static_text = self._extract_text(html)
+        text = static_text
+        rendered_text = ""
+
+        if self._has_enough_text(static_text):
+            logger.info("Статический парсинг успешен: %s символов", len(static_text))
+        else:
+            logger.warning(
+                "Статический парсинг дал мало текста (%s символов). Пробую requests-html...",
+                len(static_text),
+            )
+            try:
+                rendered_html = await asyncio.to_thread(self._fetch_rendered_html_sync, url)
+                rendered_text = self._extract_text(rendered_html) if rendered_html else ""
+                if not image_url and rendered_html:
+                    image_url = await self._extract_og_image(rendered_html, url)
+                text = self._combine_texts(static_text, rendered_text)
+                if self._has_enough_text(text):
+                    logger.info("Fallback (requests-html) успешен: %s символов", len(text))
+                else:
+                    logger.error(
+                        "Не удалось извлечь достаточно текста: статика %s символов, рендеринг %s символов",
+                        len(static_text),
+                        len(rendered_text),
+                    )
+            except Exception as exc:  # noqa: BLE001
+                logger.error(
+                    "Не удалось извлечь достаточно текста: статика %s символов, рендеринг %s символов",
+                    len(static_text),
+                    len(rendered_text),
+                )
+                logger.warning("requests-html fallback не сработал для %s: %s", url, exc)
+
+        if len(text) > self.MAX_TEXT_LENGTH:
+            text = text[: self.MAX_TEXT_LENGTH]
 
         if not text:
             logger.error("❌ Ошибка парсинга %s: пустой контент", url)
             raise RuntimeError("Страница не содержит текста")
-
-        if len(text) > self.MAX_TEXT_LENGTH:
-            text = text[: self.MAX_TEXT_LENGTH]
 
         logger.info("📄 Извлечено %s символов текста", self._format_number(len(text)))
         return ParseResult(text=text, image_url=image_url)
@@ -334,6 +377,24 @@ class WebParser(BaseParser):
             logger.error("❌ Ошибка парсинга %s: %s", url, exc)
             raise RuntimeError(f"Сетевая ошибка: {exc}") from exc
 
+    def _fetch_rendered_html_sync(self, url: str) -> str:
+        """Синхронно загрузить и отрендерить страницу через requests-html/Chromium."""
+        try:
+            from requests_html import HTMLSession
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(
+                "requests-html не установлен или недоступен; установите зависимости из requirements.txt"
+            ) from exc
+
+        session = HTMLSession()
+        try:
+            response = session.get(url, headers=self.HEADERS, timeout=self.TIMEOUT_SECONDS)
+            response.raise_for_status()
+            response.html.render(timeout=30)
+            return str(response.html.html or "")
+        finally:
+            session.close()
+
     def _extract_text(self, html: str) -> str:
         content_html = html
         if _ReadabilityDocument is not None:
@@ -349,7 +410,43 @@ class WebParser(BaseParser):
         for tag in soup(self._TAGS_TO_REMOVE):
             tag.decompose()
         raw_text = soup.get_text(separator="\n")
-        return self._clean_text(raw_text)
+        return self._clean_extracted_text(self._clean_text(raw_text))
+
+    def _has_enough_text(self, text: str) -> bool:
+        cleaned = (text or "").strip()
+        return (
+            len(cleaned) >= self.MIN_USEFUL_TEXT_LENGTH
+            and bool(self._RECIPE_KEYWORDS_RE.search(cleaned))
+        )
+
+    def _combine_texts(self, first: str, second: str) -> str:
+        first = (first or "").strip()
+        second = (second or "").strip()
+        if not first:
+            return second
+        if not second:
+            return first
+        if first in second:
+            return second
+        if second in first:
+            return first
+        return self._clean_extracted_text(f"{first}\n\n{second}")
+
+    def _clean_extracted_text(self, text: str) -> str:
+        """Очистить текст рецепта от коротких навигационных и служебных строк."""
+        lines = text.splitlines()
+        cleaned_lines: List[str] = []
+        for line in lines:
+            collapsed = re.sub(r"[ \t\u00a0]+", " ", line).strip()
+            if not collapsed:
+                continue
+            if len(collapsed) < 20:
+                continue
+            if self._TEXT_STOP_WORDS_RE.search(collapsed):
+                continue
+            cleaned_lines.append(collapsed)
+        cleaned = "\n".join(cleaned_lines)
+        return re.sub(r"\n{3,}", "\n\n", cleaned).strip()
 
     @staticmethod
     def _clean_text(text: str) -> str:
@@ -1224,6 +1321,47 @@ if __name__ == "__main__":
         )
         assert og_rel == "https://eda.ru/pics/x.png"
         print("✅ WebParser og:image URL")
+
+        wp_clean = WebParser()
+        dirty_text = (
+            "Войти\n"
+            "Коротко\n"
+            "Ингредиенты для домашнего пирога: мука, яйца и сахар\n\n\n\n"
+            "Поделиться рецептом\n"
+            "Приготовление занимает около сорока минут"
+        )
+        cleaned_text = wp_clean._clean_extracted_text(dirty_text)
+        assert "Войти" not in cleaned_text
+        assert "Коротко" not in cleaned_text
+        assert "\n\n\n" not in cleaned_text
+        assert "Ингредиенты" in cleaned_text
+        print("✅ WebParser очистка извлечённого текста")
+
+        static_html = "<html><body><p>Слишком короткое описание без полной структуры</p></body></html>"
+        rendered_recipe = (
+            "Ингредиенты для тестового рецепта: "
+            + "мука сахар масло яйца молоко " * 60
+            + "\nПриготовление: смешайте ингредиенты, выпекайте до готовности. "
+            + "рецепт подходит для проверки fallback "
+            + "подробное описание " * 40
+        )
+        rendered_html = f"<html><body><article><p>{rendered_recipe}</p></article></body></html>"
+        wp_fallback = WebParser()
+        with patch.object(WebParser, "_fetch", new_callable=AsyncMock, return_value=static_html), patch.object(
+            WebParser,
+            "_extract_og_image",
+            new_callable=AsyncMock,
+            return_value=None,
+        ), patch.object(
+            WebParser,
+            "_fetch_rendered_html_sync",
+            return_value=rendered_html,
+        ) as mock_render:
+            fallback_result = await wp_fallback.parse("https://example.test/js-recipe")
+        mock_render.assert_called_once()
+        assert "Ингредиенты" in fallback_result.text
+        assert len(fallback_result.text) >= WebParser.MIN_USEFUL_TEXT_LENGTH
+        print("✅ WebParser fallback requests-html (мок)")
 
         wp_miss = WebParser()
         assert await wp_miss._extract_og_image("<html></html>", "https://nope.test/x") is None
