@@ -217,6 +217,7 @@ class WebParser(BaseParser):
     generate_image_default: bool = False
     MAX_TEXT_LENGTH: int = 50_000
     TIMEOUT_SECONDS: float = 30.0
+    RENDER_TIMEOUT_SECONDS: int = 60
     MIN_USEFUL_TEXT_LENGTH: int = 1_000
 
     HEADERS: dict = {
@@ -228,6 +229,14 @@ class WebParser(BaseParser):
         "Accept": (
             "text/html,application/xhtml+xml,application/xml;q=0.9,"
             "image/avif,image/webp,*/*;q=0.8"
+        ),
+        "Accept-Language": "ru-RU, ru;q=0.9",
+    }
+
+    MOBILE_HEADERS: dict = {
+        "User-Agent": (
+            "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
         ),
         "Accept-Language": "ru-RU, ru;q=0.9",
     }
@@ -266,38 +275,47 @@ class WebParser(BaseParser):
         self.last_image_url = None
         html = await self._fetch(url)
         image_url = await self._extract_og_image(html, url)
-        static_text = self._extract_text(html)
+        static_text = self._extract_text(html, stage="static (aiohttp)")
         text = static_text
         rendered_text = ""
 
         if self._has_enough_text(static_text):
             logger.info("Статический парсинг успешен: %s символов", len(static_text))
         else:
-            logger.warning(
-                "Статический парсинг дал мало текста (%s символов). Пробую requests-html...",
-                len(static_text),
-            )
+            if not static_text.strip():
+                logger.warning("Статический парсинг (aiohttp): пустой результат")
+            else:
+                logger.warning(
+                    "Статический парсинг (aiohttp): мало текста (%s символов)",
+                    len(static_text),
+                )
+            logger.warning("Пробую requests-html...")
             try:
                 rendered_html = await asyncio.to_thread(self._fetch_rendered_html_sync, url)
-                rendered_text = self._extract_text(rendered_html) if rendered_html else ""
-                if not image_url and rendered_html:
-                    image_url = await self._extract_og_image(rendered_html, url)
-                text = self._combine_texts(static_text, rendered_text)
-                if self._has_enough_text(text):
-                    logger.info("Fallback (requests-html) успешен: %s символов", len(text))
+                if not (rendered_html or "").strip():
+                    logger.warning("requests-html: пустой HTML после рендеринга")
                 else:
-                    logger.error(
-                        "Не удалось извлечь достаточно текста: статика %s символов, рендеринг %s символов",
-                        len(static_text),
-                        len(rendered_text),
-                    )
+                    rendered_text = self._extract_text(rendered_html, stage="requests-html")
+                    if not rendered_text.strip():
+                        logger.warning("requests-html: текст не извлечён из отрендеренной страницы")
+                    elif self._has_enough_text(rendered_text):
+                        logger.info(
+                            "Fallback (requests-html) успешен: %s символов",
+                            len(rendered_text),
+                        )
+                    if not image_url and rendered_html:
+                        image_url = await self._extract_og_image(rendered_html, url)
+                    text = self._combine_texts(static_text, rendered_text)
             except Exception as exc:  # noqa: BLE001
+                logger.warning("requests-html fallback не сработал для %s: %s", url, exc)
+
+            if not self._has_enough_text(text):
                 logger.error(
-                    "Не удалось извлечь достаточно текста: статика %s символов, рендеринг %s символов",
+                    "Не удалось извлечь достаточно текста: статика %s символов, "
+                    "requests-html %s символов",
                     len(static_text),
                     len(rendered_text),
                 )
-                logger.warning("requests-html fallback не сработал для %s: %s", url, exc)
 
         if len(text) > self.MAX_TEXT_LENGTH:
             text = text[: self.MAX_TEXT_LENGTH]
@@ -386,31 +404,84 @@ class WebParser(BaseParser):
                 "requests-html не установлен или недоступен; установите зависимости из requirements.txt"
             ) from exc
 
+        headers = dict(self.MOBILE_HEADERS)
         session = HTMLSession()
         try:
-            response = session.get(url, headers=self.HEADERS, timeout=self.TIMEOUT_SECONDS)
+            response = session.get(url, headers=headers, timeout=self.TIMEOUT_SECONDS)
             response.raise_for_status()
-            response.html.render(timeout=30)
-            return str(response.html.html or "")
+            response.html.render(timeout=self.RENDER_TIMEOUT_SECONDS)
+            rendered = str(response.html.html or "")
+            logger.info(
+                "requests-html: страница отрендерена (%s символов HTML, timeout=%ss)",
+                len(rendered),
+                self.RENDER_TIMEOUT_SECONDS,
+            )
+            return rendered
         finally:
             session.close()
 
-    def _extract_text(self, html: str) -> str:
-        content_html = html
-        if _ReadabilityDocument is not None:
-            try:
-                doc = _ReadabilityDocument(html)
-                summary = doc.summary(html_partial=True)
-                if summary and summary.strip():
-                    content_html = summary
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("⚠️  readability не справился, используем полный HTML: %s", exc)
-
+    def _html_fragment_to_text(self, content_html: str) -> str:
+        """Извлечь текст из HTML-фрагмента (readability summary или body)."""
         soup = BeautifulSoup(content_html, "lxml")
         for tag in soup(self._TAGS_TO_REMOVE):
             tag.decompose()
         raw_text = soup.get_text(separator="\n")
         return self._clean_extracted_text(self._clean_text(raw_text))
+
+    def _body_text_from_html(self, html: str) -> str:
+        """Извлечь весь текст из ``<body>`` — запасной путь, если readability пуст."""
+        soup = BeautifulSoup(html, "lxml")
+        body = soup.find("body")
+        if body is None:
+            return self._html_fragment_to_text(html)
+        for tag in body(self._TAGS_TO_REMOVE):
+            tag.decompose()
+        raw_text = body.get_text(separator="\n")
+        return self._clean_extracted_text(self._clean_text(raw_text))
+
+    def _extract_text(self, html: str, *, stage: str = "static") -> str:
+        if not (html or "").strip():
+            logger.warning("%s: HTML пустой, текст не извлечён", stage)
+            return ""
+
+        readability_text = ""
+        if _ReadabilityDocument is not None:
+            try:
+                doc = _ReadabilityDocument(html)
+                summary = doc.summary(html_partial=True)
+                if summary and summary.strip():
+                    readability_text = self._html_fragment_to_text(summary)
+                else:
+                    logger.warning("readability (%s): пустой summary", stage)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("readability (%s): ошибка — %s", stage, exc)
+        else:
+            logger.warning("readability (%s): модуль недоступен", stage)
+
+        body_text = self._body_text_from_html(html)
+
+        if not readability_text.strip():
+            logger.warning(
+                "readability (%s): нет текста, берём <body> (%s символов)",
+                stage,
+                len(body_text),
+            )
+            return body_text
+
+        if (
+            len(readability_text) < self.MIN_USEFUL_TEXT_LENGTH
+            and len(body_text) > len(readability_text)
+        ):
+            logger.warning(
+                "readability (%s): мало текста (%s симв.), используем <body> (%s симв.)",
+                stage,
+                len(readability_text),
+                len(body_text),
+            )
+            return body_text
+
+        logger.info("readability (%s): успешно, %s символов", stage, len(readability_text))
+        return readability_text
 
     def _has_enough_text(self, text: str) -> bool:
         cleaned = (text or "").strip()
@@ -1337,6 +1408,35 @@ if __name__ == "__main__":
         assert "Ингредиенты" in cleaned_text
         print("✅ WebParser очистка извлечённого текста")
 
+        wp_body = WebParser()
+        onetable_recipe = (
+            "Желе из йогурта и желатина с фруктами — рецепт для всей семьи. "
+            "Ингредиенты: йогурт натуральный, желатин, сахар, фрукты по вкусу. "
+            + "подробное описание ингредиентов " * 35
+            + "\nПриготовление: замочите желатин, смешайте с йогуртом и фруктами. "
+            + "рецепт простой и быстрый " * 35
+        )
+        onetable_html = (
+            f"<html><head><title>Желе</title></head><body>"
+            f"<nav>Войти на сайт onetable</nav>"
+            f"<main><article><h1>Желе из йогурта</h1><p>{onetable_recipe}</p></article></main>"
+            f"</body></html>"
+        )
+
+        class _EmptyReadabilityDoc:
+            def __init__(self, html: str) -> None:
+                self._html = html
+
+            def summary(self, html_partial: bool = True) -> str:
+                return "<div></div>"
+
+        with patch.object(mod, "_ReadabilityDocument", _EmptyReadabilityDoc):
+            body_fallback_text = wp_body._extract_text(onetable_html, stage="test (body fallback)")
+        assert "Ингредиенты" in body_fallback_text
+        assert "Приготовление" in body_fallback_text
+        assert len(body_fallback_text) >= WebParser.MIN_USEFUL_TEXT_LENGTH
+        print("✅ WebParser body fallback при пустом readability (onetable-мок)")
+
         static_html = "<html><body><p>Слишком короткое описание без полной структуры</p></body></html>"
         rendered_recipe = (
             "Ингредиенты для тестового рецепта: "
@@ -1362,6 +1462,24 @@ if __name__ == "__main__":
         assert "Ингредиенты" in fallback_result.text
         assert len(fallback_result.text) >= WebParser.MIN_USEFUL_TEXT_LENGTH
         print("✅ WebParser fallback requests-html (мок)")
+
+        wp_onetable = WebParser()
+        with patch.object(WebParser, "_fetch", new_callable=AsyncMock, return_value=static_html), patch.object(
+            WebParser,
+            "_extract_og_image",
+            new_callable=AsyncMock,
+            return_value=None,
+        ), patch.object(
+            WebParser,
+            "_fetch_rendered_html_sync",
+            return_value=onetable_html,
+        ), patch.object(mod, "_ReadabilityDocument", _EmptyReadabilityDoc):
+            onetable_result = await wp_onetable.parse(
+                "https://onetable.ru/zhele-iz-jogurta-i-zhelatina-s-fruktami/",
+            )
+        assert "Ингредиенты" in onetable_result.text
+        assert len(onetable_result.text) >= WebParser.MIN_USEFUL_TEXT_LENGTH
+        print("✅ WebParser onetable URL + пустой readability (мок)")
 
         wp_miss = WebParser()
         assert await wp_miss._extract_og_image("<html></html>", "https://nope.test/x") is None
