@@ -283,8 +283,10 @@ if __name__ == "__main__":
 
     # --- Клавиатуры ---------------------------------------------------- #
     from src.keyboards import (  # noqa: E402
-        categories_keyboard,
+        dish_types_keyboard,
+        main_ingredients_keyboard,
         menu_keyboard,
+        recipes_list_keyboard,
         save_recipe_keyboard,
     )
 
@@ -304,15 +306,36 @@ if __name__ == "__main__":
 
     assert callable(messages.handle_photo)
 
-    cats_kb = categories_keyboard(
+    dish_kb = dish_types_keyboard(
         bot.loc,
-        [{"key": "lunch", "count": 5}, {"key": "dessert", "count": 3}],
+        [{"key": "soup", "count": 5}, {"key": "baking", "count": 3}],
     )
     callback_values = [
-        btn.callback_data for row in cats_kb.inline_keyboard for btn in row
+        btn.callback_data for row in dish_kb.inline_keyboard for btn in row
     ]
-    assert "cat_lunch" in callback_values
-    assert "cat_dessert" in callback_values
+    assert "dishtype_soup" in callback_values
+    assert "dishtype_baking" in callback_values
     assert "back_to_menu" in callback_values
+
+    ingredient_kb = main_ingredients_keyboard(
+        bot.loc,
+        "soup",
+        [{"key": "beef", "count": 2}],
+    )
+    ingredient_callbacks = [
+        btn.callback_data for row in ingredient_kb.inline_keyboard for btn in row
+    ]
+    assert "ingredient_soup_beef" in ingredient_callbacks
+
+    recipes_kb = recipes_list_keyboard(
+        [{"id": "00000000-0000-0000-0000-000000000001", "title": "Суп"}],
+        "soup",
+        "beef",
+    )
+    recipe_callbacks = [
+        btn.callback_data for row in recipes_kb.inline_keyboard for btn in row
+    ]
+    assert "view_soup_beef_00000000-0000-0000-0000-000000000001" in recipe_callbacks
+    assert "dishtype_soup" in recipe_callbacks
 
     print("✅ Smoke-тесты RemyBot пройдены!")

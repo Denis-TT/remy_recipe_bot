@@ -97,7 +97,7 @@ loc.get_meal_type_emoji("dessert")    # "🍰"
 | `RecipeNormalizer._postprocess` | В конце нормализации AI-ответа, перед возвратом в хендлер — **единая точка** приведения к латинице. |
 | `SupabaseStorage.save_recipe` | Страховочный повторный `normalize_recipe` перед `INSERT` — защищает от случайной записи русского в БД (например, при ручных вызовах). |
 | `src/handlers/messages.py → format_recipe` | Переводы для бейджей в карточке рецепта («🍲 Обеды», «🟡 Средне», «Русская»). |
-| `src/keyboards.py → categories_keyboard` | Текст кнопок категорий («🍲 Обеды (5)»). |
+| `src/keyboards.py → dish_types_keyboard` / `main_ingredients_keyboard` | Текст кнопок двухуровневой навигации («🥣 Супы (5)», «🍗 Курица (2)»). |
 | `mini_app/index.html → LOCALE` | Копия словарей (без Python-специфики) для рендера Mini App. |
 
 **Мнемоническое правило**: если данные уходят **в БД** — нормализуй в

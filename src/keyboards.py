@@ -9,11 +9,11 @@ Telegram. Весь код, формирующий визуальные элем�
 
 Важные инварианты:
 
-* `callback_data` **всегда латиница** (`cat_lunch`, `view_<uuid>`, ...).
+* `callback_data` **всегда латиница** (`dishtype_soup`, `view_<uuid>`, ...).
   Локализованный текст на кнопках берётся из `Localization`, но
   передаваемые данные остаются ASCII — это защищает от проблем с
   64-байтовым лимитом Telegram и делает маршрутизацию callback'ов
-  тривиальной (`data.startswith("cat_")`).
+  тривиальной (`data.startswith("dishtype_")`).
 * Для `WebApp`-кнопки используется только HTTPS-URL. Если в конфиге
   `webapp_url` пуст, кнопка не добавляется — это рабочий режим,
   когда мини-приложение ещё не развёрнуто.
@@ -162,41 +162,64 @@ def save_recipe_keyboard() -> InlineKeyboardMarkup:
     ])
 
 
-def categories_keyboard(
+def dish_types_keyboard(
     loc: Localization,
-    categories: Sequence[Mapping[str, object]],
+    dish_types: Sequence[Mapping[str, object]],
 ) -> InlineKeyboardMarkup:
-    """Клавиатура со списком категорий пользователя.
+    """Клавиатура первого уровня: ``dish_type``.
 
     Каждая строка — одна категория: «{эмодзи} {локализованное имя} ({count})»,
-    `callback_data="cat_{ключ}"`. Внизу — «◀️ Назад в меню».
-
-    Args:
-        loc: Локализатор для перевода ключей в отображаемые имена.
-        categories: Результат `SupabaseStorage.get_categories(...)` —
-            список словарей ``{"key": ..., "count": ...}``.
+    `callback_data="dishtype_{ключ}"`. Внизу — «◀️ Назад в меню».
     """
     rows: List[List[InlineKeyboardButton]] = []
 
-    for cat in categories:
-        key = str(cat.get("key", "other"))
-        count = int(cat.get("count", 0) or 0)
-        label = f"{loc.get_meal_type_emoji(key)} {loc.get_meal_type_name(key)} ({count})"
-        rows.append([InlineKeyboardButton(label, callback_data=f"cat_{key}")])
+    for item in dish_types:
+        key = str(item.get("key", "main"))
+        count = int(item.get("count", 0) or 0)
+        label = f"{loc.get_dish_type_emoji(key)} {loc.get_dish_type_name(key)} ({count})"
+        rows.append([InlineKeyboardButton(label, callback_data=f"dishtype_{key}")])
 
     rows.append([InlineKeyboardButton("◀️ Назад в меню", callback_data="back_to_menu")])
     return InlineKeyboardMarkup(rows)
 
 
+def main_ingredients_keyboard(
+    loc: Localization,
+    dish_type: str,
+    ingredients: Sequence[Mapping[str, object]],
+) -> InlineKeyboardMarkup:
+    """Клавиатура второго уровня: ``main_ingredient`` внутри ``dish_type``."""
+    rows: List[List[InlineKeyboardButton]] = []
+    dish_key = str(dish_type or "main")
+
+    for item in ingredients:
+        key = str(item.get("key", "other"))
+        count = int(item.get("count", 0) or 0)
+        label = (
+            f"{loc.get_main_ingredient_emoji(key)} "
+            f"{loc.get_main_ingredient_name(key)} ({count})"
+        )
+        rows.append([
+            InlineKeyboardButton(label, callback_data=f"ingredient_{dish_key}_{key}")
+        ])
+
+    rows.append([InlineKeyboardButton("◀️ Назад", callback_data="back_to_categories")])
+    return InlineKeyboardMarkup(rows)
+
+
 def recipes_list_keyboard(
     recipes: Sequence[Mapping[str, object]],
+    dish_type: str = "",
+    main_ingredient: str = "",
 ) -> InlineKeyboardMarkup:
     """Клавиатура со списком рецептов в выбранной категории.
 
-    На каждой кнопке — название рецепта; `callback_data="view_{id}"`.
+    На каждой кнопке — название рецепта; `callback_data="view_{...}"`.
     Длинные заголовки обрезаются до 40 символов. Внизу — «◀️ Назад».
     """
     rows: List[List[InlineKeyboardButton]] = []
+    dish_key = str(dish_type or "").strip()
+    ingredient_key = str(main_ingredient or "").strip()
 
     for recipe in recipes:
         title = str(recipe.get("title") or "Без названия").strip()
@@ -205,22 +228,35 @@ def recipes_list_keyboard(
         recipe_id = str(recipe.get("id") or "")
         if not recipe_id:
             continue
+        callback_data = f"view_{recipe_id}"
+        if dish_key and ingredient_key:
+            callback_data = f"view_{dish_key}_{ingredient_key}_{recipe_id}"
         rows.append([
-            InlineKeyboardButton(title, callback_data=f"view_{recipe_id}")
+            InlineKeyboardButton(title, callback_data=callback_data)
         ])
 
+    back_callback = "back_to_categories"
+    if dish_key:
+        back_callback = f"dishtype_{dish_key}"
     rows.append([
-        InlineKeyboardButton("◀️ Назад", callback_data="back_to_categories")
+        InlineKeyboardButton("◀️ Назад", callback_data=back_callback)
     ])
     return InlineKeyboardMarkup(rows)
 
 
-def recipe_detail_keyboard(recipe_id: str) -> InlineKeyboardMarkup:
+def recipe_detail_keyboard(
+    recipe_id: str,
+    dish_type: str = "",
+    main_ingredient: str = "",
+) -> InlineKeyboardMarkup:
     """Кнопки под детальным просмотром рецепта: «🗑 Удалить» и «◀️ Назад»."""
+    back_callback = "back_to_categories"
+    if dish_type and main_ingredient:
+        back_callback = f"ingredient_{dish_type}_{main_ingredient}"
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton("🗑 Удалить", callback_data=f"delete_{recipe_id}"),
-            InlineKeyboardButton("◀️ Назад", callback_data="back_to_categories"),
+            InlineKeyboardButton("◀️ Назад", callback_data=back_callback),
         ],
     ])
 

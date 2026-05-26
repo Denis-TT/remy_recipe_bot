@@ -227,6 +227,91 @@ class SupabaseStorage(BaseStorage):
         logger.info("📂 Категории user=%d: %s", int(user_id), summary)
         return categories
 
+    async def get_dish_types(self, user_id: int) -> List[Dict[str, Any]]:
+        """Сгруппировать рецепты пользователя по ``dish_type``."""
+        params = {
+            "user_id": f"eq.{int(user_id)}",
+            "select": "dish_type",
+        }
+        _, body = await self._request("GET", "/recipes", params=params)
+        rows = self._parse_json_body(body)
+        if not isinstance(rows, list):
+            rows = []
+
+        counts: Dict[str, int] = {}
+        for row in rows:
+            raw = row.get("dish_type") if isinstance(row, dict) else None
+            key = Localization.normalize_dish_type(raw)
+            counts[key] = counts.get(key, 0) + 1
+
+        dish_types = [
+            {"key": key, "count": count}
+            for key, count in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+        ]
+        logger.info("📂 dish_type user=%d: %s", int(user_id), dish_types)
+        return dish_types
+
+    async def get_main_ingredients(
+        self,
+        user_id: int,
+        dish_type: str,
+    ) -> List[Dict[str, Any]]:
+        """Сгруппировать рецепты по ``main_ingredient`` внутри ``dish_type``."""
+        dish_key = Localization.normalize_dish_type(dish_type)
+        params = {
+            "user_id": f"eq.{int(user_id)}",
+            "dish_type": f"eq.{dish_key}",
+            "select": "main_ingredient",
+        }
+        _, body = await self._request("GET", "/recipes", params=params)
+        rows = self._parse_json_body(body)
+        if not isinstance(rows, list):
+            rows = []
+
+        counts: Dict[str, int] = {}
+        for row in rows:
+            raw = row.get("main_ingredient") if isinstance(row, dict) else None
+            key = Localization.normalize_main_ingredient(raw)
+            counts[key] = counts.get(key, 0) + 1
+
+        ingredients = [
+            {"key": key, "count": count}
+            for key, count in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+        ]
+        logger.info("📂 main_ingredient user=%d dish_type=%s: %s", int(user_id), dish_key, ingredients)
+        return ingredients
+
+    async def get_recipes_by_dish_and_ingredient(
+        self,
+        user_id: int,
+        dish_type: str,
+        main_ingredient: str,
+        limit: int = 50,
+    ) -> List[Dict[str, Any]]:
+        """Получить рецепты по паре ``dish_type`` / ``main_ingredient``."""
+        dish_key = Localization.normalize_dish_type(dish_type)
+        ingredient_key = Localization.normalize_main_ingredient(main_ingredient)
+        params = {
+            "user_id": f"eq.{int(user_id)}",
+            "dish_type": f"eq.{dish_key}",
+            "main_ingredient": f"eq.{ingredient_key}",
+            "order": "created_at.desc",
+            "limit": str(int(limit)),
+        }
+        _, body = await self._request("GET", "/recipes", params=params)
+        rows = self._parse_json_body(body)
+        if not isinstance(rows, list):
+            rows = []
+
+        logger.info(
+            "📖 Загружено %d рецептов (user=%d, dish_type=%s, main_ingredient=%s)",
+            len(rows),
+            int(user_id),
+            dish_key,
+            ingredient_key,
+        )
+        return rows
+
     async def search_recipes(
         self, user_id: int, query: str
     ) -> List[Dict[str, Any]]:
@@ -601,6 +686,22 @@ if __name__ == "__main__":
 
         cats = await storage.get_categories(12345)
         print(f"✅ Категории: {cats}")
+
+        dish_types = await storage.get_dish_types(12345)
+        assert any(x.get("key") == "main" for x in dish_types)
+        print(f"✅ Типы блюд: {dish_types}")
+
+        ingredients = await storage.get_main_ingredients(12345, "main")
+        assert any(x.get("key") == "other" for x in ingredients)
+        print(f"✅ Основные ингредиенты: {ingredients}")
+
+        combo_recipes = await storage.get_recipes_by_dish_and_ingredient(
+            12345,
+            "main",
+            "other",
+        )
+        assert any(x.get("id") == saved["id"] for x in combo_recipes)
+        print(f"✅ Рецепты по main/other: {len(combo_recipes)}")
 
         found = await storage.search_recipes(12345, "тестовый")
         print(f"✅ Поиск нашёл: {len(found)} рецептов")

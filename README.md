@@ -94,7 +94,7 @@ remy_recipe_bot/
 │   ├── handlers/
 │   │   ├── commands.py          # /start, /menu, /help
 │   │   ├── messages.py          # текст + URL-пайплайн (parse → normalize → save)
-│   │   └── callbacks.py         # все inline-кнопки (save, cat_*, view_*, delete_*, …)
+│   │   └── callbacks.py         # inline-кнопки (save, dishtype_*, ingredient_*, view_*, delete_*, …)
 │   └── storage/
 │       ├── base.py              # абстрактный BaseStorage (CRUD + categories + search + health)
 │       └── supabase_storage.py  # реализация поверх Supabase REST API

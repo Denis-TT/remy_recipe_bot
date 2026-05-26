@@ -80,7 +80,7 @@
 | `src/storage/supabase_storage.py` | Реализация поверх Supabase REST (PostgREST): CRUD, категории, поиск с эскейпом, health-check, whitelisting полей. |
 | `src/handlers/commands.py` | `/start`, `/menu`, `/help`. |
 | `src/handlers/messages.py` | Маршрутизатор текстовых сообщений (кнопки Reply / URL / fallback), URL-пайплайн, HTML-форматтер рецепта (`format_recipe`). |
-| `src/handlers/callbacks.py` | Диспетчер `callback_data`: `save`/`dont_save`/`show_categories`/`cat_*`/`view_*`/`delete_*`/`back_*`. |
+| `src/handlers/callbacks.py` | Диспетчер `callback_data`: `save`/`dont_save`/`show_categories`/`dishtype_*`/`ingredient_*`/`view_*`/`delete_*`/`back_*`. |
 | `mini_app/index.html` | Vanilla-SPA с тремя экранами (категории / список рецептов / детальный). Ходит напрямую в Supabase REST, `user_id` берёт из `Telegram.WebApp.initDataUnsafe`. |
 | `sql/create_tables.sql` | Идемпотентный DDL для Supabase: таблица `recipes`, индексы, триггер `updated_at`, политики RLS. |
 

@@ -7,16 +7,17 @@
 
     save                — сохранить рецепт из `temp_recipes[user_id]`
     dont_save           — скрыть кнопки под распарсенным рецептом
-    show_categories     — показать список категорий пользователя
+    show_categories     — показать список типов блюд пользователя
     show_help           — показать текст помощи
     feedback            — быстрая форма обратной связи
-    cat_{meal_type}     — показать рецепты в категории
-    view_{recipe_id}    — показать детальный рецепт
+    dishtype_{dish_type} — показать основные ингредиенты внутри типа блюда
+    ingredient_{dish_type}_{main_ingredient} — показать рецепты по паре ключей
+    view_{recipe_id} или view_{dish_type}_{main_ingredient}_{recipe_id} — показать детальный рецепт
     delete_{recipe_id}  — удалить рецепт
     back_to_menu        — вернуться в главное inline-меню
     back_to_categories  — вернуться к списку категорий
 
-Функции показа экранов (:func:`show_categories`, :func:`show_recipes_in_category`,
+Функции показа экранов (:func:`show_categories`, :func:`show_main_ingredients`,
 :func:`show_recipe_detail`) спроектированы так, чтобы их могли
 переиспользовать и :mod:`messages` (при переходе по кнопке Reply-клавиатуры),
 и сам callback-хендлер (при нажатии inline-кнопки). Абстракция —
@@ -37,7 +38,8 @@ from telegram.ext import ContextTypes
 
 from ..keyboards import (
     back_to_menu_keyboard,
-    categories_keyboard,
+    dish_types_keyboard,
+    main_ingredients_keyboard,
     menu_keyboard,
     recipe_detail_keyboard,
     recipes_list_keyboard,
@@ -124,14 +126,43 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     # --- Экраны категорий/рецептов ---------------------------------------- #
-    if data.startswith("cat_"):
-        meal_type = data[len("cat_"):]
-        await show_recipes_in_category(bot, user_id, meal_type, send=query.edit_message_text)
+    if data.startswith("dishtype_"):
+        dish_type = data[len("dishtype_"):]
+        await show_main_ingredients(bot, user_id, dish_type, send=query.edit_message_text)
+        return
+
+    if data.startswith("ingredient_"):
+        tail = data[len("ingredient_"):]
+        parts = tail.split("_", 1)
+        if len(parts) != 2:
+            logger.warning("❓ Некорректный ingredient callback: %r", data)
+            await show_categories(bot, user_id, send=query.edit_message_text)
+            return
+        dish_type, main_ingredient = parts
+        await show_recipes_for_dish_ingredient(
+            bot,
+            user_id,
+            dish_type,
+            main_ingredient,
+            send=query.edit_message_text,
+        )
         return
 
     if data.startswith("view_"):
+        dish_type = ""
+        main_ingredient = ""
         recipe_id = data[len("view_"):]
-        await show_recipe_detail(bot, user_id, recipe_id, send=query.edit_message_text)
+        parts = recipe_id.split("_", 2)
+        if len(parts) == 3:
+            dish_type, main_ingredient, recipe_id = parts
+        await show_recipe_detail(
+            bot,
+            user_id,
+            recipe_id,
+            dish_type=dish_type,
+            main_ingredient=main_ingredient,
+            send=query.edit_message_text,
+        )
         return
 
     if data.startswith("delete_"):
@@ -211,7 +242,7 @@ async def _callback_dont_save(query: CallbackQuery, bot: "RemyBot", user_id: int
 # --------------------------------------------------------------------------- #
 
 async def show_categories(bot: "RemyBot", user_id: int, *, send: SendFn) -> None:
-    """Показать список категорий пользователя.
+    """Показать первый уровень сохранённых рецептов: ``dish_type``.
 
     Args:
         bot: Экземпляр :class:`RemyBot`.
@@ -222,18 +253,18 @@ async def show_categories(bot: "RemyBot", user_id: int, *, send: SendFn) -> None
             для редактирования существующего сообщения.
     """
     try:
-        categories = await bot.storage.get_categories(user_id)
+        dish_types = await bot.storage.get_dish_types(user_id)
     except Exception as exc:  # noqa: BLE001
-        logger.error("❌ Ошибка получения категорий: %s", exc)
+        logger.error("❌ Ошибка получения типов блюд: %s", exc)
         await _invoke_send(
             send,
-            f"❌ Не удалось получить список категорий: <code>{_html_escape_str(str(exc))}</code>",
+            f"❌ Не удалось получить список типов блюд: <code>{_html_escape_str(str(exc))}</code>",
             reply_markup=back_to_menu_keyboard(),
         )
         return
 
-    if not categories:
-        logger.info("📂 Показываю категории: у user %s ещё ничего не сохранено", user_id)
+    if not dish_types:
+        logger.info("📂 Показываю типы блюд: у user %s ещё ничего не сохранено", user_id)
         await _invoke_send(
             send,
             "📭 У тебя пока нет сохранённых рецептов.\n"
@@ -242,26 +273,75 @@ async def show_categories(bot: "RemyBot", user_id: int, *, send: SendFn) -> None
         )
         return
 
-    logger.info("📂 Показываю категории: %d категории", len(categories))
+    logger.info("Показаны типы блюд: %s", dish_types)
     await _invoke_send(
         send,
-        "📚 Твои категории:",
-        reply_markup=categories_keyboard(bot.loc, categories),
+        "📚 Выбери тип блюда:",
+        reply_markup=dish_types_keyboard(bot.loc, dish_types),
     )
 
 
-async def show_recipes_in_category(
+async def show_main_ingredients(
     bot: "RemyBot",
     user_id: int,
-    meal_type: str,
+    dish_type: str,
     *,
     send: SendFn,
 ) -> None:
-    """Показать список рецептов пользователя в указанной категории."""
+    """Показать второй уровень: ``main_ingredient`` внутри ``dish_type``."""
+    dish_key = str(dish_type or "main").strip()
     try:
-        recipes = await bot.storage.get_user_recipes(user_id, meal_type=meal_type)
+        ingredients = await bot.storage.get_main_ingredients(user_id, dish_key)
     except Exception as exc:  # noqa: BLE001
-        logger.error("❌ Ошибка получения рецептов категории %s: %s", meal_type, exc)
+        logger.error("❌ Ошибка получения ингредиентов для %s: %s", dish_key, exc)
+        await _invoke_send(
+            send,
+            f"❌ Не удалось получить ингредиенты: <code>{_html_escape_str(str(exc))}</code>",
+            reply_markup=back_to_menu_keyboard(),
+        )
+        return
+
+    dish_name = bot.loc.get_dish_type_display(dish_key)
+    if not ingredients:
+        await _invoke_send(
+            send,
+            f"📭 В разделе {dish_name} пока пусто.",
+            reply_markup=main_ingredients_keyboard(bot.loc, dish_key, []),
+        )
+        return
+
+    logger.info("Показаны ингредиенты для %s: %s", dish_key, ingredients)
+    await _invoke_send(
+        send,
+        f"{dish_name}: выбери основной ингредиент",
+        reply_markup=main_ingredients_keyboard(bot.loc, dish_key, ingredients),
+    )
+
+
+async def show_recipes_for_dish_ingredient(
+    bot: "RemyBot",
+    user_id: int,
+    dish_type: str,
+    main_ingredient: str,
+    *,
+    send: SendFn,
+) -> None:
+    """Показать рецепты по паре ``dish_type`` / ``main_ingredient``."""
+    dish_key = str(dish_type or "main").strip()
+    ingredient_key = str(main_ingredient or "other").strip()
+    try:
+        recipes = await bot.storage.get_recipes_by_dish_and_ingredient(
+            user_id,
+            dish_key,
+            ingredient_key,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.error(
+            "❌ Ошибка получения рецептов для %s/%s: %s",
+            dish_key,
+            ingredient_key,
+            exc,
+        )
         await _invoke_send(
             send,
             f"❌ Не удалось получить рецепты: <code>{_html_escape_str(str(exc))}</code>",
@@ -269,26 +349,21 @@ async def show_recipes_in_category(
         )
         return
 
-    category_name = bot.loc.get_meal_type_display(meal_type)
-    logger.info(
-        "📖 Категория %s: %d рецептов (user %s)",
-        meal_type,
-        len(recipes),
-        user_id,
-    )
-
+    dish_name = bot.loc.get_dish_type_display(dish_key)
+    ingredient_name = bot.loc.get_main_ingredient_display(ingredient_key)
     if not recipes:
         await _invoke_send(
             send,
-            f"📭 В категории {category_name} пока пусто.",
-            reply_markup=back_to_menu_keyboard(),
+            f"📭 В разделе {dish_name} / {ingredient_name} пока пусто.",
+            reply_markup=recipes_list_keyboard([], dish_key, ingredient_key),
         )
         return
 
+    logger.info("Показаны рецепты для %s/%s", dish_key, ingredient_key)
     await _invoke_send(
         send,
-        f"{category_name} — {len(recipes)} шт.",
-        reply_markup=recipes_list_keyboard(recipes),
+        f"{dish_name} / {ingredient_name} — {len(recipes)} шт.",
+        reply_markup=recipes_list_keyboard(recipes, dish_key, ingredient_key),
     )
 
 
@@ -297,6 +372,8 @@ async def show_recipe_detail(
     user_id: int,
     recipe_id: str,
     *,
+    dish_type: str = "",
+    main_ingredient: str = "",
     send: SendFn,
 ) -> None:
     """Показать детальный рецепт с кнопками «🗑 Удалить» / «◀️ Назад»."""
@@ -346,7 +423,7 @@ async def show_recipe_detail(
     await _invoke_send(
         send,
         text,
-        reply_markup=recipe_detail_keyboard(recipe_id),
+        reply_markup=recipe_detail_keyboard(recipe_id, dish_type, main_ingredient),
     )
 
 
