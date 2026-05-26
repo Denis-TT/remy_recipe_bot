@@ -146,6 +146,14 @@ class RemyBot:
         # --- Фото (vision) -----------------------------------------------
         app.add_handler(MessageHandler(filters.PHOTO, messages.handle_photo))
 
+        # --- Команды из Telegram Mini App --------------------------------
+        app.add_handler(
+            MessageHandler(
+                filters.StatusUpdate.WEB_APP_DATA,
+                messages.handle_webapp_data,
+            )
+        )
+
         # --- Произвольный текст ------------------------------------------
         app.add_handler(
             MessageHandler(
@@ -286,6 +294,7 @@ if __name__ == "__main__":
         dish_types_keyboard,
         main_ingredients_keyboard,
         menu_keyboard,
+        recipe_detail_keyboard,
         recipes_list_keyboard,
         save_recipe_keyboard,
     )
@@ -337,5 +346,11 @@ if __name__ == "__main__":
     ]
     assert "view_soup_beef_00000000-0000-0000-0000-000000000001" in recipe_callbacks
     assert "dishtype_soup" in recipe_callbacks
+
+    detail_kb = recipe_detail_keyboard("00000000-0000-0000-0000-000000000001", "soup", "beef")
+    detail_callbacks = [
+        btn.callback_data for row in detail_kb.inline_keyboard for btn in row
+    ]
+    assert "share_00000000-0000-0000-0000-000000000001" in detail_callbacks
 
     print("✅ Smoke-тесты RemyBot пройдены!")

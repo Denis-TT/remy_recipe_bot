@@ -249,11 +249,14 @@ def recipe_detail_keyboard(
     dish_type: str = "",
     main_ingredient: str = "",
 ) -> InlineKeyboardMarkup:
-    """Кнопки под детальным просмотром рецепта: «🗑 Удалить» и «◀️ Назад»."""
+    """Кнопки под детальным просмотром рецепта: «📤 Поделиться», «🗑 Удалить» и «◀️ Назад»."""
     back_callback = "back_to_categories"
     if dish_type and main_ingredient:
         back_callback = f"ingredient_{dish_type}_{main_ingredient}"
     return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("📤 Поделиться", callback_data=f"share_{recipe_id}"),
+        ],
         [
             InlineKeyboardButton("🗑 Удалить", callback_data=f"delete_{recipe_id}"),
             InlineKeyboardButton("◀️ Назад", callback_data=back_callback),

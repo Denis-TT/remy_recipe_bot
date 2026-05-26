@@ -13,6 +13,7 @@
     dishtype_{dish_type} — показать основные ингредиенты внутри типа блюда
     ingredient_{dish_type}_{main_ingredient} — показать рецепты по паре ключей
     view_{recipe_id} или view_{dish_type}_{main_ingredient}_{recipe_id} — показать детальный рецепт
+    share_{recipe_id}   — отправить рецепт в чат как share-сообщение
     delete_{recipe_id}  — удалить рецепт
     back_to_menu        — вернуться в главное inline-меню
     back_to_categories  — вернуться к списку категорий
@@ -163,6 +164,11 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             main_ingredient=main_ingredient,
             send=query.edit_message_text,
         )
+        return
+
+    if data.startswith("share_"):
+        recipe_id = data[len("share_"):]
+        await _callback_share(bot, query, user_id, recipe_id, context)
         return
 
     if data.startswith("delete_"):
@@ -456,6 +462,57 @@ async def _callback_delete(
 
     logger.info("🗑 Рецепт %s удалён (user %s)", recipe_id, user_id)
     await show_categories(bot, user_id, send=query.edit_message_text)
+
+
+async def _callback_share(
+    bot: "RemyBot",
+    query: CallbackQuery,
+    user_id: int,
+    recipe_id: str,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """Отправить сохранённый рецепт в чат как share-сообщение."""
+    message = query.message
+    if message is None:
+        return
+    try:
+        recipe = await bot.storage.get_recipe(recipe_id)
+    except Exception as exc:  # noqa: BLE001
+        logger.error("❌ Ошибка получения рецепта %s для шаринга: %s", recipe_id, exc)
+        try:
+            await message.reply_text("❌ Не удалось загрузить рецепт для шаринга.")
+        except BadRequest:
+            pass
+        return
+
+    if recipe is None:
+        try:
+            await message.reply_text("❌ Рецепт не найден.")
+        except BadRequest:
+            pass
+        return
+
+    owner = recipe.get("user_id")
+    try:
+        is_owner = owner is None or int(owner) == int(user_id)
+    except (TypeError, ValueError):
+        is_owner = False
+    if not is_owner:
+        logger.warning(
+            "⚠️  user %s пытается поделиться чужим рецептом %s (owner=%s)",
+            user_id,
+            recipe_id,
+            owner,
+        )
+        try:
+            await message.reply_text("❌ Рецепт не найден.")
+        except BadRequest:
+            pass
+        return
+
+    from .messages import _send_shared_recipe
+
+    await _send_shared_recipe(message.chat_id, recipe, context.bot)
 
 
 # --------------------------------------------------------------------------- #

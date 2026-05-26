@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import base64
+import json
 import logging
 import os
 import re
@@ -25,7 +26,7 @@ from html import escape as _html_escape
 from io import BytesIO
 from typing import TYPE_CHECKING, Any, List, Mapping, Optional
 
-from telegram import InputFile, Message, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputFile, Message, Update
 from telegram.constants import ParseMode
 from telegram.error import BadRequest
 from telegram.ext import ContextTypes
@@ -38,6 +39,7 @@ from ..keyboards import (
     save_recipe_keyboard,
 )
 from ..normalizer import MAX_IMAGE_BYTES
+from ..localization import Localization
 from . import callbacks, commands
 
 if TYPE_CHECKING:
@@ -84,6 +86,10 @@ _TG_PHOTO_CAPTION_BODY_MAX: int = 1000
 # Уменьшение превью перед sendPhoto (стабильнее на Railway).
 _TG_PHOTO_MAX_SIDE: int = 512
 _TG_PHOTO_JPEG_QUALITY: int = 85
+
+# Публичная ссылка на бота в сообщениях «Поделиться рецептом».
+_REMY_BOT_URL: str = "https://t.me/remy_recipe_bot"
+_REMY_BOT_USERNAME: str = "@remy_recipe_bot"
 
 
 # --------------------------------------------------------------------------- #
@@ -298,6 +304,50 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         _NOT_A_URL_HINT,
         reply_markup=main_menu_keyboard(),
     )
+
+
+async def handle_webapp_data(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обработать команды из Telegram Mini App через WebAppData."""
+    message = update.effective_message
+    user = update.effective_user
+    if message is None or user is None or message.web_app_data is None:
+        return
+
+    raw = message.web_app_data.data or ""
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        logger.warning("Некорректный WebAppData JSON: %s", exc)
+        await message.reply_text("❌ Не удалось обработать запрос из Mini App.")
+        return
+
+    if not isinstance(data, Mapping):
+        logger.warning("Некорректный WebAppData payload: %r", data)
+        return
+
+    action = str(data.get("action") or "").strip()
+    if action != "share_recipe":
+        logger.info("Неизвестное действие WebAppData: %s", action)
+        return
+
+    recipe_id = str(data.get("recipe_id") or "").strip()
+    if not recipe_id:
+        await message.reply_text("❌ Не удалось определить рецепт для шаринга.")
+        return
+
+    bot = _get_bot(context)
+    try:
+        recipe = await bot.storage.get_recipe(recipe_id)
+    except Exception as exc:  # noqa: BLE001
+        logger.error("❌ Ошибка получения рецепта для WebApp share %s: %s", recipe_id, exc)
+        await message.reply_text("❌ Не удалось загрузить рецепт для шаринга.")
+        return
+
+    if recipe is None or not _recipe_belongs_to_user(recipe, user.id):
+        await message.reply_text("❌ Рецепт не найден.")
+        return
+
+    await _send_shared_recipe(message.chat_id, recipe, context.bot)
 
 
 def _guess_image_mime(head: bytes) -> str:
@@ -603,6 +653,132 @@ format_recipe_for_telegram = format_recipe
 
 
 # --------------------------------------------------------------------------- #
+# Шаринг рецепта
+# --------------------------------------------------------------------------- #
+
+def _recipe_belongs_to_user(recipe: Mapping[str, Any], user_id: int) -> bool:
+    owner = recipe.get("user_id")
+    if owner is None:
+        return True
+    try:
+        return int(owner) == int(user_id)
+    except (TypeError, ValueError):
+        return False
+
+
+def _shared_recipe_markup() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Открыть Remy", url=_REMY_BOT_URL)],
+    ])
+
+
+def _public_image_url(recipe: Mapping[str, Any]) -> str:
+    img = str(recipe.get("image_url") or "").strip()
+    if img.startswith(("http://", "https://")):
+        return img
+    return ""
+
+
+def _shared_meta_line(recipe: Mapping[str, Any], loc: Localization) -> str:
+    cuisine = loc.get_cuisine_name(recipe.get("cuisine") or "other")
+    dish = loc.get_dish_type_display(recipe.get("dish_type") or "main")
+    total = _int(recipe.get("total_time"))
+    nutrition = recipe.get("nutrition_per_serving") or {}
+    calories = _int(nutrition.get("calories")) if isinstance(nutrition, Mapping) else 0
+
+    parts: List[str] = []
+    if cuisine:
+        parts.append(f"🍽 {cuisine}")
+    if dish:
+        parts.append(f"📋 {dish}")
+    if total:
+        parts.append(f"⏱ {total} мин")
+    if calories:
+        parts.append(f"🔥 {calories} ккал/порция")
+    return " | ".join(parts)
+
+
+def _format_shared_recipe(recipe: Mapping[str, Any]) -> str:
+    """Собрать красивый HTML-текст для пересылки рецепта другим пользователям."""
+    loc = Localization("ru")
+    title = _html_escape(str(recipe.get("title") or "Без названия").strip())
+    lines: List[str] = [f"<b>🍲 {title}</b>"]
+
+    meta = _shared_meta_line(recipe, loc)
+    if meta:
+        lines.extend(["", _html_escape(meta)])
+
+    ingredients = recipe.get("ingredients") or []
+    if ingredients:
+        lines.extend(["", "🛒 <b>Ингредиенты:</b>"])
+        for ing in list(ingredients)[:20]:
+            lines.append("• " + _html_escape(_format_ingredient(ing)))
+
+    steps = recipe.get("steps") or []
+    if steps:
+        lines.extend(["", "📝 <b>Приготовление:</b>"])
+        for idx, step in enumerate(list(steps)[:12], 1):
+            desc = str(step.get("description") or "").strip() if isinstance(step, Mapping) else str(step).strip()
+            if not desc:
+                continue
+            num = _int(step.get("step_number")) if isinstance(step, Mapping) else idx
+            lines.append(f"{num or idx}. {_html_escape(desc)}")
+
+    lines.extend([
+        "",
+        "👨‍🍳 <b>Рецепт приготовлен ботом Remy!</b>",
+        f"Попробуй и ты: {_html_escape(_REMY_BOT_USERNAME)}",
+    ])
+    return "\n".join(lines)
+
+
+def _truncate_html_message(text: str, limit: int) -> str:
+    """Укоротить HTML-сообщение, сохранив закрывающие теги."""
+    if len(text) <= limit:
+        return text
+    ell = "\n…"
+    budget = max(0, limit - len(ell) - 32)
+    cut = text[:budget]
+    sp = cut.rfind("\n")
+    if sp > budget // 2:
+        cut = cut[:sp]
+    cut = re.sub(r"<[^>]*$", "", cut).rstrip()
+    return _close_open_html_tags(cut) + ell
+
+
+async def _send_shared_recipe(chat_id: int, recipe: Mapping[str, Any], bot: Any) -> None:
+    """Отправить рецепт для шаринга с промо-кнопкой Remy."""
+    text = _format_shared_recipe(recipe)
+    markup = _shared_recipe_markup()
+    title = str(recipe.get("title") or "Без названия").strip()
+    image_url = _public_image_url(recipe)
+
+    if image_url:
+        caption = _truncate_html_message(text, _TG_PHOTO_CAPTION_LIMIT)
+        try:
+            await bot.send_photo(
+                chat_id=chat_id,
+                photo=image_url,
+                caption=caption or " ",
+                parse_mode=ParseMode.HTML,
+                reply_markup=markup,
+            )
+            logger.info("Рецепт %s отправлен для шаринга", title)
+            return
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Не удалось отправить shared recipe с фото: %s; отправляю текстом", exc)
+
+    await bot.send_message(
+        chat_id=chat_id,
+        text=_truncate_html_message(text, _TG_MESSAGE_LIMIT),
+        parse_mode=ParseMode.HTML,
+        reply_markup=markup,
+        disable_web_page_preview=True,
+    )
+    logger.info("Рецепт %s отправлен для шаринга", title)
+
+
+# --------------------------------------------------------------------------- #
 # Вспомогательные функции
 # --------------------------------------------------------------------------- #
 
@@ -757,5 +933,42 @@ if __name__ == "__main__":
     _cap = _html_caption_for_photo(_cap_src)
     assert len(_cap) <= _TG_PHOTO_CAPTION_LIMIT
     assert "…" in _cap or len(_cap_src) <= _TG_PHOTO_CAPTION_LIMIT
+
+    _shared = dict(_demo)
+    _shared.update({
+        "title": "Блины",
+        "cuisine": "russian",
+        "dish_type": "baking",
+        "total_time": 30,
+        "nutrition_per_serving": {"calories": 350},
+        "ingredients": [
+            {"name": "Мука", "amount": 500, "unit": "г", "notes": ""},
+            {"name": "Яйца", "amount": 2, "unit": "шт", "notes": ""},
+        ],
+        "steps": [
+            {"step_number": 1, "description": "Разогреть сковороду."},
+            {"step_number": 2, "description": "Смешать все ингредиенты."},
+        ],
+    })
+    _shared_text = _format_shared_recipe(_shared)
+    assert "🍲 Блины" in _shared_text
+    assert "500 г Мука" in _shared_text
+    assert "2 шт Яйца" in _shared_text
+    assert "Рецепт приготовлен ботом Remy" in _shared_text
+    assert _REMY_BOT_USERNAME in _shared_text
+
+    _mock_bot = MagicMock()
+    _mock_bot.send_message = AsyncMock()
+    _mock_bot.send_photo = AsyncMock()
+
+    async def _run_share_text() -> None:
+        await _send_shared_recipe(123, _shared, _mock_bot)
+
+    asyncio.run(_run_share_text())
+    _mock_bot.send_message.assert_called_once()
+    _share_kwargs = _mock_bot.send_message.call_args.kwargs
+    assert _share_kwargs.get("parse_mode") == ParseMode.HTML
+    assert _share_kwargs.get("reply_markup") is not None
+    assert len(_share_kwargs.get("text") or "") <= _TG_MESSAGE_LIMIT
 
     print("✅ format_recipe + _present_recipe_with_optional_photo (мок)")

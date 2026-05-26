@@ -225,6 +225,31 @@
         .recipe-delete-btn:not(:disabled):active {
             background: rgba(255, 59, 48, 0.2);
         }
+        .recipe-action-stack {
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+            margin: 20px 0 0;
+        }
+        .recipe-share-btn {
+            width: 100%;
+            min-height: 48px;
+            box-sizing: border-box;
+            padding: 0 16px;
+            font-size: 15px;
+            font-weight: 600;
+            color: #fff;
+            background: #2AABEE;
+            border: 1px solid #2AABEE;
+            border-radius: 12px;
+            cursor: pointer;
+            -webkit-tap-highlight-color: transparent;
+            touch-action: manipulation;
+            transition: background 0.12s ease, opacity 0.12s ease;
+        }
+        .recipe-share-btn:active {
+            background: #229ED9;
+        }
 
         /* Модалка подтверждения удаления (fallback, если showPopup недоступен) */
         .delete-confirm-overlay {
@@ -1993,8 +2018,16 @@
             }
 
             if (!IS_DEMO && (r.id != null && r.id !== "")) {
-                const wrap = el("div", { class: "recipe-delete-wrap" });
+                const wrap = el("div", { class: "recipe-action-stack" });
                 const idStr = r.id;
+                wrap.appendChild(el("button", {
+                    class: "recipe-share-btn",
+                    type: "button",
+                    onclick: function (ev) {
+                        ev.preventDefault();
+                        shareRecipe(idStr);
+                    }
+                }, ["📤 Поделиться"]));
                 wrap.appendChild(el("button", {
                     class: "recipe-delete-btn",
                     type: "button",
@@ -2234,6 +2267,18 @@
                 } catch (e) { /* fallback: своя модалка */ }
             }
             showDeleteConfirmModal(onDelete);
+        }
+
+        function shareRecipe(recipeId) {
+            if (IS_DEMO) return;
+            if (!tg || typeof tg.sendData !== "function") {
+                alert("Обновите Telegram, чтобы поделиться рецептом из Mini App.");
+                return;
+            }
+            tg.sendData(JSON.stringify({
+                action: "share_recipe",
+                recipe_id: String(recipeId || "")
+            }));
         }
 
         function notifyRecipeDeleted() {
