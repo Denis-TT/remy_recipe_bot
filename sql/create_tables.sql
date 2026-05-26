@@ -118,3 +118,39 @@ CREATE POLICY "Users can view own recipes"   ON recipes FOR SELECT USING (TRUE);
 CREATE POLICY "Users can insert own recipes" ON recipes FOR INSERT WITH CHECK (TRUE);
 CREATE POLICY "Users can update own recipes" ON recipes FOR UPDATE USING (TRUE);
 CREATE POLICY "Users can delete own recipes" ON recipes FOR DELETE USING (TRUE);
+
+
+-- --------------------------------------------------------------------
+-- Supabase Storage: публичный бакет для изображений рецептов
+-- --------------------------------------------------------------------
+-- Бот загружает файлы через Storage REST API:
+--   POST /storage/v1/object/recipe-images/<filename>
+-- Mini App читает их по публичному URL:
+--   /storage/v1/object/public/recipe-images/<filename>
+-- --------------------------------------------------------------------
+INSERT INTO storage.buckets (id, name, public)
+VALUES ('recipe-images', 'recipe-images', TRUE)
+ON CONFLICT (id) DO UPDATE
+SET public = TRUE;
+
+DROP POLICY IF EXISTS "Public can read recipe images" ON storage.objects;
+DROP POLICY IF EXISTS "Clients can upload recipe images" ON storage.objects;
+DROP POLICY IF EXISTS "Clients can update recipe images" ON storage.objects;
+DROP POLICY IF EXISTS "Clients can delete recipe images" ON storage.objects;
+
+CREATE POLICY "Public can read recipe images"
+ON storage.objects FOR SELECT
+USING (bucket_id = 'recipe-images');
+
+CREATE POLICY "Clients can upload recipe images"
+ON storage.objects FOR INSERT
+WITH CHECK (bucket_id = 'recipe-images');
+
+CREATE POLICY "Clients can update recipe images"
+ON storage.objects FOR UPDATE
+USING (bucket_id = 'recipe-images')
+WITH CHECK (bucket_id = 'recipe-images');
+
+CREATE POLICY "Clients can delete recipe images"
+ON storage.objects FOR DELETE
+USING (bucket_id = 'recipe-images');

@@ -371,12 +371,12 @@ class SupabaseStorage(BaseStorage):
                     resp_text = await response.text(errors="replace")
                     if response.status not in (200, 201):
                         logger.error(
-                            "Не удалось загрузить изображение в Storage (HTTP %s): %s",
+                            "Ошибка загрузки изображения в Supabase (HTTP %s): %s",
                             response.status,
                             self._truncate(resp_text, 300),
                         )
                         return None
-            logger.info("Изображение загружено в Supabase Storage: %s", public_url)
+            logger.info("Изображение загружено в Supabase: %s", public_url)
             return public_url
         except asyncio.TimeoutError:
             logger.error("Таймаут загрузки изображения в Storage: %s", path)
@@ -545,6 +545,11 @@ if __name__ == "__main__":
             public = await storage_mock.upload_image(img_file)
         assert public is not None and "recipe-images" in public
         assert public.startswith("https://test.supabase.co/storage/v1/object/public/")
+        called_url = mock_sess.post.call_args.args[0]
+        called_headers = mock_sess.post.call_args.kwargs["headers"]
+        assert called_url.startswith("https://test.supabase.co/storage/v1/object/recipe-images/")
+        assert called_headers["Authorization"] == "Bearer test-key"
+        assert called_headers["Content-Type"] == "image/jpeg"
         print("✅ upload_image (мок aiohttp)")
 
         url = os.getenv("SUPABASE_URL", "")
