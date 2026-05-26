@@ -5,7 +5,8 @@
 * `WebParser` — обычные HTTP(S)-страницы с рецептами.
 * `YouTubeParser` — заголовок и описание через YouTube Data API v3; субтитры — Apify Actor
   ``pintostudio~youtube-transcript-scraper`` (при наличии ``APIFY_API_TOKEN``).
-* `InstagramParser` — Reels и посты через Apify Actor ``crawlerbros~instagram-transcript-scraper`` (ввод ``videoUrls``).
+* `InstagramParser` — Reels и посты через Apify Actor
+  ``apple_yang~instagram-transcripts-scraper`` (ввод ``videoUrl``).
 * `ParserRegistry` / `create_parser_registry` — маршрутизация и фабрика.
 """
 
@@ -423,8 +424,8 @@ def _strip_youtube_title_text(text: str) -> str:
 
 # Apify Actor (субтитры YouTube). Официальный список items: GET /v2/actor-runs/{runId}/dataset/items
 APIFY_TRANSCRIPT_ACTOR = "pintostudio~youtube-transcript-scraper"
-# Instagram: краулер `crawlerbros~instagram-transcript-scraper` (ввод: ``videoUrls``: [url]).
-APIFY_INSTAGRAM_TRANSCRIPT_ACTOR = "crawlerbros~instagram-transcript-scraper"
+# Instagram: https://apify.com/apple_yang/instagram-transcripts-scraper
+APIFY_INSTAGRAM_TRANSCRIPT_ACTOR = "apple_yang~instagram-transcripts-scraper"
 # Дольше, чем YouTube — транскрипт Instagram может обрабатываться минутами.
 APIFY_INSTAGRAM_WAIT_FINISH_SEC = 300
 APIFY_WAIT_FINISH_SEC = 120
@@ -502,47 +503,6 @@ def _apify_segments_from_transcript_list(tr_list: list) -> List[str]:
         except (TypeError, ValueError, AttributeError):
             continue
     return out
-
-
-def _apify_raw_segment_list(payload: Any, _depth: int = 0) -> List[str]:
-    """Плоский список текстов сегментов (без склейки), в т.ч. для ``item["data"]`` в списках."""
-    max_depth = 6
-    if _depth > max_depth or payload is None:
-        return []
-    try:
-        if isinstance(payload, str):
-            s = payload.strip()
-            return [s] if s else []
-        if isinstance(payload, dict):
-            if "data" in payload and payload.get("data") is not None:
-                return _apify_raw_segment_list(payload["data"], _depth + 1)
-            tr = payload.get("transcript")
-            if isinstance(tr, list) and tr:
-                return _apify_segments_from_transcript_list(tr)
-            for key in ("text", "subtitleText", "chunk"):
-                v = payload.get(key)
-                try:
-                    if isinstance(v, str) and v.strip():
-                        return [v.strip()]
-                    if v is not None and not isinstance(v, (dict, list)):
-                        s = str(v).strip()
-                        if s:
-                            return [s]
-                except (TypeError, ValueError, AttributeError):
-                    continue
-            return []
-        if isinstance(payload, list):
-            acc: List[str] = []
-            for it in payload:
-                if isinstance(it, str):
-                    if it.strip():
-                        acc.append(it.strip())
-                elif isinstance(it, dict):
-                    acc.extend(_apify_raw_segment_list(it, _depth + 1))
-            return acc
-        return []
-    except (TypeError, ValueError, AttributeError):
-        return []
 
 
 def _apify_extract_subtitles_payload(
@@ -646,10 +606,22 @@ def _apify_extract_subtitles_payload(
                             saw_empty_data = True
                             continue
                         if data_val is not None:
-                            nested = _apify_raw_segment_list(data_val, _depth + 1)
-                            if nested:
+                            nested_parts = (
+                                _apify_segments_from_transcript_list(data_val)
+                                if isinstance(data_val, list)
+                                else []
+                            )
+                            if nested_parts:
                                 used_list_item_data = True
-                                parts.extend(nested)
+                                parts.extend(nested_parts)
+                                continue
+                            nested_text, nested_n, _nested_tag = _apify_extract_subtitles_payload(
+                                data_val,
+                                _depth + 1,
+                            )
+                            if nested_n > 0 and nested_text:
+                                used_list_item_data = True
+                                parts.append(nested_text)
                                 continue
                     tr = item.get("transcript")
                     if isinstance(tr, list) and tr:
@@ -885,140 +857,70 @@ def _instagram_safe_str(value: Any) -> str:
     return str(value).strip()
 
 
-def _instagram_transcript_to_text(transcript: Any) -> str:
-    if transcript is None:
+def _instagram_segments_to_text(segments: Any) -> str:
+    """Склеить ``segments`` нового Instagram Actor в один текст."""
+    if not isinstance(segments, list):
         return ""
-    if isinstance(transcript, str):
-        return transcript.strip()
-    if isinstance(transcript, dict):
-        t = transcript.get("text")
-        return _instagram_safe_str(t)
-    if isinstance(transcript, list):
-        parts: List[str] = []
-        for seg in transcript:
-            if isinstance(seg, dict):
-                parts.append(_instagram_safe_str(seg.get("text")))
-            elif isinstance(seg, str) and seg.strip():
-                parts.append(seg.strip())
-        return " ".join(p for p in parts if p)
-    return str(transcript).strip()
+    parts: List[str] = []
+    for seg in segments:
+        if isinstance(seg, dict):
+            text = _instagram_safe_str(seg.get("text"))
+            if text:
+                parts.append(text)
+        elif isinstance(seg, str) and seg.strip():
+            parts.append(seg.strip())
+    return re.sub(r"\s+", " ", " ".join(parts)).strip()
 
 
-def _instagram_unwrap_record(obj: dict) -> dict:
-    inner = obj.get("data")
-    if isinstance(inner, dict):
-        return inner
-    return obj
+def _instagram_author_description(user_name: str, full_name: str) -> str:
+    user = user_name.strip()
+    full = full_name.strip()
+    if user and not user.startswith("@"):
+        user = f"@{user}"
+    if user and full:
+        return f"{user} ({full})"
+    return user or full
 
 
-def _instagram_fields_from_record(rec: dict) -> tuple[str, str, str]:
-    title = _instagram_safe_str(
-        rec.get("title")
-        or rec.get("captionTitle")
-        or rec.get("videoTitle")
-        or rec.get("postTitle")
-        or rec.get("headline")
+def _instagram_extract_from_item(item: Any) -> tuple[str, str, str]:
+    """Разобрать один объект Actor ``apple_yang~instagram-transcripts-scraper``."""
+    if not isinstance(item, dict):
+        return "", "", ""
+
+    err_msg = _instagram_safe_str(item.get("errMsg"))
+    title = _instagram_safe_str(item.get("title"))
+    description = _instagram_author_description(
+        _instagram_safe_str(item.get("userName")),
+        _instagram_safe_str(item.get("userFullName")),
     )
-    description = _instagram_safe_str(
-        rec.get("description")
-        or rec.get("caption")
-        or rec.get("postDescription")
-        or rec.get("post_text")
-        or rec.get("text")
-    )
-    transcript_text = _instagram_transcript_to_text(rec.get("transcript"))
+
+    if err_msg:
+        logger.error("Ошибка получения Instagram субтитров: %s", err_msg)
+        return title, description, ""
+
+    transcript_text = _instagram_safe_str(item.get("text"))
     if not transcript_text:
-        transcript_text = _instagram_safe_str(
-            rec.get("fullText")
-            or rec.get("transcriptText")
-            or rec.get("subtitleText")
-        )
+        transcript_text = _instagram_segments_to_text(item.get("segments"))
+
+    if not transcript_text:
+        logger.warning("Apify не вернул текста субтитров для Instagram")
+
     return title, description, transcript_text
 
 
-def _instagram_items_look_like_segment_rows(rows: List[dict]) -> bool:
-    """Строки датасета `crawlerbros~instagram-transcript-scraper` (сегменты)."""
-    if not rows:
-        return False
-    d0 = rows[0]
-    return any(
-        k in d0
-        for k in ("fullText", "segmentText", "segmentIndex", "totalSegments", "transcriptionMethod")
-    )
-
-
-def _instagram_fields_from_segment_rows(rows: List[dict]) -> tuple[str, str, str]:
-    """Собрать title / description / транскрипт из нескольких строк сегментов."""
-    ok = [r for r in rows if isinstance(r, dict) and not (str(r.get("errMsg") or "").strip())]
-    if not ok:
-        ok = [r for r in rows if isinstance(r, dict)]
-    if not ok:
-        return "", "", ""
-
-    first = ok[0]
-    caption = _instagram_safe_str(first.get("title"))
-    user = _instagram_safe_str(first.get("userName"))
-    full_name = _instagram_safe_str(first.get("userFullName"))
-    desc_parts = [p for p in (f"@{user}" if user else "", full_name) if p]
-    description = " · ".join(desc_parts)
-    title = caption if caption else (f"@{user}" if user else "")
-
-    full_text = _instagram_safe_str(first.get("fullText"))
-    if not full_text:
-        indexed: List[tuple[tuple[int, int], str]] = []
-        for ord_i, r in enumerate(ok):
-            st = _instagram_safe_str(r.get("segmentText"))
-            if not st:
-                continue
-            idx_raw = r.get("segmentIndex")
-            try:
-                idx_int = int(idx_raw)  # type: ignore[arg-type]
-            except (TypeError, ValueError):
-                idx_int = ord_i
-            indexed.append(((idx_int, ord_i), st))
-        indexed.sort(key=lambda x: x[0])
-        full_text = " ".join(s for _, s in indexed)
-
-    return title, description, full_text
-
-
-def _instagram_extract_from_items(items_payload: Any) -> Optional[tuple[str, str, str]]:
-    """Разобрать тело GET dataset items: один объект, legacy или список сегментов."""
-    if items_payload is None:
-        return None
-    if isinstance(items_payload, dict):
-        rec = _instagram_unwrap_record(items_payload)
-        return _instagram_fields_from_record(rec) if rec else None
-
-    if isinstance(items_payload, list):
-        dicts: List[dict] = []
-        for x in items_payload:
-            if isinstance(x, dict):
-                u = _instagram_unwrap_record(x)
-                if u:
-                    dicts.append(u)
-        if not dicts:
-            return None
-        if _instagram_items_look_like_segment_rows(dicts):
-            return _instagram_fields_from_segment_rows(dicts)
-        for d in dicts:
-            tup = _instagram_fields_from_record(d)
-            if tup[0] or tup[1] or tup[2]:
-                return tup
-        return _instagram_fields_from_record(dicts[0])
-
-    return None
-
-
 class InstagramParser(BaseParser):
-    """Instagram Reels и посты через Apify ``crawlerbros~instagram-transcript-scraper``."""
+    """Instagram Reels и посты через Apify ``apple_yang~instagram-transcripts-scraper``.
+
+    Actor: https://apify.com/apple_yang/instagram-transcripts-scraper
+    """
 
     source_type: str = "instagram"
     generate_image_default: bool = True
     MAX_TEXT_LENGTH: int = 50_000
 
-    def __init__(self, apify_api_token: str = "") -> None:
+    def __init__(self, apify_api_token: str = "", instagram_session_id: str = "") -> None:
         self._apify_api_token = (apify_api_token or "").strip()
+        self.sessionid = (instagram_session_id or "").strip()
 
     @staticmethod
     def _extract_shortcode(url: str) -> str:
@@ -1042,31 +944,6 @@ class InstagramParser(BaseParser):
             )
         )
 
-    @staticmethod
-    def _format_raw_text(
-        *,
-        title: str,
-        description: str,
-        transcript_text: str,
-        url: str,
-        shortcode: str,
-    ) -> str:
-        """Собрать сырой текст с явным разделением метаданных, caption и субтитров."""
-        sections: List[str] = ["Source: Instagram Reel"]
-        if shortcode:
-            sections.append(f"Shortcode: {shortcode}")
-        if url:
-            sections.append(f"URL: {url.strip()}")
-
-        if description:
-            sections.append(f"Author metadata:\n{description}")
-        if title:
-            sections.append(f"Caption:\n{title}")
-        if transcript_text:
-            sections.append(f"Transcript / subtitles:\n{transcript_text}")
-
-        return "\n\n".join(s for s in sections if s and s.strip())
-
     async def parse(self, url: str) -> ParseResult:
         if not self.can_parse(url):
             raise ValueError(f"InstagramParser не поддерживает URL: {url!r}")
@@ -1084,11 +961,15 @@ class InstagramParser(BaseParser):
             f"https://api.apify.com/v2/acts/{APIFY_INSTAGRAM_TRANSCRIPT_ACTOR}/runs"
             f"?waitForFinish={APIFY_INSTAGRAM_WAIT_FINISH_SEC}"
         )
+        body = {"videoUrl": url}
+        if self.sessionid:
+            logger.info("Используется Instagram sessionid")
+            body["sessionid"] = self.sessionid
         envelope = _apify_http_json(
             "POST",
             run_url,
             token,
-            {"videoUrls": [url]},
+            body,
         )
         if not isinstance(envelope, dict):
             logger.error("Ошибка получения Instagram субтитров")
@@ -1106,17 +987,15 @@ class InstagramParser(BaseParser):
 
         items_url = f"https://api.apify.com/v2/actor-runs/{run_id}/dataset/items?format=json"
         items_payload = _apify_http_json("GET", items_url, token, None)
-        triple = _instagram_extract_from_items(items_payload)
-        if not triple:
-            logger.error("Ошибка получения Instagram субтитров")
-            return "", "", ""
-
-        title, description, transcript_text = triple
+        item: Any = items_payload
+        if isinstance(items_payload, list):
+            item = items_payload[0] if items_payload else None
+        title, description, transcript_text = _instagram_extract_from_item(item)
         if not (title or description or transcript_text):
             logger.error("Ошибка получения Instagram субтитров")
             return "", "", ""
 
-        logger.info("Получены данные через Apify Instagram Transcript Scraper")
+        logger.info("Получены данные через Apify Instagram Transcripts Scraper")
         return title, description, transcript_text
 
     def _parse_sync(self, url: str) -> str:
@@ -1138,13 +1017,8 @@ class InstagramParser(BaseParser):
             logger.error("Ошибка получения Instagram субтитров")
             raise RuntimeError("Не удалось извлечь текст из Instagram (пустой ответ Apify)")
 
-        text = self._format_raw_text(
-            title=title,
-            description=description,
-            transcript_text=transcript_text,
-            url=url,
-            shortcode=shortcode,
-        )
+        chunks = [title, description, transcript_text]
+        text = "\n\n".join(c for c in chunks if c and str(c).strip())
 
         if not text.strip():
             logger.error("Ошибка получения Instagram субтитров")
@@ -1192,15 +1066,21 @@ class ParserRegistry:
 
 
 def create_parser_registry(cfg: Optional[object] = None) -> ParserRegistry:
-    """Реестр: YouTube, Instagram, Web. Передаются ``youtube_api_key`` и ``apify_api_token``."""
+    """Реестр: YouTube, Instagram, Web. Передаются ключи API и Instagram sessionid."""
     if cfg is None:
         from config import config as _cfg
         cfg = _cfg
     api_key = str(getattr(cfg, "youtube_api_key", "") or "")
     apify_tok = str(getattr(cfg, "apify_api_token", "") or "")
+    instagram_session_id = str(getattr(cfg, "instagram_session_id", "") or "")
     registry = ParserRegistry()
     registry.register(YouTubeParser(youtube_api_key=api_key, apify_api_token=apify_tok))
-    registry.register(InstagramParser(apify_api_token=apify_tok))
+    registry.register(
+        InstagramParser(
+            apify_api_token=apify_tok,
+            instagram_session_id=instagram_session_id,
+        )
+    )
     registry.register(WebParser())
     return registry
 
@@ -1284,6 +1164,7 @@ if __name__ == "__main__":
         assert YouTubeParser.generate_image_default is True
         assert InstagramParser.generate_image_default is True
         mod = sys.modules[__name__]
+        this_mod = mod
         wp = WebParser()
         og_u = wp._extract_og_image_url(
             '<html><meta property="og:image" content="https://img.test/hero.jpg"/></html>',
@@ -1342,7 +1223,8 @@ if __name__ == "__main__":
             assert "Борщ" in call_kw.get("prompt", "")
 
             mock_client.text_to_image.side_effect = RuntimeError("fal-ai недоступен")
-            path_fail = await mod._generate_and_save_image("Суп", hf_api_key="hf_test")
+            with patch("huggingface_hub.InferenceClient", return_value=mock_client):
+                path_fail = await mod._generate_and_save_image("Суп", hf_api_key="hf_test")
             assert path_fail is None
         print("✅ FLUX.1-dev _generate_and_save_image (мок InferenceClient)")
 
@@ -1351,6 +1233,8 @@ if __name__ == "__main__":
         assert rd.get("image_url") is None
         with patch.object(mod, "_generate_and_save_image", new_callable=AsyncMock) as gm:
             mock_path = os.path.join(td_pol, "mock.jpg")
+            with open(mock_path, "wb") as fh:
+                fh.write(b"\xff\xd8\xff\xd9")
             gm.return_value = mock_path
             yt_dummy = YouTubeParser(youtube_api_key="x", apify_api_token="")
             rd2 = {"raw_text": "Плов узбекский", "image_url": None}
@@ -1370,33 +1254,52 @@ if __name__ == "__main__":
         assert InstagramParser._extract_shortcode("https://www.instagram.com/p/xY9_/") == "xY9_"
         assert not InstagramParser.can_parse("https://www.youtube.com/watch?v=dQw4w9WgXcQ")
         assert not InstagramParser.can_parse("")
-        ig_actor_ds = [
-            {
-                "url": "https://www.instagram.com/reel/TEST123/",
-                "code": "TEST123",
-                "title": "Шоколадный торт #рецепт",
-                "userName": "baker_maria",
-                "userFullName": "Мария П.",
-                "fullText": "Смешать яйца и сахар. Добавить муку.",
-                "segmentIndex": 0,
-                "segmentText": "Смешать яйца и сахар.",
-                "errMsg": "",
-            },
-            {
-                "title": "Шоколадный торт #рецепт",
-                "userName": "baker_maria",
-                "userFullName": "Мария П.",
-                "fullText": "Смешать яйца и сахар. Добавить муку.",
-                "segmentIndex": 1,
-                "segmentText": "Добавить муку.",
-                "errMsg": "",
-            },
-        ]
-        ig_t, ig_d, ig_tr = _instagram_extract_from_items(ig_actor_ds)
+        ig_actor_item = {
+            "title": "Шоколадный торт #рецепт",
+            "userName": "baker_maria",
+            "userFullName": "Мария П.",
+            "text": "Смешать яйца и сахар. Добавить муку.",
+            "segments": [
+                {"start": 0.0, "end": 3.1, "text": "Смешать яйца и сахар."},
+                {"start": 3.2, "end": 5.4, "text": "Добавить муку."},
+            ],
+            "errMsg": "",
+        }
+        ig_t, ig_d, ig_tr = _instagram_extract_from_item(ig_actor_item)
         assert "торт" in ig_t
         assert "baker_maria" in ig_d
         assert "муку" in ig_tr
-        print("✅ Instagram can_parse / shortcode + мок crawlerbros dataset")
+        ig_seg_t, ig_seg_d, ig_seg_tr = _instagram_extract_from_item({
+            "title": "Сырники",
+            "userName": "chef",
+            "segments": [
+                {"start": 0, "end": 1, "text": "Берем творог."},
+                {"start": 1, "end": 2, "text": "Жарим на сковороде."},
+            ],
+        })
+        assert ig_seg_t == "Сырники"
+        assert "@chef" in ig_seg_d
+        assert "творог" in ig_seg_tr and "Жарим" in ig_seg_tr
+        print("✅ Instagram can_parse / shortcode + мок apple_yang dataset")
+
+        apify_calls: List[tuple[str, str, dict[str, Any] | None]] = []
+
+        def _mock_ig_apify(method: str, req_url: str, token: str, body: Optional[dict[str, Any]] = None):
+            apify_calls.append((method, req_url, body))
+            if method == "POST":
+                return {"data": {"id": "run-ig"}}
+            return [ig_actor_item]
+
+        with patch.object(this_mod, "_apify_http_json", side_effect=_mock_ig_apify):
+            ig_live_mock = InstagramParser(
+                apify_api_token="dummy-apify",
+                instagram_session_id="session-test",
+            )._fetch_via_apify("https://www.instagram.com/reel/TEST123/")
+        assert "торт" in ig_live_mock[0]
+        assert apify_calls[0][2] == {
+            "videoUrl": "https://www.instagram.com/reel/TEST123/",
+            "sessionid": "session-test",
+        }
 
         with patch.object(
             InstagramParser,
@@ -1407,9 +1310,6 @@ if __name__ == "__main__":
                 "https://www.instagram.com/reel/xyz123xxxxx/",
             )
         assert "IG Title" in ig_out.text and "Описание" in ig_out.text and "субтитров" in ig_out.text
-        assert "Source: Instagram Reel" in ig_out.text
-        assert "Caption:" in ig_out.text
-        assert "Transcript / subtitles:" in ig_out.text
         print("✅ Instagram parse() с моком Apify")
 
         no_key = YouTubeParser(youtube_api_key="")
