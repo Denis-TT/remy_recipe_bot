@@ -254,6 +254,10 @@ flowchart TD
 | `is_vegetarian`, `is_vegan`, `is_gluten_free`, `is_lactose_free` | `BOOLEAN` | — |
 | `created_at`, `updated_at` | `TIMESTAMPTZ` | Триггер `trg_recipes_set_updated_at` обновляет `updated_at` на каждом `UPDATE` |
 
+`ingredients` хранится как массив объектов `{name, amount, unit, notes, estimated}`.
+`estimated=true` означает, что граммовка была оценена ИИ, потому что источник не
+содержал точного количества; Mini App показывает такую оценку со звёздочкой.
+
 Индексы: `user_id`, `meal_type`, составной `(user_id, meal_type)` и
 `created_at DESC`. Достаточно для всех текущих запросов.
 

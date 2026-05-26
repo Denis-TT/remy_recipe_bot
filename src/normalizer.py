@@ -8,7 +8,8 @@ GitHub Models API (совместимый с OpenAI Chat Completions) и
 
 * `title`, `description`, `cuisine`, `meal_type`, `dish_type`, `main_ingredient`, `difficulty`,
 * `prep_time`, `cook_time`, `total_time`, `servings`,
-* `ingredients` (список словарей), `steps` (список словарей),
+* `ingredients` (список словарей `{name, amount, unit, notes, estimated}`),
+  `steps` (список словарей),
 * `nutrition_per_serving`, `nutrition` (на 100 г),
 * `tips`, `storage`, `tags`,
 * булевы флаги диет (`is_vegetarian`, `is_vegan`, ...).
@@ -65,7 +66,7 @@ Return ONLY a valid JSON object with this EXACT structure:
     "total_time": 60,
     "servings": 4,
     "ingredients": [
-        {"name": "Мука пшеничная", "amount": 200, "unit": "г", "notes": "просеянная"}
+        {"name": "Мука пшеничная", "amount": 200, "unit": "г", "notes": "просеянная", "estimated": false}
     ],
     "steps": [
         {"step_number": 1, "description": "Разогреть духовку до 180°C"}
@@ -99,6 +100,7 @@ Never paste the full description or a raw ingredient list into "steps". Each ste
 GROUNDING RULES (mandatory):
 1. Use ONLY information that appears in the provided source text. Do not invent facts.
 2. If a parameter is missing in the text, you may give a realistic estimate ONLY if necessary for valid JSON; set the corresponding confidence key to "low" or "medium" and mention the assumption briefly in "description" or in ingredient/step "notes".
+2a. Ingredient amounts: every ingredient object MUST include boolean "estimated". If the source explicitly gives the amount, set "estimated": false. If the source omits the amount, estimate a realistic amount from recipe context, servings, and other ingredients, set "estimated": true, and use unit "г", "мл", or "шт". Always return "amount" as a number or numeric string. For ingredients like "соль по вкусу", use amount 0 or a small default such as 1, keep "по вкусу" in notes, and set "estimated": true if no exact source amount exists.
 3. Do NOT invent ingredients, cooking steps, or times that are not implied by the source. If the text does not list ingredients or steps, return minimal empty lists and set confidence.ingredients / confidence.steps to "low".
 4. Do NOT fabricate nutrition numbers: if the source does not allow a grounded estimate, use zeros and set confidence.nutrition to "low".
 5. If the source is contradictory, choose the most probable interpretation, set confidence for affected blocks to "medium" or "low", and briefly note the ambiguity in "description".
@@ -811,14 +813,46 @@ class RecipeNormalizer:
 
     @staticmethod
     def _normalize_ingredient(raw: Any) -> Dict[str, Any]:
-        """Привести один ингредиент к схеме `{name, amount, unit, notes}`."""
+        """Привести один ингредиент к схеме `{name, amount, unit, notes, estimated}`."""
         if not isinstance(raw, dict):
-            return {"name": str(raw).strip(), "amount": 0, "unit": "", "notes": ""}
+            return {
+                "name": str(raw).strip(),
+                "amount": 0,
+                "unit": "",
+                "notes": "",
+                "estimated": False,
+            }
+        name = str(raw.get("name") or "").strip()
+        amount = RecipeNormalizer._to_number(raw.get("amount"), default=0)
+        unit = str(raw.get("unit") or "").strip()
+        notes = str(raw.get("notes") or "").strip()
+        estimated = bool(raw.get("estimated", False))
+
+        if estimated:
+            if amount <= 0:
+                amount = 1
+            low_unit = unit.lower()
+            if low_unit in {"гр"}:
+                unit = "г"
+            elif low_unit in {"штука", "штуки", "штук"}:
+                unit = "шт"
+            if unit.lower() not in {"г", "гр", "мл", "шт", "штука", "штуки", "штук"}:
+                unit = "г"
+            if "*" not in notes:
+                notes = f"{notes} *".strip() if notes else "*"
+            logger.warning(
+                "Ингредиент %s: количество оценено ИИ как %s %s",
+                name or "без названия",
+                amount,
+                unit,
+            )
+
         return {
-            "name": str(raw.get("name") or "").strip(),
-            "amount": RecipeNormalizer._to_number(raw.get("amount"), default=0),
-            "unit": str(raw.get("unit") or "").strip(),
-            "notes": str(raw.get("notes") or "").strip(),
+            "name": name,
+            "amount": amount,
+            "unit": unit,
+            "notes": notes,
+            "estimated": estimated,
         }
 
     @staticmethod
@@ -971,6 +1005,56 @@ if __name__ == "__main__":
             assert r_ok.get("ingredients")
 
         print("✅ analyze_image: мок vision API")
+
+        # ---- estimated ingredients (мок text API, без сети) ----
+        with patch.object(RecipeNormalizer, "_call_api", new_callable=AsyncMock) as mock_text:
+            mock_text.return_value = json.dumps({
+                "title": "Паста с томатами",
+                "description": "Тест",
+                "cuisine": "italian",
+                "meal_type": "lunch",
+                "dish_type": "main",
+                "main_ingredient": "pasta",
+                "difficulty": "easy",
+                "prep_time": 5,
+                "cook_time": 10,
+                "total_time": 15,
+                "servings": 2,
+                "ingredients": [
+                    {
+                        "name": "Соль",
+                        "amount": 0,
+                        "unit": "",
+                        "notes": "по вкусу",
+                        "estimated": True,
+                    }
+                ],
+                "steps": [{"step_number": 1, "description": "Сварить пасту."}],
+                "nutrition_per_serving": {"calories": 0, "protein": 0, "fat": 0, "carbs": 0},
+                "nutrition": {"calories": 0, "protein": 0, "fat": 0, "carbs": 0},
+                "tips": [],
+                "storage": "",
+                "tags": [],
+                "confidence": {
+                    "title": "high",
+                    "description": "high",
+                    "ingredients": "medium",
+                    "steps": "high",
+                    "times": "medium",
+                    "nutrition": "low",
+                },
+                "is_vegetarian": True,
+                "is_vegan": True,
+                "is_gluten_free": False,
+                "is_lactose_free": True,
+            })
+            r_est = await temp_normalizer.normalize("Паста. Соль по вкусу.")
+        est_ing = r_est["ingredients"][0]
+        assert est_ing["estimated"] is True
+        assert est_ing["amount"] > 0
+        assert est_ing["unit"] in {"г", "мл", "шт"}
+        assert "*" in est_ing["notes"]
+        print("✅ estimated ingredients: amount/unit/marker")
 
         # ---- Тест 1 (с API): реальная нормализация ----
         token = os.getenv("GITHUB_TOKEN")

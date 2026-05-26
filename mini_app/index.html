@@ -617,6 +617,49 @@
             font-variant-numeric: tabular-nums;
             text-align: right;
             white-space: nowrap;
+            position: relative;
+        }
+        .ingredients-modern .ing-amount--estimated {
+            cursor: help;
+            padding-right: 2px;
+        }
+        .estimated-star {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            min-width: 16px;
+            height: 16px;
+            margin-left: 3px;
+            border-radius: 999px;
+            background: rgba(42, 171, 238, 0.12);
+            color: var(--accent);
+            font-weight: 700;
+            line-height: 1;
+        }
+        .ingredient-tooltip {
+            position: absolute;
+            right: 0;
+            bottom: calc(100% + 10px);
+            z-index: 20;
+            width: 220px;
+            padding: 9px 10px;
+            border-radius: 10px;
+            background: rgba(20, 20, 20, 0.94);
+            color: #fff;
+            font-size: 12px;
+            line-height: 1.35;
+            white-space: normal;
+            text-align: left;
+            box-shadow: 0 6px 18px rgba(0, 0, 0, 0.22);
+        }
+        .ingredient-tooltip::after {
+            content: "";
+            position: absolute;
+            right: 14px;
+            top: 100%;
+            border-width: 6px 6px 0;
+            border-style: solid;
+            border-color: rgba(20, 20, 20, 0.94) transparent transparent;
         }
 
         /* Шаги v2 — расширенный отступ, более «дышащий» layout */
@@ -1968,6 +2011,40 @@
         // Один пункт ингредиента: круглый маркер (через CSS ::before),
         // название слева, количество + единица справа. Маркер нерискованно
         // ставится во всех случаях — даже если ингредиент пришёл строкой.
+        function cleanEstimatedMarker(text) {
+            return String(text || "").replace(/\s*\*+\s*$/, "").trim();
+        }
+
+        function isServingNote(text) {
+            return /(по вкусу|по желанию|для подачи|для украшения|опционально|по необходимости)/i
+                .test(String(text || ""));
+        }
+
+        function extractQuantityFromNotes(notes) {
+            const src = cleanEstimatedMarker(notes);
+            const re = /^\s*(\d+(?:[.,]\d+)?(?:\s*[-–—]\s*\d+(?:[.,]\d+)?)?)\s*(г|гр|кг|мл|л|шт|ст\.?\s*л\.?|ч\.?\s*л\.?|стол\.?\s*л\.?|чайн\.?\s*л\.?)(?=\s|\.|,|$)\.?\s*(.*)$/i;
+            const m = src.match(re);
+            if (!m) return null;
+            return {
+                quantity: (m[1] + " " + m[2]).replace(/\s+/g, " ").trim(),
+                rest: String(m[3] || "").replace(/^[,;:—–-]\s*/, "").trim()
+            };
+        }
+
+        function toggleEstimatedTooltip(host) {
+            const existing = host.querySelector(".ingredient-tooltip");
+            document.querySelectorAll(".ingredient-tooltip").forEach(function (node) {
+                if (node !== existing && node.parentNode) node.parentNode.removeChild(node);
+            });
+            if (existing) {
+                existing.parentNode.removeChild(existing);
+                return;
+            }
+            host.appendChild(el("span", { class: "ingredient-tooltip" }, [
+                "Это количество сгенерировано ИИ, так как в оригинальном рецепте граммовка не указана"
+            ]));
+        }
+
         function renderIngredient(ing) {
             if (!ing || typeof ing !== "object") {
                 return el("li", {}, [
@@ -1978,15 +2055,35 @@
             const amount = Number(ing.amount);
             const amountStr = (Number.isFinite(amount) && amount > 0) ? String(amount) : "";
             const unit = String(ing.unit || "").trim();
-            const right = [amountStr, unit].filter(Boolean).join(" ");
+            let right = [amountStr, unit].filter(Boolean).join(" ");
 
             const baseName = String(ing.name || "").trim();
-            const notes = String(ing.notes || "").trim();
+            let notes = cleanEstimatedMarker(ing.notes);
+            if (!right) {
+                const extracted = extractQuantityFromNotes(notes);
+                if (extracted) {
+                    right = extracted.quantity;
+                    notes = extracted.rest;
+                } else if (isServingNote(notes)) {
+                    right = notes;
+                    notes = "";
+                }
+            }
             const fullName = baseName + (notes ? " (" + notes + ")" : "");
+            const estimated = ing.estimated === true;
+            const amountChildren = [right || "—"];
+            const amountProps = { class: "ing-amount" + (estimated ? " ing-amount--estimated" : "") };
+            if (estimated) {
+                amountProps.onclick = function (ev) {
+                    ev.stopPropagation();
+                    toggleEstimatedTooltip(ev.currentTarget);
+                };
+                amountChildren.push(el("span", { class: "estimated-star", role: "button" }, ["*"]));
+            }
 
             return el("li", {}, [
                 el("span", { class: "ing-name" }, [fullName || "—"]),
-                el("span", { class: "ing-amount" }, [right || "—"])
+                el("span", amountProps, amountChildren)
             ]);
         }
 
