@@ -218,7 +218,7 @@ class WebParser(BaseParser):
     MAX_TEXT_LENGTH: int = 50_000
     TIMEOUT_SECONDS: float = 30.0
     RENDER_TIMEOUT_SECONDS: int = 60
-    MIN_USEFUL_TEXT_LENGTH: int = 1_000
+    MIN_USEFUL_TEXT_LENGTH: int = 500
 
     HEADERS: dict = {
         "User-Agent": (
@@ -386,6 +386,11 @@ class WebParser(BaseParser):
                     html = await response.text(errors="replace")
                     size_kb = max(len(html) // 1024, 1)
                     logger.info("✅ Страница загружена (%s), размер: %sKB", response.status, size_kb)
+                    if self._looks_like_beget_cookie_challenge(html):
+                        logger.warning(
+                            "Страница вернула Beget JS-cookie challenge; повторяю запрос с cookie",
+                        )
+                        return await self._fetch_with_beget_cookie(session, url)
                     return html
 
         except asyncio.TimeoutError:
@@ -394,6 +399,33 @@ class WebParser(BaseParser):
         except aiohttp.ClientError as exc:
             logger.error("❌ Ошибка парсинга %s: %s", url, exc)
             raise RuntimeError(f"Сетевая ошибка: {exc}") from exc
+
+    @staticmethod
+    def _looks_like_beget_cookie_challenge(html: str) -> bool:
+        """Распознать короткую JS-страницу Beget, которая ставит cookie и reload."""
+        low = (html or "").lower()
+        return (
+            "document.cookie" in low
+            and "beget=begetok" in low
+            and "location.reload" in low
+        )
+
+    async def _fetch_with_beget_cookie(self, session: aiohttp.ClientSession, url: str) -> str:
+        """Повторить загрузку страниц Beget после JS-cookie challenge."""
+        headers = dict(self.HEADERS)
+        headers["Cookie"] = "beget=begetok"
+        async with session.get(url, headers=headers, allow_redirects=True) as response:
+            if response.status >= 400:
+                logger.error("❌ Ошибка парсинга %s после Beget cookie: HTTP %s", url, response.status)
+                raise RuntimeError(f"Ошибка HTTP {response.status} при повторной загрузке страницы")
+            html = await response.text(errors="replace")
+            size_kb = max(len(html) // 1024, 1)
+            logger.info(
+                "✅ Страница загружена после Beget cookie (%s), размер: %sKB",
+                response.status,
+                size_kb,
+            )
+            return html
 
     def _fetch_rendered_html_sync(self, url: str) -> str:
         """Синхронно загрузить и отрендерить страницу через requests-html/Chromium."""
@@ -439,6 +471,128 @@ class WebParser(BaseParser):
         raw_text = body.get_text(separator="\n")
         return self._clean_extracted_text(self._clean_text(raw_text))
 
+    def _extract_structured_recipe_text(self, html: str) -> str:
+        """Достать рецепт из JSON-LD или типичных DOM-блоков, не теряя короткие ингредиенты."""
+        soup = BeautifulSoup(html, "lxml")
+        json_ld_text = self._extract_json_ld_recipe_text(soup)
+        if json_ld_text:
+            return json_ld_text
+        return self._extract_dom_recipe_text(soup)
+
+    def _extract_json_ld_recipe_text(self, soup: BeautifulSoup) -> str:
+        decoder = json.JSONDecoder(strict=False)
+        for script in soup.find_all("script", type="application/ld+json"):
+            raw = (script.get_text() or "").strip()
+            if not raw or "Recipe" not in raw:
+                continue
+            try:
+                payload = decoder.decode(raw)
+            except json.JSONDecodeError as exc:
+                logger.warning("JSON-LD Recipe не распарсен: %s", exc)
+                continue
+            recipe = self._find_recipe_object(payload)
+            if recipe:
+                return self._format_recipe_object_text(recipe)
+        return ""
+
+    def _find_recipe_object(self, value: Any) -> Optional[dict[str, Any]]:
+        if isinstance(value, dict):
+            raw_type = value.get("@type")
+            types = raw_type if isinstance(raw_type, list) else [raw_type]
+            if any(str(t).lower() == "recipe" for t in types):
+                return value
+            graph = value.get("@graph")
+            found = self._find_recipe_object(graph)
+            if found:
+                return found
+            for item in value.values():
+                found = self._find_recipe_object(item)
+                if found:
+                    return found
+        if isinstance(value, list):
+            for item in value:
+                found = self._find_recipe_object(item)
+                if found:
+                    return found
+        return None
+
+    def _format_recipe_object_text(self, recipe: dict[str, Any]) -> str:
+        lines: List[str] = []
+        title = self._plain_text(recipe.get("name"))
+        description = self._plain_text(recipe.get("description"))
+        if title:
+            lines.append(title)
+        if description:
+            lines.append(description)
+        ingredients = recipe.get("recipeIngredient")
+        if isinstance(ingredients, list) and ingredients:
+            lines.append("Ингредиенты:")
+            for item in ingredients:
+                text = self._plain_text(item)
+                if text:
+                    lines.append(f"Ингредиент: {text}")
+        instructions = recipe.get("recipeInstructions")
+        steps = self._recipe_instruction_texts(instructions)
+        if steps:
+            lines.append("Приготовление:")
+            for index, step in enumerate(steps, 1):
+                lines.append(f"Шаг {index}: {step}")
+        return "\n".join(lines).strip()
+
+    def _recipe_instruction_texts(self, instructions: Any) -> List[str]:
+        if isinstance(instructions, str):
+            text = self._plain_text(instructions)
+            return [text] if text else []
+        if not isinstance(instructions, list):
+            return []
+        steps: List[str] = []
+        for item in instructions:
+            if isinstance(item, dict):
+                text = self._plain_text(item.get("text") or item.get("name"))
+            else:
+                text = self._plain_text(item)
+            if text:
+                steps.append(text)
+        return steps
+
+    def _extract_dom_recipe_text(self, soup: BeautifulSoup) -> str:
+        root = soup.select_one("article.post-recipe") or soup
+        lines: List[str] = []
+        title = soup.find("h1")
+        if title:
+            title_text = self._plain_text(title.get_text(" ", strip=True))
+            if title_text:
+                lines.append(title_text)
+        ingredients: List[str] = []
+        for item in root.select(".recipe-ingredients li"):
+            name_el = item.select_one(".name")
+            value_el = item.select_one(".value")
+            name = self._plain_text(name_el.get_text(" ", strip=True) if name_el else "")
+            value = self._plain_text(value_el.get_text(" ", strip=True) if value_el else "")
+            text = " ".join(part for part in (value, name) if part).strip()
+            if text:
+                ingredients.append(text)
+        if ingredients:
+            lines.append("Ингредиенты:")
+            lines.extend(f"Ингредиент: {item}" for item in ingredients)
+        steps: List[str] = []
+        for item in root.select(".recipe-cooking li"):
+            text_el = item.select_one(".recipe-cooking__text") or item
+            text = self._plain_text(text_el.get_text(" ", strip=True))
+            if text:
+                steps.append(text)
+        if steps:
+            lines.append("Приготовление:")
+            lines.extend(f"Шаг {index}: {step}" for index, step in enumerate(steps, 1))
+        return "\n".join(lines).strip()
+
+    @staticmethod
+    def _plain_text(value: Any) -> str:
+        if value is None:
+            return ""
+        text = BeautifulSoup(str(value), "lxml").get_text(" ", strip=True)
+        return re.sub(r"\s+", " ", text).strip()
+
     def _extract_text(self, html: str, *, stage: str = "static") -> str:
         if not (html or "").strip():
             logger.warning("%s: HTML пустой, текст не извлечён", stage)
@@ -458,27 +612,33 @@ class WebParser(BaseParser):
         else:
             logger.warning("readability (%s): модуль недоступен", stage)
 
+        structured_text = self._extract_structured_recipe_text(html)
         body_text = self._body_text_from_html(html)
+        if structured_text:
+            logger.info(
+                "Структурированный рецепт (%s): извлечено %s символов",
+                stage,
+                len(structured_text),
+            )
+            body_text = self._combine_texts(structured_text, body_text)
+            if readability_text:
+                readability_text = self._combine_texts(structured_text, readability_text)
 
         if not readability_text.strip():
             logger.warning(
-                "readability (%s): нет текста, берём <body> (%s символов)",
-                stage,
+                "readability не дал текста, использую body: %s символов",
                 len(body_text),
             )
             return body_text
 
-        if (
-            len(readability_text) < self.MIN_USEFUL_TEXT_LENGTH
-            and len(body_text) > len(readability_text)
-        ):
+        if len(readability_text) < self.MIN_USEFUL_TEXT_LENGTH:
             logger.warning(
-                "readability (%s): мало текста (%s симв.), используем <body> (%s симв.)",
+                "readability (%s): мало текста (%s симв.), использую body: %s символов",
                 stage,
                 len(readability_text),
                 len(body_text),
             )
-            return body_text
+            return body_text or readability_text
 
         logger.info("readability (%s): успешно, %s символов", stage, len(readability_text))
         return readability_text
@@ -1393,6 +1553,14 @@ if __name__ == "__main__":
         assert og_rel == "https://eda.ru/pics/x.png"
         print("✅ WebParser og:image URL")
 
+        beget_challenge = (
+            "<html><head><script>document.cookie='beget=begetok; path=/';"
+            "location.reload();</script></head><body></body></html>"
+        )
+        assert WebParser._looks_like_beget_cookie_challenge(beget_challenge)
+        assert not WebParser._looks_like_beget_cookie_challenge("<html><body>Рецепт</body></html>")
+        print("✅ WebParser Beget cookie challenge")
+
         wp_clean = WebParser()
         dirty_text = (
             "Войти\n"
@@ -1416,8 +1584,25 @@ if __name__ == "__main__":
             + "\nПриготовление: замочите желатин, смешайте с йогуртом и фруктами. "
             + "рецепт простой и быстрый " * 35
         )
+        onetable_json_ld = json.dumps({
+            "@context": "https://schema.org/",
+            "@type": "Recipe",
+            "name": "Желе из йогурта и желатина",
+            "recipeIngredient": [
+                "400 г Греческий йогурт",
+                "10 г Желатин",
+                "60 мл Вода",
+            ],
+            "recipeInstructions": [
+                {"@type": "HowToStep", "text": "Подготовьте продукты."},
+                {"@type": "HowToStep", "text": "Смешайте йогурт с желатином."},
+            ],
+        }, ensure_ascii=False)
         onetable_html = (
-            f"<html><head><title>Желе</title></head><body>"
+            f"<html><head><title>Желе</title>"
+            f"<meta property=\"og:image\" content=\"/images/zhele.jpg\">"
+            f"<script type=\"application/ld+json\">{onetable_json_ld}</script></head><body>"
+            f"<script>window.__noise = true;</script><style>.hidden{{display:none}}</style>"
             f"<nav>Войти на сайт onetable</nav>"
             f"<main><article><h1>Желе из йогурта</h1><p>{onetable_recipe}</p></article></main>"
             f"</body></html>"
@@ -1433,7 +1618,10 @@ if __name__ == "__main__":
         with patch.object(mod, "_ReadabilityDocument", _EmptyReadabilityDoc):
             body_fallback_text = wp_body._extract_text(onetable_html, stage="test (body fallback)")
         assert "Ингредиенты" in body_fallback_text
+        assert "Ингредиент: 10 г Желатин" in body_fallback_text
         assert "Приготовление" in body_fallback_text
+        assert "Шаг 1: Подготовьте продукты." in body_fallback_text
+        assert "window.__noise" not in body_fallback_text
         assert len(body_fallback_text) >= WebParser.MIN_USEFUL_TEXT_LENGTH
         print("✅ WebParser body fallback при пустом readability (onetable-мок)")
 
@@ -1464,22 +1652,32 @@ if __name__ == "__main__":
         print("✅ WebParser fallback requests-html (мок)")
 
         wp_onetable = WebParser()
+        td_onetable = tempfile.mkdtemp()
+
+        async def _fake_onetable_image_download(_u: str, dest: str) -> bool:
+            with open(dest, "wb") as fh:
+                fh.write(b"\xff\xd8\xff\xd9")
+            return True
+
         with patch.object(WebParser, "_fetch", new_callable=AsyncMock, return_value=static_html), patch.object(
-            WebParser,
-            "_extract_og_image",
-            new_callable=AsyncMock,
-            return_value=None,
-        ), patch.object(
             WebParser,
             "_fetch_rendered_html_sync",
             return_value=onetable_html,
-        ), patch.object(mod, "_ReadabilityDocument", _EmptyReadabilityDoc):
+        ), patch.object(
+            WebParser,
+            "_download_binary_to_path",
+            side_effect=_fake_onetable_image_download,
+        ), patch.object(mod, "_ReadabilityDocument", _EmptyReadabilityDoc), patch.object(mod, "IMAGES_DIR", td_onetable):
             onetable_result = await wp_onetable.parse(
                 "https://onetable.ru/zhele-iz-jogurta-i-zhelatina-s-fruktami/",
             )
         assert "Ингредиенты" in onetable_result.text
+        assert "Ингредиент: 400 г Греческий йогурт" in onetable_result.text
+        assert "Шаг 2: Смешайте йогурт с желатином." in onetable_result.text
         assert len(onetable_result.text) >= WebParser.MIN_USEFUL_TEXT_LENGTH
-        print("✅ WebParser onetable URL + пустой readability (мок)")
+        assert wp_onetable.last_image_url == "https://onetable.ru/images/zhele.jpg"
+        assert onetable_result.image_url is not None and os.path.isfile(onetable_result.image_url)
+        print("✅ WebParser onetable URL + body fallback + og:image (мок)")
 
         wp_miss = WebParser()
         assert await wp_miss._extract_og_image("<html></html>", "https://nope.test/x") is None
