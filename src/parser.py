@@ -882,10 +882,10 @@ def _instagram_author_description(user_name: str, full_name: str) -> str:
     return user or full
 
 
-def _instagram_extract_from_item(item: Any) -> tuple[str, str, str]:
+def _instagram_extract_from_item(item: Any) -> tuple[str, str, str, str]:
     """Разобрать один объект Actor ``apple_yang~instagram-transcripts-scraper``."""
     if not isinstance(item, dict):
-        return "", "", ""
+        return "", "", "", ""
 
     err_msg = _instagram_safe_str(item.get("errMsg"))
     title = _instagram_safe_str(item.get("title"))
@@ -893,10 +893,11 @@ def _instagram_extract_from_item(item: Any) -> tuple[str, str, str]:
         _instagram_safe_str(item.get("userName")),
         _instagram_safe_str(item.get("userFullName")),
     )
+    img_url = _instagram_safe_str(item.get("img"))
 
     if err_msg:
         logger.error("Ошибка получения Instagram субтитров: %s", err_msg)
-        return title, description, ""
+        return title, description, "", img_url
 
     transcript_text = _instagram_safe_str(item.get("text"))
     if not transcript_text:
@@ -905,7 +906,7 @@ def _instagram_extract_from_item(item: Any) -> tuple[str, str, str]:
     if not transcript_text:
         logger.warning("Apify не вернул текста субтитров для Instagram")
 
-    return title, description, transcript_text
+    return title, description, transcript_text, img_url
 
 
 class InstagramParser(BaseParser):
@@ -915,8 +916,10 @@ class InstagramParser(BaseParser):
     """
 
     source_type: str = "instagram"
-    generate_image_default: bool = True
+    generate_image_default: bool = False
     MAX_TEXT_LENGTH: int = 50_000
+    TIMEOUT_SECONDS: float = 30.0
+    HEADERS: dict = WebParser.HEADERS
 
     def __init__(self, apify_api_token: str = "", instagram_session_id: str = "") -> None:
         self._apify_api_token = (apify_api_token or "").strip()
@@ -947,15 +950,59 @@ class InstagramParser(BaseParser):
     async def parse(self, url: str) -> ParseResult:
         if not self.can_parse(url):
             raise ValueError(f"InstagramParser не поддерживает URL: {url!r}")
-        text = await asyncio.to_thread(self._parse_sync, url)
-        return ParseResult(text=text)
+        text, img_url = await asyncio.to_thread(self._parse_sync, url)
+        image_path = await self._download_instagram_image(img_url)
+        return ParseResult(text=text, image_url=image_path)
 
-    def _fetch_via_apify(self, url: str) -> tuple[str, str, str]:
-        """Вернуть (title, description, transcript_text) или три пустые строки при сбое."""
+    async def _download_instagram_image(self, img_url: str) -> Optional[str]:
+        """Скачать ``img`` из Instagram Actor в ``IMAGES_DIR`` и вернуть локальный путь."""
+        url = (img_url or "").strip()
+        if not url:
+            logger.info("Instagram не предоставил изображение (поле img пусто)")
+            return None
+        if not url.startswith(("http://", "https://")):
+            logger.warning("Не удалось скачать изображение Instagram: %s", url)
+            return None
+
+        ensure_images_dir()
+        dest = os.path.join(IMAGES_DIR, f"{uuid.uuid4().hex}.jpg")
+        try:
+            ok = await self._download_binary_to_path(url, dest)
+            if ok:
+                logger.info("Изображение Instagram сохранено: %s", dest)
+                return dest
+        except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
+            logger.warning("Не удалось скачать изображение Instagram: %s", url)
+            logger.debug("Ошибка скачивания Instagram img: %s", exc)
+        if os.path.isfile(dest):
+            try:
+                os.unlink(dest)
+            except OSError:
+                pass
+        return None
+
+    async def _download_binary_to_path(self, file_url: str, dest_path: str) -> bool:
+        timeout = aiohttp.ClientTimeout(total=self.TIMEOUT_SECONDS)
+        max_bytes = 8 * 1024 * 1024
+        async with aiohttp.ClientSession(timeout=timeout, headers=self.HEADERS) as session:
+            async with session.get(file_url, allow_redirects=True) as response:
+                if response.status >= 400:
+                    logger.warning("Не удалось скачать изображение Instagram: %s", file_url)
+                    return False
+                data = await response.read()
+        if len(data) > max_bytes:
+            logger.warning("Не удалось скачать изображение Instagram: %s", file_url)
+            return False
+        with open(dest_path, "wb") as f:
+            f.write(data)
+        return True
+
+    def _fetch_via_apify(self, url: str) -> tuple[str, str, str, str]:
+        """Вернуть title / description / transcript / img или пустые строки при сбое."""
         token = (self._apify_api_token or "").strip()
         if not token:
             logger.error("Ошибка получения Instagram субтитров")
-            return "", "", ""
+            return "", "", "", ""
 
         run_url = (
             f"https://api.apify.com/v2/acts/{APIFY_INSTAGRAM_TRANSCRIPT_ACTOR}/runs"
@@ -973,32 +1020,32 @@ class InstagramParser(BaseParser):
         )
         if not isinstance(envelope, dict):
             logger.error("Ошибка получения Instagram субтитров")
-            return "", "", ""
+            return "", "", "", ""
 
         run = envelope.get("data")
         if not isinstance(run, dict):
             logger.error("Ошибка получения Instagram субтитров")
-            return "", "", ""
+            return "", "", "", ""
 
         run_id = run.get("id")
         if not run_id:
             logger.error("Ошибка получения Instagram субтитров")
-            return "", "", ""
+            return "", "", "", ""
 
         items_url = f"https://api.apify.com/v2/actor-runs/{run_id}/dataset/items?format=json"
         items_payload = _apify_http_json("GET", items_url, token, None)
         item: Any = items_payload
         if isinstance(items_payload, list):
             item = items_payload[0] if items_payload else None
-        title, description, transcript_text = _instagram_extract_from_item(item)
+        title, description, transcript_text, img_url = _instagram_extract_from_item(item)
         if not (title or description or transcript_text):
             logger.error("Ошибка получения Instagram субтитров")
-            return "", "", ""
+            return "", "", "", ""
 
         logger.info("Получены данные через Apify Instagram Transcripts Scraper")
-        return title, description, transcript_text
+        return title, description, transcript_text, img_url
 
-    def _parse_sync(self, url: str) -> str:
+    def _parse_sync(self, url: str) -> tuple[str, str]:
         shortcode = self._extract_shortcode(url)
         is_share_url = bool(
             re.search(
@@ -1012,7 +1059,7 @@ class InstagramParser(BaseParser):
 
         logger.info("📸 Обнаружено Instagram видео: %s", shortcode or "share-url")
 
-        title, description, transcript_text = self._fetch_via_apify(url)
+        title, description, transcript_text, img_url = self._fetch_via_apify(url)
         if not (title or description or transcript_text):
             logger.error("Ошибка получения Instagram субтитров")
             raise RuntimeError("Не удалось извлечь текст из Instagram (пустой ответ Apify)")
@@ -1026,7 +1073,7 @@ class InstagramParser(BaseParser):
 
         if len(text) > self.MAX_TEXT_LENGTH:
             text = text[: self.MAX_TEXT_LENGTH]
-        return text
+        return text, img_url
 
 
 # --------------------------------------------------------------------------- #
@@ -1162,7 +1209,7 @@ if __name__ == "__main__":
 
         assert WebParser.generate_image_default is False
         assert YouTubeParser.generate_image_default is True
-        assert InstagramParser.generate_image_default is True
+        assert InstagramParser.generate_image_default is False
         mod = sys.modules[__name__]
         this_mod = mod
         wp = WebParser()
@@ -1258,6 +1305,7 @@ if __name__ == "__main__":
             "title": "Шоколадный торт #рецепт",
             "userName": "baker_maria",
             "userFullName": "Мария П.",
+            "img": "https://cdn.example.test/recipe.jpg",
             "text": "Смешать яйца и сахар. Добавить муку.",
             "segments": [
                 {"start": 0.0, "end": 3.1, "text": "Смешать яйца и сахар."},
@@ -1265,11 +1313,12 @@ if __name__ == "__main__":
             ],
             "errMsg": "",
         }
-        ig_t, ig_d, ig_tr = _instagram_extract_from_item(ig_actor_item)
+        ig_t, ig_d, ig_tr, ig_img = _instagram_extract_from_item(ig_actor_item)
         assert "торт" in ig_t
         assert "baker_maria" in ig_d
         assert "муку" in ig_tr
-        ig_seg_t, ig_seg_d, ig_seg_tr = _instagram_extract_from_item({
+        assert ig_img == "https://cdn.example.test/recipe.jpg"
+        ig_seg_t, ig_seg_d, ig_seg_tr, ig_seg_img = _instagram_extract_from_item({
             "title": "Сырники",
             "userName": "chef",
             "segments": [
@@ -1280,6 +1329,7 @@ if __name__ == "__main__":
         assert ig_seg_t == "Сырники"
         assert "@chef" in ig_seg_d
         assert "творог" in ig_seg_tr and "Жарим" in ig_seg_tr
+        assert ig_seg_img == ""
         print("✅ Instagram can_parse / shortcode + мок apple_yang dataset")
 
         apify_calls: List[tuple[str, str, dict[str, Any] | None]] = []
@@ -1301,15 +1351,35 @@ if __name__ == "__main__":
             "sessionid": "session-test",
         }
 
+        td_ig = tempfile.mkdtemp()
+
+        async def _fake_ig_image_download(_u: str, dest: str) -> bool:
+            with open(dest, "wb") as fh:
+                fh.write(b"\xff\xd8\xff\xd9")
+            return True
+
         with patch.object(
             InstagramParser,
             "_fetch_via_apify",
-            return_value=("IG Title", "Описание и ингредиенты", "текст субтитров"),
-        ):
+            return_value=(
+                "IG Title",
+                "Описание и ингредиенты",
+                "текст субтитров",
+                "https://cdn.example.test/recipe.jpg",
+            ),
+        ), patch.object(
+            InstagramParser,
+            "_download_binary_to_path",
+            side_effect=_fake_ig_image_download,
+        ), patch.object(mod, "IMAGES_DIR", td_ig):
             ig_out = await InstagramParser(apify_api_token="dummy").parse(
                 "https://www.instagram.com/reel/xyz123xxxxx/",
             )
         assert "IG Title" in ig_out.text and "Описание" in ig_out.text and "субтитров" in ig_out.text
+        assert ig_out.image_url is not None and ig_out.image_url.startswith(td_ig)
+        assert os.path.isfile(ig_out.image_url)
+        no_img = await InstagramParser(apify_api_token="dummy")._download_instagram_image("")
+        assert no_img is None
         print("✅ Instagram parse() с моком Apify")
 
         no_key = YouTubeParser(youtube_api_key="")
