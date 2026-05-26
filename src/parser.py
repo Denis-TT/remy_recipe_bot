@@ -1023,7 +1023,7 @@ class InstagramParser(BaseParser):
     @staticmethod
     def _extract_shortcode(url: str) -> str:
         m = re.search(
-            r"instagram\.com/(?:reel|p)/([A-Za-z0-9_-]+)",
+            r"(?:www\.|m\.)?instagram\.com/(?:reel|reels|p)/([A-Za-z0-9_-]+)",
             (url or "").strip(),
             re.IGNORECASE,
         )
@@ -1033,8 +1033,39 @@ class InstagramParser(BaseParser):
     def can_parse(url: str) -> bool:
         if not isinstance(url, str) or not url.strip():
             return False
-        u = url.lower()
-        return "instagram.com/reel/" in u or "instagram.com/p/" in u
+        u = url.lower().strip()
+        return bool(
+            re.search(
+                r"(?:^|://)(?:www\.|m\.)?instagram\.com/(?:reel|reels|p|share/(?:reel|p))/",
+                u,
+                re.IGNORECASE,
+            )
+        )
+
+    @staticmethod
+    def _format_raw_text(
+        *,
+        title: str,
+        description: str,
+        transcript_text: str,
+        url: str,
+        shortcode: str,
+    ) -> str:
+        """Собрать сырой текст с явным разделением метаданных, caption и субтитров."""
+        sections: List[str] = ["Source: Instagram Reel"]
+        if shortcode:
+            sections.append(f"Shortcode: {shortcode}")
+        if url:
+            sections.append(f"URL: {url.strip()}")
+
+        if description:
+            sections.append(f"Author metadata:\n{description}")
+        if title:
+            sections.append(f"Caption:\n{title}")
+        if transcript_text:
+            sections.append(f"Transcript / subtitles:\n{transcript_text}")
+
+        return "\n\n".join(s for s in sections if s and s.strip())
 
     async def parse(self, url: str) -> ParseResult:
         if not self.can_parse(url):
@@ -1090,15 +1121,30 @@ class InstagramParser(BaseParser):
 
     def _parse_sync(self, url: str) -> str:
         shortcode = self._extract_shortcode(url)
-        if not shortcode:
+        is_share_url = bool(
+            re.search(
+                r"(?:^|://)(?:www\.|m\.)?instagram\.com/share/(?:reel|p)/",
+                (url or "").strip(),
+                re.IGNORECASE,
+            )
+        )
+        if not shortcode and not is_share_url:
             raise ValueError("Некорректный Instagram URL")
 
-        logger.info("📸 Обнаружено Instagram видео: %s", shortcode)
+        logger.info("📸 Обнаружено Instagram видео: %s", shortcode or "share-url")
 
         title, description, transcript_text = self._fetch_via_apify(url)
+        if not (title or description or transcript_text):
+            logger.error("Ошибка получения Instagram субтитров")
+            raise RuntimeError("Не удалось извлечь текст из Instagram (пустой ответ Apify)")
 
-        chunks = [title, description, transcript_text]
-        text = "\n\n".join(c for c in chunks if c and str(c).strip())
+        text = self._format_raw_text(
+            title=title,
+            description=description,
+            transcript_text=transcript_text,
+            url=url,
+            shortcode=shortcode,
+        )
 
         if not text.strip():
             logger.error("Ошибка получения Instagram субтитров")
@@ -1314,10 +1360,13 @@ if __name__ == "__main__":
         print("✅ generate_image_if_needed / флаги парсеров")
 
         assert InstagramParser.can_parse("https://www.instagram.com/reel/ABCxyz12/")
+        assert InstagramParser.can_parse("https://m.instagram.com/reels/ABCxyz12/?igsh=x")
         assert InstagramParser.can_parse("https://instagram.com/p/XYZ_ab-1/")
+        assert InstagramParser.can_parse("https://www.instagram.com/share/reel/BAABCxyz12/")
         assert InstagramParser._extract_shortcode(
             "https://www.instagram.com/reel/AbCd123/?utm=x",
         ) == "AbCd123"
+        assert InstagramParser._extract_shortcode("https://m.instagram.com/reels/ReEl_42/") == "ReEl_42"
         assert InstagramParser._extract_shortcode("https://www.instagram.com/p/xY9_/") == "xY9_"
         assert not InstagramParser.can_parse("https://www.youtube.com/watch?v=dQw4w9WgXcQ")
         assert not InstagramParser.can_parse("")
@@ -1358,6 +1407,9 @@ if __name__ == "__main__":
                 "https://www.instagram.com/reel/xyz123xxxxx/",
             )
         assert "IG Title" in ig_out.text and "Описание" in ig_out.text and "субтитров" in ig_out.text
+        assert "Source: Instagram Reel" in ig_out.text
+        assert "Caption:" in ig_out.text
+        assert "Transcript / subtitles:" in ig_out.text
         print("✅ Instagram parse() с моком Apify")
 
         no_key = YouTubeParser(youtube_api_key="")

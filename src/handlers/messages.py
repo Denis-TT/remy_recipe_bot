@@ -409,7 +409,12 @@ async def _handle_url(
 
     logger.info("🔍 Начинаю обработку URL: %s", url)
 
-    status: Message = await message.reply_text("🔍 Читаю страницу...")
+    src_parser = bot.parser.get_parser(url)
+    status_text = "🔍 Читаю страницу..."
+    if src_parser is not None and getattr(src_parser, "source_type", "") == "instagram":
+        status_text = "📸 Обрабатываю Instagram Reel, это может занять до 1-2 минут..."
+
+    status: Message = await message.reply_text(status_text)
 
     # 1) Парсинг
     try:
@@ -433,7 +438,6 @@ async def _handle_url(
     elif parsed.image_url:
         recipe_data["image_url"] = parsed.image_url
 
-    src_parser = bot.parser.get_parser(url)
     if src_parser is not None:
         await src_parser.generate_image_if_needed(
             recipe_data,
