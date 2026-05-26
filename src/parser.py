@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import asyncio
+import html as html_lib
 import json
 import logging
 import os
@@ -21,6 +22,7 @@ import tempfile
 import urllib.error
 import urllib.request
 import uuid
+import xml.etree.ElementTree as ET
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, List, Optional
@@ -1005,11 +1007,11 @@ def _apify_dataset_payload_to_subtitle_text(payload: Any) -> tuple[str, int]:
 
 
 class YouTubeParser(BaseParser):
-    """YouTube: Data API v3 — заголовок и описание; субтитры — Apify (опционально).
+    """YouTube: Data API v3 — заголовок и описание; субтитры — captionTracks/Apify.
 
     Биллинг Apify (ориентиры для планирования; актуальные цены — на apify.com/pricing и у Actor):
     бесплатный tier даёт около $5 кредита в месяц; один запуск YouTube Transcript Scraper
-    обычно порядка $0.02 за видео; на месячный кредит ориентировочно выходит 250+ видео.
+    обычно порядка $0.02 за видео; поэтому Apify используется только последним fallback.
     """
 
     source_type: str = "youtube"
@@ -1054,6 +1056,143 @@ class YouTubeParser(BaseParser):
             raise ValueError(f"YouTubeParser не поддерживает URL: {url!r}")
         text = await asyncio.to_thread(self._parse_sync, url)
         return ParseResult(text=text)
+
+    @staticmethod
+    def _extract_balanced_json(text: str, marker: str) -> str:
+        """Извлечь JSON-объект после JS-маркера вроде ``ytInitialPlayerResponse``."""
+        idx = text.find(marker)
+        if idx < 0:
+            return ""
+        start = text.find("{", idx)
+        if start < 0:
+            return ""
+        depth = 0
+        in_string = False
+        escape = False
+        for pos in range(start, len(text)):
+            ch = text[pos]
+            if in_string:
+                if escape:
+                    escape = False
+                elif ch == "\\":
+                    escape = True
+                elif ch == '"':
+                    in_string = False
+                continue
+            if ch == '"':
+                in_string = True
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    return text[start: pos + 1]
+        return ""
+
+    @staticmethod
+    def _choose_caption_track(tracks: list[dict[str, Any]]) -> Optional[dict[str, Any]]:
+        """Выбрать дорожку: ru manual → ru auto → en manual → en auto → first."""
+        if not tracks:
+            return None
+
+        def lang(track: dict[str, Any]) -> str:
+            return str(track.get("languageCode") or "").lower()
+
+        def is_auto(track: dict[str, Any]) -> bool:
+            return str(track.get("kind") or "").lower() == "asr"
+
+        priorities = [
+            lambda t: lang(t).startswith("ru") and not is_auto(t),
+            lambda t: lang(t).startswith("ru"),
+            lambda t: lang(t).startswith("en") and not is_auto(t),
+            lambda t: lang(t).startswith("en"),
+            lambda t: not is_auto(t),
+            lambda _t: True,
+        ]
+        for predicate in priorities:
+            for track in tracks:
+                if isinstance(track, dict) and predicate(track):
+                    return track
+        return None
+
+    def _fetch_subtitles_public(self, video_id: str) -> str:
+        """Бесплатно получить публичные субтитры из YouTube captionTracks, если доступны."""
+        watch_url = f"https://www.youtube.com/watch?v={video_id}"
+        headers = {
+            "User-Agent": WebParser.HEADERS["User-Agent"],
+            "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
+        }
+        try:
+            req = urllib.request.Request(watch_url, headers=headers)
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                watch_html = resp.read().decode("utf-8", errors="replace")
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            logger.info("YouTube public captions: не удалось загрузить watch page: %s", exc)
+            return ""
+
+        raw_player = self._extract_balanced_json(watch_html, "ytInitialPlayerResponse")
+        if not raw_player:
+            logger.info("YouTube public captions: ytInitialPlayerResponse не найден")
+            return ""
+        try:
+            player = json.loads(raw_player)
+        except json.JSONDecodeError as exc:
+            logger.info("YouTube public captions: player JSON не распарсен: %s", exc)
+            return ""
+
+        captions = player.get("captions") if isinstance(player, dict) else None
+        tracklist = (
+            captions.get("playerCaptionsTracklistRenderer")
+            if isinstance(captions, dict)
+            else None
+        )
+        tracks = tracklist.get("captionTracks") if isinstance(tracklist, dict) else None
+        if not isinstance(tracks, list) or not tracks:
+            logger.info("YouTube public captions: публичные captionTracks не найдены")
+            return ""
+
+        track = self._choose_caption_track(tracks)
+        if not track:
+            return ""
+        base_url = str(track.get("baseUrl") or "").strip()
+        if not base_url:
+            return ""
+        name = track.get("name")
+        lang_label = name.get("simpleText") if isinstance(name, dict) else ""
+        sep = "&" if "?" in base_url else "?"
+        transcript_url = base_url if "fmt=" in base_url else f"{base_url}{sep}fmt=srv3"
+        try:
+            req = urllib.request.Request(transcript_url, headers=headers)
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                raw_xml = resp.read().decode("utf-8", errors="replace")
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            logger.info("YouTube public captions: не удалось скачать transcript: %s", exc)
+            return ""
+        if not raw_xml.strip():
+            logger.info("YouTube public captions: transcript пустой")
+            return ""
+
+        try:
+            root = ET.fromstring(raw_xml)
+        except ET.ParseError as exc:
+            logger.info("YouTube public captions: transcript XML не распарсен: %s", exc)
+            return ""
+
+        parts: List[str] = []
+        for elem in root.iter():
+            if elem.tag.endswith("text") or elem.tag.endswith("p"):
+                text = html_lib.unescape("".join(elem.itertext()))
+                text = re.sub(r"\s+", " ", text).strip()
+                if text:
+                    parts.append(text)
+        collapsed = _apify_collapse_subtitle_text(parts)
+        if collapsed:
+            logger.info(
+                "Получены публичные субтитры YouTube captionTracks (%s символов, %s)",
+                len(collapsed),
+                lang_label or str(track.get("languageCode") or "unknown"),
+            )
+        return collapsed
 
     def _fetch_subtitles_apify(self, video_id: str) -> str:
         """Субтитры через Apify POST run + GET dataset items (без HTTP, если токен пуст)."""
@@ -1153,16 +1292,26 @@ class YouTubeParser(BaseParser):
             title_preview,
         )
 
-        sub_text = self._fetch_subtitles_apify(video_id)
+        sub_text = self._fetch_subtitles_public(video_id)
+        if not sub_text:
+            sub_text = self._fetch_subtitles_apify(video_id)
 
-        parts_out: List[str] = []
+        metadata_parts: List[str] = []
         if title_for_text:
-            parts_out.append(title_for_text)
+            metadata_parts.append(f"Название видео (YouTube Data API):\n{title_for_text}")
         if desc_for_text:
-            parts_out.append(desc_for_text)
-        core = "\n\n".join(parts_out)
+            metadata_parts.append(
+                "Описание видео (YouTube Data API, главный источник рецепта):\n"
+                f"{desc_for_text}"
+            )
+        core = "\n\n".join(metadata_parts)
         if sub_text:
-            text = f"{core}\n\n{sub_text}" if core else sub_text
+            subtitles_block = (
+                "Дополнительный контекст из субтитров "
+                "(использовать только если в названии/описании не хватает деталей):\n"
+                f"{sub_text}"
+            )
+            text = f"{core}\n\n{subtitles_block}" if core else subtitles_block
         else:
             text = core
             if core.strip():
@@ -1483,6 +1632,51 @@ if __name__ == "__main__":
         assert not YouTubeParser.can_parse("https://eda.ru/recept/123")
         assert not YouTubeParser.can_parse("")
         assert YouTubeParser._extract_youtube_video_id("https://www.youtube.com/watch?v=short") == ""
+        assert YouTubeParser._extract_youtube_video_id(
+            "https://youtu.be/7oUqRIysbag?si=d9i2N7NW1IM6-WB3",
+        ) == "7oUqRIysbag"
+        raw_player = 'x; ytInitialPlayerResponse = {"a":{"b":1},"c":"} ok"}; y;'
+        assert json.loads(YouTubeParser._extract_balanced_json(raw_player, "ytInitialPlayerResponse"))["a"]["b"] == 1
+        chosen_track = YouTubeParser._choose_caption_track([
+            {"languageCode": "en", "kind": "asr", "baseUrl": "en-auto"},
+            {"languageCode": "ru", "baseUrl": "ru-manual"},
+        ])
+        assert chosen_track and chosen_track["baseUrl"] == "ru-manual"
+
+        class _MockUrlopenResponse:
+            def __init__(self, body: bytes) -> None:
+                self._body = body
+
+            def __enter__(self) -> "_MockUrlopenResponse":
+                return self
+
+            def __exit__(self, *_args: object) -> None:
+                return None
+
+            def read(self) -> bytes:
+                return self._body
+
+        player_json = json.dumps({
+            "captions": {
+                "playerCaptionsTracklistRenderer": {
+                    "captionTracks": [
+                        {
+                            "languageCode": "ru",
+                            "baseUrl": "https://youtube.test/timedtext?v=abcdefghijk",
+                            "name": {"simpleText": "Русский"},
+                        }
+                    ]
+                }
+            }
+        })
+        watch_html = f"<script>var ytInitialPlayerResponse = {player_json};</script>"
+        transcript_xml = "<transcript><text>Первый сегмент</text><text>второй сегмент</text></transcript>"
+        with patch("urllib.request.urlopen", side_effect=[
+            _MockUrlopenResponse(watch_html.encode("utf-8")),
+            _MockUrlopenResponse(transcript_xml.encode("utf-8")),
+        ]):
+            public_subs = YouTubeParser()._fetch_subtitles_public("abcdefghijk")
+        assert public_subs == "Первый сегмент второй сегмент"
         tx, n = _apify_dataset_payload_to_subtitle_text(
             [
                 {
@@ -1849,6 +2043,10 @@ if __name__ == "__main__":
         this_mod = sys.modules[__name__]
         with patch.object(this_mod, "build") as mock_build, patch.object(
             YouTubeParser,
+            "_fetch_subtitles_public",
+            return_value="",
+        ), patch.object(
+            YouTubeParser,
             "_fetch_subtitles_apify",
             return_value="Mock Apify subtitle text",
         ):
@@ -1871,12 +2069,19 @@ if __name__ == "__main__":
                 youtube_api_key="test-key",
                 apify_api_token="dummy-apify",
             ).parse("https://www.youtube.com/watch?v=abcdefghijk")
+            assert "Название видео (YouTube Data API)" in parsed.text
             assert "Mock Recipe" in parsed.text
+            assert "Описание видео (YouTube Data API, главный источник рецепта)" in parsed.text
             assert "Ingredients" in parsed.text
+            assert parsed.text.index("Ingredients") < parsed.text.index("Apify subtitle")
             assert "Apify subtitle" in parsed.text
             print("✅ parse() с моком Data API и Apify")
 
         with patch.object(this_mod, "build") as mock_build_ns, patch.object(
+            YouTubeParser,
+            "_fetch_subtitles_public",
+            return_value="",
+        ), patch.object(
             YouTubeParser,
             "_fetch_subtitles_apify",
             return_value="",
@@ -1904,7 +2109,46 @@ if __name__ == "__main__":
             assert "Ингредиенты" in parsed_ns.text
         print("✅ YouTube: данные Data API без субтитров Apify")
 
-        with patch("urllib.request.urlopen") as urlopen_mock:
+        with patch.object(this_mod, "build") as mock_build_pub, patch.object(
+            YouTubeParser,
+            "_fetch_subtitles_public",
+            return_value="Public caption text",
+        ) as mock_public, patch.object(
+            YouTubeParser,
+            "_fetch_subtitles_apify",
+            return_value="SHOULD_NOT_BE_USED",
+        ) as mock_apify_unused:
+            mock_yt_pub = MagicMock()
+            mock_build_pub.return_value = mock_yt_pub
+            mock_req_pub = MagicMock()
+            mock_yt_pub.videos.return_value.list.return_value = mock_req_pub
+            mock_req_pub.execute.return_value = {
+                "items": [
+                    {
+                        "snippet": {
+                            "title": "Public Subs Video",
+                            "description": "Описание с ингредиентами: рис 200 г",
+                        },
+                        "contentDetails": {"duration": "PT2M"},
+                    }
+                ]
+            }
+            parsed_pub = await YouTubeParser(
+                youtube_api_key="test-key",
+                apify_api_token="dummy-apify",
+            ).parse("https://www.youtube.com/watch?v=abcdefghijk")
+            mock_public.assert_called_once_with("abcdefghijk")
+            mock_apify_unused.assert_not_called()
+            assert "Описание с ингредиентами" in parsed_pub.text
+            assert "Public caption text" in parsed_pub.text
+            assert parsed_pub.text.index("Описание с ингредиентами") < parsed_pub.text.index("Public caption text")
+        print("✅ YouTube: публичные captionTracks имеют приоритет над Apify")
+
+        with patch("urllib.request.urlopen") as urlopen_mock, patch.object(
+            YouTubeParser,
+            "_fetch_subtitles_public",
+            return_value="",
+        ):
             mock_yt = MagicMock()
             mock_build = MagicMock(return_value=mock_yt)
             mock_req = MagicMock()
