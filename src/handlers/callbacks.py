@@ -472,8 +472,10 @@ async def _callback_share(
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
     """Отправить сохранённый рецепт в чат как share-сообщение."""
+    logger.info("📤 Callback share: user %s, recipe %s", user_id, recipe_id)
     message = query.message
     if message is None:
+        logger.warning("⚠️ Callback share %s: query.message недоступен", recipe_id)
         return
     try:
         recipe = await bot.storage.get_recipe(recipe_id)
@@ -512,7 +514,14 @@ async def _callback_share(
 
     from .messages import _send_shared_recipe
 
-    await _send_shared_recipe(message.chat_id, recipe, context.bot)
+    try:
+        await _send_shared_recipe(message.chat_id, recipe, context.bot)
+    except Exception as exc:  # noqa: BLE001
+        logger.error("❌ Callback share %s: ошибка отправки: %s", recipe_id, exc, exc_info=True)
+        try:
+            await message.reply_text("❌ Не удалось отправить рецепт. Попробуй ещё раз.")
+        except BadRequest:
+            pass
 
 
 # --------------------------------------------------------------------------- #

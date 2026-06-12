@@ -314,6 +314,7 @@ async def handle_webapp_data(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
 
     raw = message.web_app_data.data or ""
+    logger.info("📲 WEB_APP_DATA от user %s: %s", user.id, raw[:200])
     try:
         data = json.loads(raw)
     except json.JSONDecodeError as exc:
@@ -347,7 +348,11 @@ async def handle_webapp_data(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await message.reply_text("❌ Рецепт не найден.")
         return
 
-    await _send_shared_recipe(message.chat_id, recipe, context.bot)
+    try:
+        await _send_shared_recipe(message.chat_id, recipe, context.bot)
+    except Exception as exc:  # noqa: BLE001
+        logger.error("❌ WebApp share %s: ошибка отправки: %s", recipe_id, exc, exc_info=True)
+        await message.reply_text("❌ Не удалось отправить рецепт. Попробуй ещё раз.")
 
 
 def _guess_image_mime(head: bytes) -> str:
@@ -748,6 +753,11 @@ def _truncate_html_message(text: str, limit: int) -> str:
 
 async def _send_shared_recipe(chat_id: int, recipe: Mapping[str, Any], bot: Any) -> None:
     """Отправить рецепт для шаринга с промо-кнопкой Remy."""
+    logger.info(
+        "📤 _send_shared_recipe: chat %s, recipe %s",
+        chat_id,
+        recipe.get("id") or "—",
+    )
     text = _format_shared_recipe(recipe)
     markup = _shared_recipe_markup()
     title = str(recipe.get("title") or "Без названия").strip()

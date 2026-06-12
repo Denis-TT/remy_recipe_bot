@@ -79,6 +79,11 @@ def _get_bot(context: ContextTypes.DEFAULT_TYPE) -> "RemyBot":
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Команда ``/start`` — приветствие и Reply-клавиатура с «📋 Меню».
 
+    Поддерживает deep link ``/start share_<recipe_id>`` — так Mini App,
+    запущенный через Menu Button или inline-кнопку, инициирует шаринг
+    рецепта (в этих режимах ``WebApp.sendData`` не доставляет данные боту,
+    поэтому фронтенд открывает ссылку ``t.me/<bot>?start=share_<id>``).
+
     Reply-клавиатура содержит только «📋 Меню». Точка входа в Mini App
     «📖 Книга рецептов» — Menu Button бота (BotFather) плюс inline-меню
     по ``/menu``; сознательно не дублируем её в always-visible клавиатуре.
@@ -91,10 +96,59 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if message is None:
         return
 
+    args = list(getattr(context, "args", None) or [])
+    payload = str(args[0]).strip() if args else ""
+    if payload.startswith("share_"):
+        recipe_id = payload[len("share_"):]
+        if await _start_share_deeplink(update, context, recipe_id):
+            return
+
     await message.reply_text(
         WELCOME_TEXT,
         reply_markup=main_menu_keyboard(),
     )
+
+
+async def _start_share_deeplink(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    recipe_id: str,
+) -> bool:
+    """Обработать ``/start share_<recipe_id>``: отправить share-карточку рецепта.
+
+    Returns:
+        ``True``, если рецепт отправлен (приветствие не нужно);
+        ``False`` — при любой проблеме (показываем обычный welcome).
+    """
+    # Ленивый импорт: messages импортирует commands на уровне модуля,
+    # поэтому обратный импорт делаем внутри функции.
+    from .messages import _recipe_belongs_to_user, _send_shared_recipe
+
+    message = update.effective_message
+    user = update.effective_user
+    recipe_id = (recipe_id or "").strip()
+    if message is None or user is None or not recipe_id:
+        return False
+
+    logger.info("📤 Deep link share: user %s, recipe %s", user.id, recipe_id)
+    bot = _get_bot(context)
+    try:
+        recipe = await bot.storage.get_recipe(recipe_id)
+    except Exception as exc:  # noqa: BLE001
+        logger.error("❌ Deep link share: ошибка загрузки рецепта %s: %s", recipe_id, exc)
+        return False
+
+    if recipe is None or not _recipe_belongs_to_user(recipe, user.id):
+        logger.warning("⚠️ Deep link share: рецепт %s не найден/чужой для user %s", recipe_id, user.id)
+        await message.reply_text("❌ Рецепт не найден.")
+        return True
+
+    try:
+        await _send_shared_recipe(message.chat_id, recipe, context.bot)
+    except Exception as exc:  # noqa: BLE001
+        logger.error("❌ Deep link share: не удалось отправить рецепт %s: %s", recipe_id, exc)
+        await message.reply_text("❌ Не удалось отправить рецепт. Попробуй ещё раз.")
+    return True
 
 
 # --------------------------------------------------------------------------- #

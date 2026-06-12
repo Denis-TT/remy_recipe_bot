@@ -2271,14 +2271,33 @@
 
         function shareRecipe(recipeId) {
             if (IS_DEMO) return;
-            if (!tg || typeof tg.sendData !== "function") {
-                alert("Обновите Telegram, чтобы поделиться рецептом из Mini App.");
+            const id = String(recipeId || "");
+            if (!id) return;
+
+            // sendData доставляет web_app_data боту ТОЛЬКО если Mini App
+            // запущен с Reply-клавиатуры (KeyboardButton). Наш Mini App
+            // открывается через Menu Button и inline-кнопку /menu — в этих
+            // режимах sendData молча ничего не делает. Поэтому основной путь —
+            // deep link /start share_<id>, он работает при любом способе запуска.
+            const deepLink = "https://t.me/remy_recipe_bot?start=share_" + encodeURIComponent(id);
+            if (tg && typeof tg.openTelegramLink === "function") {
+                tg.openTelegramLink(deepLink);
+                if (typeof tg.close === "function") {
+                    try { tg.close(); } catch (e) { /* уже закрыто */ }
+                }
                 return;
             }
-            tg.sendData(JSON.stringify({
-                action: "share_recipe",
-                recipe_id: String(recipeId || "")
-            }));
+
+            // Запасной вариант для keyboard-запуска (если когда-нибудь появится).
+            if (tg && typeof tg.sendData === "function") {
+                tg.sendData(JSON.stringify({
+                    action: "share_recipe",
+                    recipe_id: id
+                }));
+                return;
+            }
+
+            alert("Обновите Telegram, чтобы поделиться рецептом из Mini App.");
         }
 
         function notifyRecipeDeleted() {
