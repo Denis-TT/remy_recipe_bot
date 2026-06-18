@@ -1,6 +1,7 @@
 [build]
 builder = "NIXPACKS"
-aptPackages = ["ffmpeg"]
+# ВНИМАНИЕ: ключ `aptPackages` здесь Railway игнорирует (он не входит в схему
+# railway.toml), поэтому ffmpeg ставится через nixpacks.toml (nixPkgs = ffmpeg).
 [build.config]
 pythonVersion = "3.11"
 

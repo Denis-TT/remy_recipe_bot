@@ -1,0 +1,17 @@
+# Конфигурация сборки Nixpacks (builder = "NIXPACKS" в railway.toml).
+#
+# ПОЧЕМУ ЭТОТ ФАЙЛ: ключ `aptPackages` в railway.toml — НЕ валидное поле и
+# молча игнорируется Railway, поэтому `aptPackages = ["ffmpeg"]` никогда не
+# устанавливал ffmpeg (отсюда лог «ffmpeg не найден»). Для Nixpacks системные
+# пакеты задаются именно здесь, через nixPkgs.
+#
+# ffmpeg нужен локальному распознаванию Instagram Reels (yt-dlp + Whisper):
+#   * yt-dlp вызывает ffmpeg + ffprobe для извлечения аудиодорожки в .mp3;
+#   * Whisper вызывает ffmpeg для чтения аудио.
+# Nix-пакет `ffmpeg` кладёт ОБА бинарника (ffmpeg и ffprobe) в один bin-каталог,
+# который попадает в PATH — этого достаточно и для yt-dlp, и для Whisper.
+#
+# Спецтокен "..." сохраняет автоопределённые Nixpacks пакеты (Python и пр.),
+# а мы лишь добавляем ffmpeg — поэтому остальная сборка не меняется.
+[phases.setup]
+nixPkgs = ["...", "ffmpeg"]

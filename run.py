@@ -20,6 +20,7 @@ import fcntl
 import json
 import logging
 import os
+import shutil
 import signal
 import sys
 import threading
@@ -107,6 +108,35 @@ def setup_logging() -> None:
     logging.getLogger("urllib3").setLevel(logging.WARNING)
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("telegram").setLevel(logging.INFO)
+
+
+# --------------------------------------------------------------------------- #
+# Диагностика системных зависимостей
+# --------------------------------------------------------------------------- #
+
+def log_ffmpeg_diagnostics() -> None:
+    """Залогировать наличие ffmpeg/ffprobe сразу при старте.
+
+    ffmpeg нужен локальному распознаванию Instagram Reels (yt-dlp + Whisper).
+    Этот лог показывает прямо в деплое Railway, доступны ли бинарники, ещё до
+    обработки первого Reels. Функция чисто диагностическая и никогда не роняет
+    процесс — на YouTube/Web-парсеры она не влияет.
+    """
+    ffmpeg = shutil.which("ffmpeg")
+    ffprobe = shutil.which("ffprobe")
+
+    if ffmpeg:
+        logger.info("ffmpeg найден: %s", ffmpeg)
+    else:
+        logger.warning(
+            "⚠️ ffmpeg не найден в PATH — локальное распознавание Reels отключится "
+            "(fallback на Apify). Проверьте nixpacks.toml: [phases.setup] nixPkgs=[..., \"ffmpeg\"]."
+        )
+
+    if ffprobe:
+        logger.info("ffprobe найден: %s", ffprobe)
+    else:
+        logger.warning("⚠️ ffprobe не найден в PATH (нужен yt-dlp для извлечения аудио).")
 
 
 # --------------------------------------------------------------------------- #
@@ -407,6 +437,8 @@ def main() -> None:
     logger.info("🚀 Remy Bot запускается...")
     logger.info("✅ Конфигурация загружена (окружение: %s)", config.environment)
     logger.info("📝 Логирование настроено (уровень: %s)", config.log_level)
+
+    log_ffmpeg_diagnostics()
 
     logger.info("🔒 Проверка единственного экземпляра...")
     ensure_single_instance()
