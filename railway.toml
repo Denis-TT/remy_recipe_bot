@@ -1,6 +1,6 @@
 [build]
 builder = "NIXPACKS"
-
+aptPackages = ["ffmpeg"]
 [build.config]
 pythonVersion = "3.11"
 
