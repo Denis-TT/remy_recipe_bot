@@ -5,8 +5,12 @@ aiohttp==3.10.10
 beautifulsoup4==4.12.3
 lxml==5.3.0
 readability-lxml==0.8.1
-requests-html==0.10.0
 lxml_html_clean
+# ПРИМЕЧАНИЕ: requests-html намеренно удалён. Он тянул pyppeteer → websockets<11,
+# который на Python 3.12 собирается из исходников и ломал сборку на Railway
+# (а сам JS-рендеринг через Chromium на Railway всё равно не работал). WebParser
+# использует его лишь как опциональный fallback с ленивым импортом и корректно
+# деградирует без него (остаются aiohttp + readability + структурный разбор).
 
 # YouTube Data API v3; субтитры — через Apify (HTTP, см. src/parser.py).
 google-api-python-client==2.149.0
