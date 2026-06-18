@@ -1387,7 +1387,16 @@ def _instagram_extract_from_item(item: Any) -> tuple[str, str, str, str]:
 
 
 class InstagramParser(BaseParser):
-    """Instagram Reels и посты через Apify ``apple_yang~instagram-transcripts-scraper``.
+    """Instagram Reels и посты: локальное распознавание речи + Apify-fallback.
+
+    Основной путь — автономный и бесплатный:
+      1. ``yt-dlp`` скачивает аудиодорожку Reels во временный ``.mp3``;
+      2. ``openai-whisper`` (модель ``base``) распознаёт речь офлайн.
+
+    Если локальная обработка не удалась (ошибка скачивания, пустой текст,
+    отсутствуют зависимости), парсер прозрачно переключается на платный
+    Apify Actor ``apple_yang~instagram-transcripts-scraper`` — он же даёт
+    превью-картинку (поле ``img``).
 
     Actor: https://apify.com/apple_yang/instagram-transcripts-scraper
     """
@@ -1398,9 +1407,17 @@ class InstagramParser(BaseParser):
     TIMEOUT_SECONDS: float = 30.0
     HEADERS: dict = WebParser.HEADERS
 
+    # Локальное распознавание (yt-dlp + Whisper).
+    AUDIO_OUTTMPL: str = "/tmp/reels_audio_%(id)s.%(ext)s"
+    COOKIE_FILE_PATH: str = "/tmp/instagram_cookies.txt"
+    WHISPER_MODEL_NAME: str = "base"
+
     def __init__(self, apify_api_token: str = "", instagram_session_id: str = "") -> None:
         self._apify_api_token = (apify_api_token or "").strip()
         self.sessionid = (instagram_session_id or "").strip()
+        # Модель Whisper загружается лениво при первом распознавании и
+        # кэшируется на время жизни парсера (повторная загрузка ~74 МБ дорогая).
+        self._whisper_model: Any = None
 
     @staticmethod
     def _extract_shortcode(url: str) -> str:
@@ -1427,9 +1444,180 @@ class InstagramParser(BaseParser):
     async def parse(self, url: str) -> ParseResult:
         if not self.can_parse(url):
             raise ValueError(f"InstagramParser не поддерживает URL: {url!r}")
+
+        # --- 1. Основной путь: локальное скачивание + Whisper -------------- #
+        try:
+            audio_path = await self._download_audio(url)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "⚠️ Локальное распознавание не удалось: %s. Переключаюсь на Apify",
+                exc,
+            )
+            audio_path = ""
+
+        if audio_path:
+            # _transcribe_audio сам не выбрасывает исключений и сам удаляет
+            # временный аудиофайл — нам остаётся проверить результат.
+            transcript = await self._transcribe_audio(audio_path)
+            if transcript.strip():
+                logger.info("✅ Локальное распознавание успешно")
+                text = transcript.strip()
+                if len(text) > self.MAX_TEXT_LENGTH:
+                    text = text[: self.MAX_TEXT_LENGTH]
+                return ParseResult(text=text, image_url=None)
+            logger.warning(
+                "⚠️ Локальное распознавание дало пустой текст. Переключаюсь на Apify",
+            )
+
+        # --- 2. Fallback: старый путь через Apify -------------------------- #
         text, img_url = await asyncio.to_thread(self._parse_sync, url)
         image_path = await self._download_instagram_image(img_url)
         return ParseResult(text=text, image_url=image_path)
+
+    # ----------------------------------------------------------------------- #
+    # Локальное распознавание речи: yt-dlp + Whisper
+    # ----------------------------------------------------------------------- #
+
+    def _create_cookie_file(self) -> str:
+        """Создать временный cookie-файл (Netscape) из ``self.sessionid``.
+
+        yt-dlp принимает cookies только в Netscape-формате через опцию
+        ``cookiefile``. Авторизация по ``sessionid`` помогает обходить
+        ограничения Instagram на приватный/региональный контент.
+
+        Returns:
+            Путь к файлу либо пустую строку, если ``sessionid`` не задан.
+        """
+        if not self.sessionid:
+            return ""
+        # Поля Netscape: domain, include_subdomains, path, secure, expiry, name, value.
+        # expiry=0 трактуется как session-cookie (бессрочный в рамках запуска).
+        cookie_line = "\t".join(
+            [".instagram.com", "TRUE", "/", "TRUE", "0", "sessionid", self.sessionid]
+        )
+        content = "# Netscape HTTP Cookie File\n" + cookie_line + "\n"
+        try:
+            with open(self.COOKIE_FILE_PATH, "w", encoding="utf-8") as fh:
+                fh.write(content)
+        except OSError as exc:
+            logger.warning("Не удалось создать cookie-файл Instagram: %s", exc)
+            return ""
+        return self.COOKIE_FILE_PATH
+
+    async def _download_audio(self, url: str) -> str:
+        """Скачать аудиодорожку Reels через yt-dlp и вернуть путь к ``.mp3``.
+
+        Бросает исключение при любой ошибке — его ловит :meth:`parse`
+        и переключается на Apify.
+        """
+        # Ленивый импорт: yt-dlp тяжёлый и нужен только в рантайме.
+        import yt_dlp  # type: ignore[import-untyped]
+
+        logger.info("🎵 Скачиваю аудио из Instagram Reels...")
+
+        ydl_opts: dict[str, Any] = {
+            "format": "bestaudio/best",
+            "outtmpl": self.AUDIO_OUTTMPL,
+            "postprocessors": [
+                {
+                    "key": "FFmpegExtractAudio",
+                    "preferredcodec": "mp3",
+                    "preferredquality": "192",
+                }
+            ],
+            "quiet": True,
+            "no_warnings": True,
+        }
+
+        cookie_path = self._create_cookie_file()
+        if cookie_path:
+            ydl_opts["cookiefile"] = cookie_path
+
+        def _extract() -> dict:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                return ydl.extract_info(url, download=True)
+
+        try:
+            info = await asyncio.to_thread(_extract)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("❌ Ошибка скачивания аудио: %s", exc)
+            raise
+        finally:
+            # Cookie-файл с секретом не должен залёживаться во временной папке.
+            if cookie_path and os.path.isfile(cookie_path):
+                try:
+                    os.remove(cookie_path)
+                except OSError:
+                    pass
+
+        audio_path = self._resolve_audio_path(info)
+        if not audio_path or not os.path.isfile(audio_path):
+            raise RuntimeError(
+                f"Аудиофайл не найден после скачивания (id={(info or {}).get('id')!r})"
+            )
+
+        logger.info("✅ Аудио скачано: %s", audio_path)
+        return audio_path
+
+    @staticmethod
+    def _resolve_audio_path(info: Optional[dict]) -> str:
+        """Определить путь к итоговому ``.mp3`` по ответу yt-dlp."""
+        info = info or {}
+        # Самый надёжный источник — фактический путь из requested_downloads.
+        requested = info.get("requested_downloads")
+        if isinstance(requested, list) and requested:
+            first = requested[0]
+            if isinstance(first, dict):
+                fp = first.get("filepath") or first.get("_filename") or ""
+                if fp:
+                    # После FFmpegExtractAudio расширение уже .mp3.
+                    base, _ext = os.path.splitext(fp)
+                    return base + ".mp3"
+        # Запасной вариант — собрать путь из шаблона и id.
+        video_id = str(info.get("id") or "").strip()
+        if video_id:
+            return f"/tmp/reels_audio_{video_id}.mp3"
+        return ""
+
+    async def _transcribe_audio(self, audio_path: str) -> str:
+        """Распознать речь из ``audio_path`` через Whisper (модель ``base``).
+
+        Не выбрасывает исключений (возвращает пустую строку при сбое), чтобы
+        не ломать fallback на Apify. Всегда удаляет временный аудиофайл.
+        """
+        try:
+            model = await self._ensure_whisper_model()
+            logger.info("🎙️ Распознаю речь через Whisper (модель base)...")
+            result = await asyncio.to_thread(
+                model.transcribe,
+                audio_path,
+                language="ru",
+                fp16=False,
+            )
+            text = str((result or {}).get("text") or "").strip()
+            logger.info("✅ Распознано %d символов", len(text))
+            return text
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("⚠️ Ошибка распознавания Whisper: %s", exc)
+            return ""
+        finally:
+            if audio_path and os.path.isfile(audio_path):
+                try:
+                    os.remove(audio_path)
+                    logger.info("🗑️ Временный аудиофайл удалён")
+                except OSError as exc:
+                    logger.debug("Не удалось удалить аудиофайл %s: %s", audio_path, exc)
+
+    async def _ensure_whisper_model(self) -> Any:
+        """Лениво загрузить и закэшировать модель Whisper ``base``."""
+        if self._whisper_model is None:
+            import whisper  # type: ignore[import-untyped]
+
+            logger.info("⏳ Загружаю модель Whisper '%s' (~74 МБ)...", self.WHISPER_MODEL_NAME)
+            self._whisper_model = await asyncio.to_thread(
+                whisper.load_model, self.WHISPER_MODEL_NAME
+            )
+        return self._whisper_model
 
     async def _download_instagram_image(self, img_url: str) -> Optional[str]:
         """Скачать ``img`` из Instagram Actor в ``IMAGES_DIR`` и вернуть локальный путь."""
@@ -2006,7 +2194,14 @@ if __name__ == "__main__":
                 fh.write(b"\xff\xd8\xff\xd9")
             return True
 
+        # parse() через Apify-fallback: локальное скачивание принудительно
+        # роняем, чтобы проверить именно ветку Apify + скачивание картинки.
         with patch.object(
+            InstagramParser,
+            "_download_audio",
+            new_callable=AsyncMock,
+            side_effect=RuntimeError("local disabled in test"),
+        ), patch.object(
             InstagramParser,
             "_fetch_via_apify",
             return_value=(
@@ -2028,7 +2223,81 @@ if __name__ == "__main__":
         assert os.path.isfile(ig_out.image_url)
         no_img = await InstagramParser(apify_api_token="dummy")._download_instagram_image("")
         assert no_img is None
-        print("✅ Instagram parse() с моком Apify")
+        print("✅ Instagram parse() с Apify-fallback (локальный путь отключён)")
+
+        # --- Локальное распознавание (yt-dlp + Whisper), happy path ------- #
+        with patch.object(
+            InstagramParser,
+            "_download_audio",
+            new_callable=AsyncMock,
+            return_value="/tmp/reels_audio_localtest.mp3",
+        ) as mock_dl, patch.object(
+            InstagramParser,
+            "_transcribe_audio",
+            new_callable=AsyncMock,
+            return_value="Локальный рецепт из Whisper: смешать муку, сахар и яйца.",
+        ) as mock_tr, patch.object(
+            InstagramParser,
+            "_fetch_via_apify",
+        ) as mock_apify_unused:
+            local_out = await InstagramParser(apify_api_token="dummy").parse(
+                "https://www.instagram.com/reel/local123abc/",
+            )
+        mock_dl.assert_awaited_once()
+        mock_tr.assert_awaited_once_with("/tmp/reels_audio_localtest.mp3")
+        mock_apify_unused.assert_not_called()
+        assert "Whisper" in local_out.text and "муку" in local_out.text
+        assert local_out.image_url is None
+        print("✅ Instagram локальное распознавание (мок yt-dlp + Whisper)")
+
+        # --- Пустой транскрипт → fallback на Apify ------------------------ #
+        with patch.object(
+            InstagramParser,
+            "_download_audio",
+            new_callable=AsyncMock,
+            return_value="/tmp/reels_audio_empty.mp3",
+        ), patch.object(
+            InstagramParser,
+            "_transcribe_audio",
+            new_callable=AsyncMock,
+            return_value="   ",
+        ), patch.object(
+            InstagramParser,
+            "_fetch_via_apify",
+            return_value=("Apify T", "Apify D", "Apify Tr", ""),
+        ) as mock_apify_used:
+            empty_out = await InstagramParser(apify_api_token="dummy").parse(
+                "https://www.instagram.com/reel/empty123abc/",
+            )
+        mock_apify_used.assert_called_once()
+        assert "Apify T" in empty_out.text and "Apify Tr" in empty_out.text
+        print("✅ Instagram fallback на Apify при пустом транскрипте")
+
+        # --- _create_cookie_file: Netscape-формат с sessionid ------------- #
+        td_cookie = tempfile.mkdtemp()
+        cookie_target = os.path.join(td_cookie, "instagram_cookies.txt")
+        with patch.object(InstagramParser, "COOKIE_FILE_PATH", cookie_target):
+            ig_cookie_parser = InstagramParser(
+                apify_api_token="dummy",
+                instagram_session_id="SESSION_XYZ",
+            )
+            cookie_path = ig_cookie_parser._create_cookie_file()
+            assert cookie_path == cookie_target and os.path.isfile(cookie_path)
+            with open(cookie_path, encoding="utf-8") as fh:
+                cookie_content = fh.read()
+            assert "Netscape HTTP Cookie File" in cookie_content
+            assert "sessionid\tSESSION_XYZ" in cookie_content
+            # Без sessionid файл не создаётся.
+            assert InstagramParser(apify_api_token="dummy")._create_cookie_file() == ""
+        print("✅ Instagram _create_cookie_file (Netscape)")
+
+        # --- _resolve_audio_path: разбор ответа yt-dlp -------------------- #
+        assert InstagramParser._resolve_audio_path(
+            {"requested_downloads": [{"filepath": "/tmp/reels_audio_AB12.webm"}]}
+        ) == "/tmp/reels_audio_AB12.mp3"
+        assert InstagramParser._resolve_audio_path({"id": "ZZ99"}) == "/tmp/reels_audio_ZZ99.mp3"
+        assert InstagramParser._resolve_audio_path({}) == ""
+        print("✅ Instagram _resolve_audio_path")
 
         no_key = YouTubeParser(youtube_api_key="")
         try:
