@@ -18,6 +18,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import tempfile
 import urllib.error
 import urllib.request
@@ -1412,12 +1413,44 @@ class InstagramParser(BaseParser):
     COOKIE_FILE_PATH: str = "/tmp/instagram_cookies.txt"
     WHISPER_MODEL_NAME: str = "base"
 
+    # Стандартные пути бинарников после `apt install ffmpeg` (Railway / Debian).
+    FFMPEG_FALLBACK_PATH: str = "/usr/bin/ffmpeg"
+    FFPROBE_FALLBACK_PATH: str = "/usr/bin/ffprobe"
+
     def __init__(self, apify_api_token: str = "", instagram_session_id: str = "") -> None:
         self._apify_api_token = (apify_api_token or "").strip()
         self.sessionid = (instagram_session_id or "").strip()
         # Модель Whisper загружается лениво при первом распознавании и
         # кэшируется на время жизни парсера (повторная загрузка ~74 МБ дорогая).
         self._whisper_model: Any = None
+
+        # Диагностика ffmpeg/ffprobe: yt-dlp без них не умеет извлекать аудио
+        # (ошибка "ffprobe and ffmpeg not found"). Если бинарников нет —
+        # сразу отключаем локальный режим и работаем только через Apify.
+        self._ffmpeg_path, self._ffprobe_path = self._detect_ffmpeg()
+        self._local_enabled: bool = bool(self._ffmpeg_path)
+        if self._local_enabled:
+            logger.info("ffmpeg найден: %s", self._ffmpeg_path)
+        else:
+            logger.warning("ffmpeg не найден, локальное распознавание отключено")
+
+    @classmethod
+    def _detect_ffmpeg(cls) -> tuple[str, str]:
+        """Найти ffmpeg и ffprobe в PATH, иначе проверить стандартные пути apt.
+
+        Returns:
+            Кортеж ``(ffmpeg_path, ffprobe_path)``; элемент пуст, если бинарник
+            не найден. Пустой ``ffmpeg_path`` означает «локальный режим недоступен».
+        """
+        ffmpeg = shutil.which("ffmpeg") or ""
+        if not ffmpeg and os.path.isfile(cls.FFMPEG_FALLBACK_PATH):
+            ffmpeg = cls.FFMPEG_FALLBACK_PATH
+
+        ffprobe = shutil.which("ffprobe") or ""
+        if not ffprobe and os.path.isfile(cls.FFPROBE_FALLBACK_PATH):
+            ffprobe = cls.FFPROBE_FALLBACK_PATH
+
+        return ffmpeg, ffprobe
 
     @staticmethod
     def _extract_shortcode(url: str) -> str:
@@ -1446,14 +1479,20 @@ class InstagramParser(BaseParser):
             raise ValueError(f"InstagramParser не поддерживает URL: {url!r}")
 
         # --- 1. Основной путь: локальное скачивание + Whisper -------------- #
-        try:
-            audio_path = await self._download_audio(url)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                "⚠️ Локальное распознавание не удалось: %s. Переключаюсь на Apify",
-                exc,
+        audio_path = ""
+        if not self._local_enabled:
+            logger.info(
+                "ℹ️ Локальное распознавание отключено (нет ffmpeg) — использую Apify",
             )
-            audio_path = ""
+        else:
+            try:
+                audio_path = await self._download_audio(url)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "⚠️ Локальное распознавание не удалось: %s. Переключаюсь на Apify",
+                    exc,
+                )
+                audio_path = ""
 
         if audio_path:
             # _transcribe_audio сам не выбрасывает исключений и сам удаляет
@@ -1510,6 +1549,10 @@ class InstagramParser(BaseParser):
         Бросает исключение при любой ошибке — его ловит :meth:`parse`
         и переключается на Apify.
         """
+        # Без ffmpeg yt-dlp не извлечёт аудио — не тратим время, сразу в fallback.
+        if not self._ffmpeg_path:
+            raise RuntimeError("Локальный режим недоступен: ffmpeg не найден")
+
         # Ленивый импорт: yt-dlp тяжёлый и нужен только в рантайме.
         import yt_dlp  # type: ignore[import-untyped]
 
@@ -1527,7 +1570,17 @@ class InstagramParser(BaseParser):
             ],
             "quiet": True,
             "no_warnings": True,
+            # Явно указываем КАТАЛОГ с ffmpeg: yt-dlp найдёт в нём и ffmpeg,
+            # и ffprobe. Это снимает ошибку "ffprobe and ffmpeg not found",
+            # когда PATH воркера на Railway не содержит /usr/bin.
+            "ffmpeg_location": os.path.dirname(self._ffmpeg_path) or self._ffmpeg_path,
         }
+        logger.debug(
+            "yt-dlp ffmpeg_location=%s (ffmpeg=%s, ffprobe=%s)",
+            ydl_opts["ffmpeg_location"],
+            self._ffmpeg_path,
+            self._ffprobe_path or "—",
+        )
 
         cookie_path = self._create_cookie_file()
         if cookie_path:
@@ -2240,7 +2293,9 @@ if __name__ == "__main__":
             InstagramParser,
             "_fetch_via_apify",
         ) as mock_apify_unused:
-            local_out = await InstagramParser(apify_api_token="dummy").parse(
+            ig_local = InstagramParser(apify_api_token="dummy")
+            ig_local._local_enabled = True  # тест не зависит от наличия ffmpeg
+            local_out = await ig_local.parse(
                 "https://www.instagram.com/reel/local123abc/",
             )
         mock_dl.assert_awaited_once()
@@ -2266,7 +2321,9 @@ if __name__ == "__main__":
             "_fetch_via_apify",
             return_value=("Apify T", "Apify D", "Apify Tr", ""),
         ) as mock_apify_used:
-            empty_out = await InstagramParser(apify_api_token="dummy").parse(
+            ig_empty = InstagramParser(apify_api_token="dummy")
+            ig_empty._local_enabled = True  # тест не зависит от наличия ffmpeg
+            empty_out = await ig_empty.parse(
                 "https://www.instagram.com/reel/empty123abc/",
             )
         mock_apify_used.assert_called_once()
@@ -2298,6 +2355,35 @@ if __name__ == "__main__":
         assert InstagramParser._resolve_audio_path({"id": "ZZ99"}) == "/tmp/reels_audio_ZZ99.mp3"
         assert InstagramParser._resolve_audio_path({}) == ""
         print("✅ Instagram _resolve_audio_path")
+
+        # --- Диагностика ffmpeg: detect + автоотключение локального режима -- #
+        with patch.object(this_mod.shutil, "which", return_value="/usr/local/bin/ffmpeg"):
+            ig_with_ff = InstagramParser(apify_api_token="dummy")
+        assert ig_with_ff._local_enabled is True
+        assert ig_with_ff._ffmpeg_path == "/usr/local/bin/ffmpeg"
+
+        with patch.object(this_mod.shutil, "which", return_value=None), patch.object(
+            os.path, "isfile", return_value=False
+        ):
+            ig_no_ff = InstagramParser(apify_api_token="dummy")
+        assert ig_no_ff._local_enabled is False
+        assert ig_no_ff._ffmpeg_path == ""
+        # parse() при отключённом локальном режиме идёт сразу в Apify, не трогая _download_audio.
+        with patch.object(this_mod.shutil, "which", return_value=None), patch.object(
+            os.path, "isfile", return_value=False
+        ):
+            ig_route = InstagramParser(apify_api_token="dummy")
+        with patch.object(
+            InstagramParser, "_download_audio", new_callable=AsyncMock
+        ) as mock_no_dl, patch.object(
+            InstagramParser,
+            "_fetch_via_apify",
+            return_value=("FF Off T", "FF Off D", "FF Off Tr", ""),
+        ):
+            ff_off_out = await ig_route.parse("https://www.instagram.com/reel/noffmpeg123/")
+        mock_no_dl.assert_not_awaited()
+        assert "FF Off T" in ff_off_out.text and "FF Off Tr" in ff_off_out.text
+        print("✅ Instagram _detect_ffmpeg + автоотключение локального режима")
 
         no_key = YouTubeParser(youtube_api_key="")
         try:
