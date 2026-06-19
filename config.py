@@ -60,6 +60,12 @@ class Config:
     github_model: str = "gpt-5-mini"
     # Усилие рассуждения для reasoning-моделей (minimal, low, medium, high).
     github_reasoning_effort: str = "medium"
+    # Минимальный интервал между обработками URL одним пользователем (сек).
+    url_rate_limit_seconds: int = 180
+    # Макс. длина видео для скачивания аудио и Whisper (сек); длиннее — только описание/субтитры.
+    max_video_duration_seconds: int = 120
+    # Одновременных тяжёлых видео-задач (yt-dlp + Whisper) на весь бот.
+    max_concurrent_video_jobs: int = 3
 
     @property
     def is_development(self) -> bool:
@@ -151,6 +157,22 @@ class Config:
             )
             github_reasoning_effort = "medium"
 
+        url_rate_limit_seconds = cls._parse_positive_int(
+            os.getenv("URL_RATE_LIMIT_SECONDS", "180"),
+            default=180,
+            name="URL_RATE_LIMIT_SECONDS",
+        )
+        max_video_duration_seconds = cls._parse_positive_int(
+            os.getenv("MAX_VIDEO_DURATION_SECONDS", "120"),
+            default=120,
+            name="MAX_VIDEO_DURATION_SECONDS",
+        )
+        max_concurrent_video_jobs = cls._parse_positive_int(
+            os.getenv("MAX_CONCURRENT_VIDEO_JOBS", "3"),
+            default=3,
+            name="MAX_CONCURRENT_VIDEO_JOBS",
+        )
+
         environment = os.getenv("ENVIRONMENT", "production").strip().lower() or "production"
         if environment not in _ALLOWED_ENVIRONMENTS:
             print(
@@ -177,7 +199,30 @@ class Config:
             youtube_cookie_file=youtube_cookie_file,
             github_model=github_model,
             github_reasoning_effort=github_reasoning_effort,
+            url_rate_limit_seconds=url_rate_limit_seconds,
+            max_video_duration_seconds=max_video_duration_seconds,
+            max_concurrent_video_jobs=max_concurrent_video_jobs,
         )
+
+    @staticmethod
+    def _parse_positive_int(raw: str, *, default: int, name: str) -> int:
+        """Распарсить положительное целое из env с fallback."""
+        text = (raw or "").strip()
+        try:
+            value = int(text)
+        except ValueError:
+            print(
+                f"⚠️  Некорректный {name}='{text}', используем {default}.",
+                file=sys.stderr,
+            )
+            return default
+        if value <= 0:
+            print(
+                f"⚠️  {name} должно быть > 0, получено {value}; используем {default}.",
+                file=sys.stderr,
+            )
+            return default
+        return value
 
     @staticmethod
     def _fail_missing(missing: List[str]) -> None:

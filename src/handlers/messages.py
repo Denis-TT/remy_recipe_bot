@@ -42,6 +42,7 @@ from ..keyboards import (
 )
 from ..normalizer import MAX_IMAGE_BYTES
 from ..localization import Localization
+from ..ytdlp_mixin import VideoPolicyError
 from . import callbacks, commands
 
 if TYPE_CHECKING:
@@ -681,6 +682,12 @@ async def _handle_text_recipe(
         )
         return
 
+    if user_id in bot.processing_urls:
+        await message.reply_text(
+            "⏳ Уже обрабатываю предыдущий запрос. Подожди — скоро пришлю результат.",
+        )
+        return
+
     bot.processing_urls[user_id] = job_key
 
     status: Message = await message.reply_text("⏳ Запускаю обработку…")
@@ -787,17 +794,31 @@ async def _handle_url(
 
     logger.info("🔍 Начинаю обработку URL: %s", url)
 
+    allowed, wait_sec = bot.url_rate_limiter.check(user_id)
+    if not allowed:
+        limit_sec = bot.config.url_rate_limit_seconds
+        if limit_sec % 60 == 0:
+            limit_label = f"{limit_sec // 60} мин"
+        else:
+            limit_label = f"{limit_sec} сек"
+        await message.reply_text(
+            f"⏳ Слишком часто. Подожди {wait_sec} сек. перед следующей ссылкой "
+            f"(лимит: 1 ссылка раз в {limit_label}).",
+        )
+        return
+
+    if user_id in bot.processing_urls:
+        await message.reply_text(
+            "⏳ Уже обрабатываю предыдущий запрос. Подожди — скоро пришлю результат.",
+        )
+        return
+
     src_parser = bot.parser.get_parser(url)
     source_type = getattr(src_parser, "source_type", "") if src_parser else ""
     job_key = _url_processing_key(url, source_type)
 
-    if bot.processing_urls.get(user_id) == job_key:
-        await message.reply_text(
-            "⏳ Эта ссылка уже обрабатывается. Подожди — скоро пришлю результат.",
-        )
-        return
-
     bot.processing_urls[user_id] = job_key
+    bot.url_rate_limiter.record(user_id)
 
     status: Message = await message.reply_text("⏳ Запускаю обработку…")
     is_video = source_type in _VIDEO_SOURCE_TYPES
@@ -825,6 +846,10 @@ async def _handle_url(
                 on_progress=_on_parser_progress if is_video else None,
             )
             raw_text = parsed.text
+        except VideoPolicyError as exc:
+            logger.info("ℹ️ Ограничение по видео: %s", exc)
+            await _safe_edit(status, f"❌ {_html_escape(str(exc))}")
+            return
         except Exception as exc:  # noqa: BLE001 — логируем любую причину
             logger.error("❌ Ошибка обработки URL: %s", exc)
             await _safe_edit(status, f"❌ Не удалось прочитать страницу:\n<code>{_html_escape(str(exc))}</code>")

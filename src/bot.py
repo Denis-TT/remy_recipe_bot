@@ -25,6 +25,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import threading
 import time
@@ -45,6 +46,7 @@ from .handlers import callbacks, commands, messages
 from .localization import Localization
 from .normalizer import RecipeNormalizer
 from .parser import InstagramParser, ParserRegistry, create_parser_registry, ensure_images_dir
+from .rate_limit import UserRateLimiter
 from .ytdlp_mixin import YtdlpWhisperMixin
 from .storage import SupabaseStorage
 
@@ -99,6 +101,11 @@ class RemyBot:
         # user_id → ключ обрабатываемой ссылки (shortcode Instagram или URL),
         # чтобы не запускать два тяжёлых Whisper-процесса на один Reels.
         self.processing_urls: Dict[int, str] = {}
+        self.url_rate_limiter = UserRateLimiter(self.config.url_rate_limit_seconds)
+        self.heavy_job_semaphore = asyncio.Semaphore(self.config.max_concurrent_video_jobs)
+        for parser in self.parser.parsers:
+            if isinstance(parser, YtdlpWhisperMixin):
+                parser.heavy_job_semaphore = self.heavy_job_semaphore
 
         self._app: Optional[Application] = None
 

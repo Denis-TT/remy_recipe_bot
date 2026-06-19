@@ -13,6 +13,7 @@ import asyncio
 import contextlib
 import logging
 import os
+import re
 import shutil
 import time
 import uuid
@@ -27,6 +28,41 @@ logger = logging.getLogger(__name__)
 IMAGES_DIR: str = str(_remy_config.images_dir or "/images").rstrip("/") or "/images"
 
 ProgressCallback = Callable[[str, str], Awaitable[None]]
+
+_RECIPE_META_SIGNAL_RE = re.compile(
+    r"(?:"
+    r"ингредиент|состав|готовк|приготовлен|рецепт|"
+    r"\d+\s*г\b|\d+\s*мл\b|\d+\s*шт\b|\d+\s*ч\.?\s*л"
+    r")",
+    re.IGNORECASE,
+)
+
+
+class VideoPolicyError(RuntimeError):
+    """Ограничение по длине видео или недостатку текста без транскрипции."""
+
+
+def _format_duration(seconds: int) -> str:
+    sec = max(0, int(seconds))
+    if sec < 60:
+        return f"{sec} сек"
+    minutes, rem = divmod(sec, 60)
+    if rem == 0:
+        return f"{minutes} мин"
+    return f"{minutes} мин {rem} сек"
+
+
+def metadata_sufficient_for_recipe(text: str) -> bool:
+    """Достаточно ли описания/субтитров, чтобы обойтись без Whisper."""
+    t = (text or "").strip()
+    if len(t) < 80:
+        return False
+    if _RECIPE_META_SIGNAL_RE.search(t) and len(t) >= 80:
+        return True
+    if len(t) < 120:
+        return False
+    lines = [ln.strip() for ln in t.splitlines() if ln.strip()]
+    return len(t) >= 300 or len(lines) >= 6
 
 
 def _images_dir() -> str:
@@ -146,6 +182,11 @@ class YtdlpWhisperMixin:
     _ffmpeg_path: str
     _ffprobe_path: str
     _local_enabled: bool
+    heavy_job_semaphore: Optional[asyncio.Semaphore] = None
+
+    @property
+    def max_video_duration_seconds(self) -> int:
+        return max(1, int(getattr(_remy_config, "max_video_duration_seconds", 120) or 120))
 
     @property
     @abstractmethod
@@ -192,6 +233,26 @@ class YtdlpWhisperMixin:
         supplement_transcript: Optional[Callable[[str], str]] = None,
     ) -> Any:
         """Универсальный пайплайн: метаданные → Whisper → объединение → Apify."""
+        sem = self.heavy_job_semaphore
+        if sem is not None:
+            await sem.acquire()
+        try:
+            return await self._parse_ytdlp_video_inner(
+                url,
+                on_progress=on_progress,
+                supplement_transcript=supplement_transcript,
+            )
+        finally:
+            if sem is not None:
+                sem.release()
+
+    async def _parse_ytdlp_video_inner(
+        self,
+        url: str,
+        *,
+        on_progress: Optional[ProgressCallback] = None,
+        supplement_transcript: Optional[Callable[[str], str]] = None,
+    ) -> Any:
         from .parser import ParseResult
 
         async def _notify(stage: str, detail: str = "") -> None:
@@ -201,17 +262,21 @@ class YtdlpWhisperMixin:
         title = ""
         description = ""
         image_path: Optional[str] = None
+        duration_sec = 0
+        info: Optional[dict] = None
 
         await _notify("fetching_metadata")
         try:
             info = await self._fetch_ytdlp_info(url, download=False)
+            duration_sec = int(info.get("duration") or 0) if isinstance(info, dict) else 0
             title, description, thumb_url = self._metadata_from_info(info)
             if title or description:
                 logger.info(
-                    "%s: метаданные title=%d симв., description=%d симв.",
+                    "%s: метаданные title=%d симв., description=%d симв., duration=%ss",
                     type(self).__name__,
                     len(title),
                     len(description),
+                    duration_sec,
                 )
             if thumb_url:
                 logger.info("%s: обложка найдена через yt-dlp", type(self).__name__)
@@ -222,6 +287,49 @@ class YtdlpWhisperMixin:
                 type(self).__name__,
                 exc,
             )
+
+        max_dur = self.max_video_duration_seconds
+        if duration_sec > max_dur:
+            caption_supplement = ""
+            if supplement_transcript is not None:
+                try:
+                    caption_supplement = await asyncio.to_thread(supplement_transcript, url)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "%s: не удалось получить субтитры для длинного видео: %s",
+                        type(self).__name__,
+                        exc,
+                    )
+            combined_meta = "\n\n".join(
+                part.strip() for part in (description, caption_supplement) if part.strip()
+            )
+            if not metadata_sufficient_for_recipe(combined_meta):
+                raise VideoPolicyError(
+                    f"Видео слишком длинное ({_format_duration(duration_sec)}). "
+                    f"Обрабатываются только клипы до {_format_duration(max_dur)}. "
+                    "В описании и субтитрах недостаточно текста для рецепта — "
+                    "пришли короткий клип или ссылку с полным описанием."
+                )
+            logger.info(
+                "%s: видео %ss > %ss — пропускаем Whisper, используем описание/субтитры",
+                type(self).__name__,
+                duration_sec,
+                max_dur,
+            )
+            text = video_compose_text(
+                self.PLATFORM_NAME,
+                title,
+                description,
+                caption_supplement,
+            )
+            if not text.strip():
+                raise VideoPolicyError(
+                    f"Видео слишком длинное ({_format_duration(duration_sec)}), "
+                    "а текст из описания пуст."
+                )
+            if len(text) > self.MAX_TEXT_LENGTH:
+                text = text[: self.MAX_TEXT_LENGTH]
+            return ParseResult(text=text, image_url=image_path)
 
         transcript = ""
         if self._local_enabled:
@@ -239,7 +347,7 @@ class YtdlpWhisperMixin:
             if audio_path:
                 await _notify("transcribing")
                 try:
-                    transcript = await asyncio.wait_for(
+                    whisper_text = await asyncio.wait_for(
                         self._transcribe_audio(audio_path, on_progress=on_progress),
                         timeout=self.TRANSCRIBE_TIMEOUT_SECONDS,
                     )
@@ -249,8 +357,9 @@ class YtdlpWhisperMixin:
                         type(self).__name__,
                         self.TRANSCRIBE_TIMEOUT_SECONDS,
                     )
-                    transcript = ""
-                if transcript.strip():
+                    whisper_text = ""
+                if whisper_text.strip():
+                    transcript = whisper_text.strip()
                     logger.info("✅ %s: локальное распознавание речи успешно", type(self).__name__)
         else:
             logger.info(
@@ -260,7 +369,7 @@ class YtdlpWhisperMixin:
             await _notify("apify_fallback", "нет ffmpeg")
 
         if supplement_transcript and not transcript.strip():
-            extra = supplement_transcript(url)
+            extra = await asyncio.to_thread(supplement_transcript, url)
             if extra.strip():
                 transcript = extra.strip()
                 logger.info(
@@ -508,3 +617,15 @@ class YtdlpWhisperMixin:
         with open(dest_path, "wb") as f:
             f.write(data)
         return True
+
+
+if __name__ == "__main__":
+    assert not metadata_sufficient_for_recipe("коротко")
+    assert metadata_sufficient_for_recipe(
+        "Ингредиенты: мука 500 г, молоко 800 мл, яйца 3 шт. "
+        "Смешать, жарить на сковороде."
+    )
+    assert not metadata_sufficient_for_recipe("просто название блюда без деталей")
+    assert _format_duration(45) == "45 сек"
+    assert _format_duration(120) == "2 мин"
+    print("✅ ytdlp_mixin: video policy helpers")
