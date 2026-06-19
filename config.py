@@ -48,6 +48,8 @@ class Config:
     apify_api_token: str = ""
     # Instagram sessionid для Actor ``apple_yang~instagram-transcripts-scraper`` (опционально).
     instagram_session_id: str = ""
+    # VK remixsid для yt-dlp и приватных видео (опционально).
+    vk_remixsid: str = ""
     # Каталог для сохранения изображений рецептов (том на Railway: /images).
     images_dir: str = "/images"
     # Hugging Face Inference API (FLUX.1-dev) — генерация изображений блюд.
@@ -121,6 +123,8 @@ class Config:
 
         instagram_session_id = cls._env_optional_secret("INSTAGRAM_SESSION_ID")
 
+        vk_remixsid = cls._env_optional_secret("VK_REMIXSID")
+
         _img = (os.getenv("IMAGES_DIR") or os.getenv("REMY_IMAGES_DIR") or "/images").strip()
         images_dir = _img.rstrip("/") or "/images"
 
@@ -148,6 +152,7 @@ class Config:
             youtube_api_key=youtube_api_key,
             apify_api_token=apify_api_token,
             instagram_session_id=instagram_session_id,
+            vk_remixsid=vk_remixsid,
             images_dir=images_dir,
             hf_api_key=hf_api_key,
             youtube_cookie_file=youtube_cookie_file,

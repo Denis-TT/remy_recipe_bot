@@ -5,6 +5,7 @@
 * `WebParser` — обычные HTTP(S)-страницы с рецептами.
 * `YouTubeParser` — yt-dlp метаданные + Whisper + публичные субтитры / Apify-fallback.
 * `TikTokParser` — тот же пайплайн для TikTok.
+* `VkVideoParser` — VK Video: yt-dlp + Whisper + Apify ``umbrella_software~vk-videos-scraper``.
 * `InstagramParser` — Reels: yt-dlp + Whisper + Apify ``apple_yang~instagram-transcripts-scraper``.
 * `ParserRegistry` / `create_parser_registry` — маршрутизация и фабрика.
 """
@@ -771,6 +772,9 @@ APIFY_INSTAGRAM_TRANSCRIPT_ACTOR = "apple_yang~instagram-transcripts-scraper"
 # Дольше, чем YouTube — транскрипт Instagram может обрабатываться минутами.
 APIFY_INSTAGRAM_WAIT_FINISH_SEC = 300
 APIFY_TIKTOK_TRANSCRIPT_ACTOR = "scrape-creators~best-tiktok-transcripts-scraper"
+# VK Video: https://apify.com/umbrella_software/vk-videos-scraper (режим LINKS по URL)
+APIFY_VK_VIDEO_ACTOR = "umbrella_software~vk-videos-scraper"
+APIFY_VK_WAIT_FINISH_SEC = 300
 APIFY_WAIT_FINISH_SEC = 120
 
 
@@ -1357,6 +1361,152 @@ def _instagram_compose_text(title: str, description: str, transcript: str) -> st
     return video_compose_text("Reels", title, description, transcript)
 
 
+def _vk_extract_from_item(item: Any) -> tuple[str, str, str, str]:
+    """Разобрать объект Apify ``umbrella_software~vk-videos-scraper`` или metadata-extractor."""
+    if not isinstance(item, dict):
+        return "", "", "", ""
+    title = safe_video_str(item.get("video_title") or item.get("title"))
+    description = safe_video_str(item.get("video_description") or item.get("description"))
+    author = safe_video_str(item.get("author") or item.get("video_author"))
+    if author:
+        handle = author if author.startswith("@") else f"@{author}"
+        if description and handle not in description:
+            description = f"{handle}\n\n{description}".strip()
+        elif not description:
+            description = handle
+    transcript = safe_video_str(
+        item.get("transcript")
+        or item.get("transcriptText")
+        or item.get("subtitle")
+        or item.get("text")
+    )
+    if not transcript:
+        transcript = _instagram_segments_to_text(item.get("segments"))
+    img_url = safe_video_str(
+        item.get("thumbnail") or item.get("video_thumbnail") or item.get("img")
+    )
+    return title, description, transcript, img_url
+
+
+class VkVideoParser(YtdlpWhisperMixin, BaseParser):
+    """VK Video: yt-dlp + Whisper + Apify-fallback (``umbrella_software~vk-videos-scraper``)."""
+
+    source_type: str = "vk"
+    generate_image_default: bool = False
+    PLATFORM_NAME: str = "VK Video"
+    AUDIO_OUTTMPL: str = "/tmp/vk_audio_%(id)s.%(ext)s"
+    AUDIO_LOG_LABEL: str = "VK Video"
+    HEADERS: dict = WebParser.HEADERS
+    COOKIE_FILE_PATH: str = "/tmp/vk_cookies.txt"
+
+    def __init__(self, apify_api_token: str = "", vk_remixsid: str = "") -> None:
+        self._apify_api_token = (apify_api_token or "").strip()
+        self.remixsid = (vk_remixsid or "").strip()
+        self._init_ytdlp_whisper()
+
+    def _ytdlp_cookiefile(self) -> str:
+        return self._create_cookie_file()
+
+    @staticmethod
+    def _extract_video_id(url: str) -> str:
+        m = re.search(
+            r"(?:vk\.com|vkvideo\.ru)/(?:video|clip)-?(-?\d+)_(\d+)",
+            (url or "").strip(),
+            re.IGNORECASE,
+        )
+        return f"{m.group(1)}_{m.group(2)}" if m else ""
+
+    @staticmethod
+    def can_parse(url: str) -> bool:
+        if not isinstance(url, str) or not url.strip():
+            return False
+        u = url.lower().strip()
+        return bool(
+            re.search(
+                r"(?:^|://)(?:www\.|m\.)?(?:vk\.com|vkvideo\.ru)/(?:video|clip)-?\d+_\d+",
+                u,
+                re.IGNORECASE,
+            )
+        )
+
+    async def parse(
+        self,
+        url: str,
+        *,
+        on_progress: Optional[ProgressCallback] = None,
+    ) -> ParseResult:
+        if not self.can_parse(url):
+            raise ValueError(f"VkVideoParser не поддерживает URL: {url!r}")
+        return await self.parse_ytdlp_video(url, on_progress=on_progress)
+
+    @staticmethod
+    def _resolve_audio_path(info: Optional[dict]) -> str:
+        info = info or {}
+        requested = info.get("requested_downloads")
+        if isinstance(requested, list) and requested:
+            first = requested[0]
+            if isinstance(first, dict):
+                fp = first.get("filepath") or first.get("_filename") or ""
+                if fp:
+                    base, _ext = os.path.splitext(fp)
+                    return base + ".mp3"
+        video_id = str(info.get("id") or "").strip()
+        if video_id:
+            return f"/tmp/vk_audio_{video_id}.mp3"
+        return ""
+
+    def _create_cookie_file(self) -> str:
+        if not self.remixsid:
+            return ""
+        cookie_line = "\t".join(
+            [".vk.com", "TRUE", "/", "TRUE", "0", "remixsid", self.remixsid]
+        )
+        content = "# Netscape HTTP Cookie File\n" + cookie_line + "\n"
+        try:
+            with open(self.COOKIE_FILE_PATH, "w", encoding="utf-8") as fh:
+                fh.write(content)
+        except OSError as exc:
+            logger.warning("Не удалось создать cookie-файл VK: %s", exc)
+            return ""
+        return self.COOKIE_FILE_PATH
+
+    def _fetch_apify_fallback(self, url: str) -> tuple[str, str, str, str]:
+        token = (self._apify_api_token or "").strip()
+        if not token:
+            logger.error("Ошибка получения VK Video метаданных: Apify токен не задан")
+            return "", "", "", ""
+
+        run_url = (
+            f"https://api.apify.com/v2/acts/{APIFY_VK_VIDEO_ACTOR}/runs"
+            f"?waitForFinish={APIFY_VK_WAIT_FINISH_SEC}"
+        )
+        body: dict[str, Any] = {
+            "mode": "LINKS",
+            "videoUrls": [{"url": url}],
+            "proxy": {"useApifyProxy": True},
+        }
+        envelope = _apify_http_json("POST", run_url, token, body)
+        if not isinstance(envelope, dict):
+            return "", "", "", ""
+
+        run = envelope.get("data")
+        if not isinstance(run, dict):
+            return "", "", "", ""
+        run_id = run.get("id")
+        if not run_id:
+            return "", "", "", ""
+
+        items_url = f"https://api.apify.com/v2/actor-runs/{run_id}/dataset/items?format=json"
+        items_payload = _apify_http_json("GET", items_url, token, None)
+        item: Any = items_payload
+        if isinstance(items_payload, list):
+            item = items_payload[0] if items_payload else None
+        title, description, transcript_text, img_url = _vk_extract_from_item(item)
+        if title or description or transcript_text:
+            logger.info("Получены данные через Apify VK Videos Scraper")
+        return title, description, transcript_text, img_url
+
+
 class InstagramParser(YtdlpWhisperMixin, BaseParser):
     """Instagram Reels: yt-dlp + Whisper + Apify-fallback (``apple_yang~instagram-transcripts-scraper``)."""
 
@@ -1626,15 +1776,19 @@ class ParserRegistry:
 
 
 def create_parser_registry(cfg: Optional[object] = None) -> ParserRegistry:
-    """Реестр: YouTube, TikTok, Instagram, Web."""
+    """Реестр: YouTube, TikTok, VK Video, Instagram, Web."""
     if cfg is None:
         from config import config as _cfg
         cfg = _cfg
     apify_tok = str(getattr(cfg, "apify_api_token", "") or "")
     instagram_session_id = str(getattr(cfg, "instagram_session_id", "") or "")
+    vk_remixsid = str(getattr(cfg, "vk_remixsid", "") or "")
     registry = ParserRegistry()
     registry.register(YouTubeParser(apify_api_token=apify_tok))
     registry.register(TikTokParser(apify_api_token=apify_tok))
+    registry.register(
+        VkVideoParser(apify_api_token=apify_tok, vk_remixsid=vk_remixsid)
+    )
     registry.register(
         InstagramParser(
             apify_api_token=apify_tok,
@@ -2320,6 +2474,29 @@ if __name__ == "__main__":
         assert not TikTokParser.can_parse("https://www.youtube.com/watch?v=dQw4w9WgXcQ")
         print("✅ TikTok can_parse")
 
+        assert VkVideoParser.can_parse("https://vk.com/video-22822305_456243020")
+        assert VkVideoParser.can_parse("https://vkvideo.ru/video-61462919_456240518")
+        assert VkVideoParser.can_parse("https://m.vk.com/clip-123_456")
+        assert VkVideoParser._extract_video_id(
+            "https://vk.com/video-22822305_456243020",
+        ) == "22822305_456243020"
+        assert VkVideoParser._extract_video_id(
+            "https://vkvideo.ru/video-61462919_456240518",
+        ) == "61462919_456240518"
+        assert not VkVideoParser.can_parse("https://www.instagram.com/reel/ABC/")
+        vk_item_t, vk_item_d, vk_item_tr, vk_item_img = _vk_extract_from_item({
+            "video_title": "Рецепт борща",
+            "video_description": "Ингредиенты: свёкла, капуста",
+            "author": "chef_vk",
+        })
+        assert vk_item_t == "Рецепт борща"
+        assert "свёкла" in vk_item_d and "@chef_vk" in vk_item_d
+        assert vk_item_tr == ""
+        assert vk_item_img == ""
+        print("✅ VK Video can_parse / extract / Apify item parser")
+
+        assert VkVideoParser.generate_image_default is False
+
         _yt_metadata = {
             "title": "Mock Recipe Video Title Here",
             "description": "Line one\n\nIngredients: test flour 200g",
@@ -2399,6 +2576,8 @@ if __name__ == "__main__":
         assert ig_p is not None and getattr(ig_p, "source_type", None) == "instagram"
         tt_p = registry.get_parser("https://www.tiktok.com/@x/video/123")
         assert tt_p is not None and getattr(tt_p, "source_type", None) == "tiktok"
+        vk_p = registry.get_parser("https://vk.com/video-1_2")
+        assert vk_p is not None and getattr(vk_p, "source_type", None) == "vk"
         assert registry.get_parser("https://eda.ru/test") is not None
         assert registry.get_parser("not-a-url") is None
         print("✅ can_parse / реестр")

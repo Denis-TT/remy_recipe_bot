@@ -453,7 +453,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 # Прогресс обработки URL (чеклист этапов в одном статусном сообщении)
 # --------------------------------------------------------------------------- #
 
-# Этапы коротких видео (Instagram, YouTube, TikTok).
+# Этапы коротких видео (Instagram, YouTube, TikTok, VK).
 _VIDEO_PROGRESS_STEPS: tuple[tuple[str, str], ...] = (
     ("metadata", "Читаю описание видео"),
     ("transcribe", "Распознаю речь"),
@@ -475,7 +475,7 @@ _VIDEO_PARSER_STAGE_TO_STEP: dict[str, str] = {
     "apify_fallback": "transcribe",
 }
 
-_VIDEO_SOURCE_TYPES = frozenset({"instagram", "youtube", "tiktok"})
+_VIDEO_SOURCE_TYPES = frozenset({"instagram", "youtube", "tiktok", "vk"})
 
 
 class RecipeProgress:
@@ -493,6 +493,8 @@ class RecipeProgress:
             self._title = "▶️ <b>YouTube</b>"
         elif source_type == "tiktok":
             self._title = "🎵 <b>TikTok</b>"
+        elif source_type == "vk":
+            self._title = "📺 <b>VK Видео</b>"
         elif video:
             self._title = "🎬 <b>Видео</b>"
         else:
@@ -549,13 +551,17 @@ def _url_processing_key(url: str, source_type: str) -> str:
         shortcode = InstagramParser._extract_shortcode(url)
         if shortcode:
             return f"ig:{shortcode}"
-    if source_type in ("youtube", "tiktok"):
-        from ..parser import TikTokParser, YouTubeParser
+    if source_type in ("youtube", "tiktok", "vk"):
+        from ..parser import TikTokParser, VkVideoParser, YouTubeParser
 
         if source_type == "youtube":
             vid = YouTubeParser._extract_youtube_video_id(url)
             if vid:
                 return f"yt:{vid}"
+        elif source_type == "vk":
+            vid = VkVideoParser._extract_video_id(url)
+            if vid:
+                return f"vk:{vid}"
         else:
             normalized = url.strip().lower().rstrip("/")
             return f"tt:{normalized}"

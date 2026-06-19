@@ -1,5 +1,5 @@
 """
-Общий пайплайн yt-dlp + faster-whisper для коротких видео (Reels, YouTube, TikTok).
+Общий пайплайн yt-dlp + faster-whisper для коротких видео (Reels, YouTube, TikTok, VK).
 
   1. Метаданные и обложка через yt-dlp (без скачивания видео);
   2. Аудио + faster-whisper — шаги из видео;
