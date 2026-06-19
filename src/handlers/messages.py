@@ -455,7 +455,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 # Этапы Instagram Reels, которые отображаются пользователю.
 _IG_PROGRESS_STEPS: tuple[tuple[str, str], ...] = (
-    ("download", "Скачиваю аудио"),
+    ("metadata", "Читаю описание Reels"),
     ("transcribe", "Распознаю речь"),
     ("normalize", "Анализирую рецепт"),
     ("present", "Формирую карточку"),
@@ -470,7 +470,9 @@ _DEFAULT_PROGRESS_STEPS: tuple[tuple[str, str], ...] = (
 
 # Соответствие внутренних стадий InstagramParser → id шага в чеклисте.
 _IG_PARSER_STAGE_TO_STEP: dict[str, str] = {
-    "downloading_audio": "download",
+    "fetching_metadata": "metadata",
+    "description_sufficient": "transcribe",
+    "downloading_audio": "transcribe",
     "transcribing": "transcribe",
     "apify_fallback": "transcribe",
 }
@@ -578,6 +580,8 @@ async def _handle_url(
         step_id = _IG_PARSER_STAGE_TO_STEP.get(stage, stage)
         if stage == "apify_fallback":
             await progress.set_stage(step_id, detail or "запасной путь")
+        elif stage == "description_sufficient":
+            await progress.set_stage(step_id, detail or "не требуется")
         elif detail:
             await progress.set_stage(step_id, detail)
         else:
@@ -1035,11 +1039,11 @@ if __name__ == "__main__":
     _mock_status_msg = MagicMock()
     _prog = RecipeProgress(_mock_status_msg, instagram=True)
     _prog._current = "transcribe"
-    _prog._completed.add("download")
+    _prog._completed.add("metadata")
     _prog._detail = "42 с"
     _progress_text = _prog._render_text()
     assert "📸" in _progress_text and "1/4" in _progress_text
-    assert "✅ 1/4 Скачиваю аудио" in _progress_text
+    assert "✅ 1/4 Читаю описание Reels" in _progress_text
     assert "🔄 2/4 Распознаю речь — 42 с" in _progress_text
     assert "⏳ 3/4 Анализирую рецепт" in _progress_text
     print("✅ RecipeProgress чеклист (Instagram)")

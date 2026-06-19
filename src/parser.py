@@ -1366,6 +1366,18 @@ def _instagram_author_description(user_name: str, full_name: str) -> str:
     return user or full
 
 
+def _instagram_compose_text(title: str, description: str, transcript: str) -> str:
+    """Собрать сырой текст Reels: описание в приоритете, речь — дополнение."""
+    chunks: List[str] = []
+    if title.strip():
+        chunks.append(f"Название Reels:\n{title.strip()}")
+    if description.strip():
+        chunks.append(f"Описание Reels (приоритетный источник):\n{description.strip()}")
+    if transcript.strip():
+        chunks.append(f"Речь в видео / субтитры (дополнение):\n{transcript.strip()}")
+    return "\n\n".join(chunks)
+
+
 def _instagram_extract_from_item(item: Any) -> tuple[str, str, str, str]:
     """Разобрать один объект Actor ``apple_yang~instagram-transcripts-scraper``."""
     if not isinstance(item, dict):
@@ -1394,16 +1406,14 @@ def _instagram_extract_from_item(item: Any) -> tuple[str, str, str, str]:
 
 
 class InstagramParser(BaseParser):
-    """Instagram Reels и посты: локальное распознавание речи + Apify-fallback.
+    """Instagram Reels: yt-dlp метаданные + Whisper + Apify-fallback.
 
-    Основной путь — автономный и бесплатный:
-      1. ``yt-dlp`` скачивает аудиодорожку Reels во временный ``.mp3``;
-      2. ``faster-whisper`` (модель ``small``, int8 на CPU) распознаёт речь офлайн.
+    Локальный бесплатный пайплайн:
 
-    Если локальная обработка не удалась (ошибка скачивания, таймаут, пустой текст,
-    отсутствуют зависимости), парсер прозрачно переключается на платный
-    Apify Actor ``apple_yang~instagram-transcripts-scraper`` — он же даёт
-    превью-картинку (поле ``img``).
+      1. ``yt-dlp`` без скачивания видео — описание (caption), название, обложка;
+      2. если описания достаточно для рецепта — Whisper **не вызывается**;
+      3. иначе — аудио + ``faster-whisper`` (модель ``small``, int8);
+      4. при сбое — Apify Actor ``apple_yang~instagram-transcripts-scraper``.
 
     Actor: https://apify.com/apple_yang/instagram-transcripts-scraper
     """
@@ -1420,6 +1430,22 @@ class InstagramParser(BaseParser):
     WHISPER_MODEL_NAME: str = "small"
     WHISPER_COMPUTE_TYPE: str = "int8"
     TRANSCRIBE_TIMEOUT_SECONDS: float = 120.0
+
+    # Минимальная длина caption, чтобы считать описание «полноценным» без Whisper.
+    MIN_DESCRIPTION_CHARS: int = 120
+    # Короткое описание допустимо, если есть явные признаки рецепта / граммовок.
+    MIN_DESCRIPTION_WITH_RECIPE_HINT_CHARS: int = 40
+
+    _RECIPE_HINT_RE = re.compile(
+        r"(ингредиент|рецепт|приготов|готовим|состав|понадоб|нужно|"
+        r"нарез|запек|варить|жарить|смешать|духовк)",
+        re.IGNORECASE,
+    )
+    _QUANTITY_HINT_RE = re.compile(
+        r"\d+[\d.,/]*\s*(?:г|гр|кг|мл|л|шт|ст\.?\s*л\.?|ч\.?\s*л\.?|"
+        r"столов|чайн|порци)",
+        re.IGNORECASE,
+    )
 
     # Стандартные пути бинарников после `apt install ffmpeg` (Railway / Debian).
     FFMPEG_FALLBACK_PATH: str = "/usr/bin/ffmpeg"
@@ -1482,6 +1508,61 @@ class InstagramParser(BaseParser):
             )
         )
 
+    @classmethod
+    def _description_is_sufficient(cls, description: str) -> bool:
+        """Проверить, хватает ли caption Reels для нормализации без Whisper."""
+        text = (description or "").strip()
+        if not text:
+            return False
+        if len(text) >= cls.MIN_DESCRIPTION_CHARS:
+            return True
+        if len(text) >= cls.MIN_DESCRIPTION_WITH_RECIPE_HINT_CHARS:
+            if cls._RECIPE_HINT_RE.search(text) or cls._QUANTITY_HINT_RE.search(text):
+                return True
+        return False
+
+    @staticmethod
+    def _pick_best_thumbnail(info: Optional[dict]) -> str:
+        """Выбрать URL обложки максимального качества из метаданных yt-dlp."""
+        info = info or {}
+        thumbs = info.get("thumbnails")
+        if isinstance(thumbs, list) and thumbs:
+            best: Optional[dict] = None
+            best_score = -1
+            for item in thumbs:
+                if not isinstance(item, dict):
+                    continue
+                url = str(item.get("url") or "").strip()
+                if not url:
+                    continue
+                score = int(item.get("height") or 0) * int(item.get("width") or 0)
+                if score <= 0:
+                    score = len(url)
+                if score > best_score:
+                    best_score = score
+                    best = item
+            if best is not None:
+                return str(best.get("url") or "").strip()
+        return str(info.get("thumbnail") or "").strip()
+
+    @staticmethod
+    def _metadata_from_info(info: Optional[dict]) -> tuple[str, str, str]:
+        """Извлечь название, описание (caption) и URL обложки из ответа yt-dlp."""
+        info = info or {}
+        title = _instagram_safe_str(info.get("title") or info.get("fulltitle"))
+        description = _instagram_safe_str(info.get("description"))
+        if not description:
+            description = title
+            title = ""
+        elif title and description == title:
+            title = ""
+        uploader = _instagram_safe_str(info.get("uploader") or info.get("channel"))
+        if uploader and uploader not in description:
+            handle = uploader if uploader.startswith("@") else f"@{uploader}"
+            description = f"{handle}\n\n{description}".strip()
+        thumb_url = InstagramParser._pick_best_thumbnail(info)
+        return title, description, thumb_url
+
     async def parse(
         self,
         url: str,
@@ -1495,14 +1576,41 @@ class InstagramParser(BaseParser):
             if on_progress is not None:
                 await on_progress(stage, detail)
 
-        # --- 1. Основной путь: локальное скачивание + Whisper -------------- #
-        audio_path = ""
-        if not self._local_enabled:
-            logger.info(
-                "ℹ️ Локальное распознавание отключено (нет ffmpeg) — использую Apify",
-            )
-            await _notify("apify_fallback", "нет ffmpeg")
-        else:
+        title = ""
+        description = ""
+        thumb_url = ""
+        image_path: Optional[str] = None
+
+        # --- 0. Метаданные yt-dlp: caption + обложка (без скачивания видео) --- #
+        await _notify("fetching_metadata")
+        try:
+            info = await self._fetch_ytdlp_info(url, download=False)
+            title, description, thumb_url = self._metadata_from_info(info)
+            if title or description:
+                logger.info(
+                    "Получены метаданные Instagram: title=%d симв., description=%d симв.",
+                    len(title),
+                    len(description),
+                )
+            if thumb_url:
+                logger.info("Обложка Reels найдена через yt-dlp")
+                image_path = await self._download_instagram_image(thumb_url)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Не удалось получить метаданные Instagram через yt-dlp: %s", exc)
+
+        # --- 1. Достаточно caption → возвращаем без Whisper ---------------- #
+        if self._description_is_sufficient(description):
+            text = _instagram_compose_text(title, description, "")
+            if text.strip():
+                logger.info("✅ Описание Reels достаточно — Whisper пропущен")
+                await _notify("description_sufficient", "из описания")
+                if len(text) > self.MAX_TEXT_LENGTH:
+                    text = text[: self.MAX_TEXT_LENGTH]
+                return ParseResult(text=text, image_url=image_path)
+
+        # --- 2. Дополняем речью: локальный Whisper или Apify ---------------- #
+        transcript = ""
+        if self._local_enabled:
             await _notify("downloading_audio")
             try:
                 audio_path = await self._download_audio(url)
@@ -1513,36 +1621,85 @@ class InstagramParser(BaseParser):
                 )
                 audio_path = ""
 
-        if audio_path:
-            await _notify("transcribing")
-            # _transcribe_audio сам не выбрасывает исключений и сам удаляет
-            # временный аудиофайл — нам остаётся проверить результат.
-            try:
-                transcript = await asyncio.wait_for(
-                    self._transcribe_audio(audio_path, on_progress=on_progress),
-                    timeout=self.TRANSCRIBE_TIMEOUT_SECONDS,
-                )
-            except asyncio.TimeoutError:
-                logger.warning(
-                    "⚠️ Распознавание Whisper превысило %.0f с — переключаюсь на Apify",
-                    self.TRANSCRIBE_TIMEOUT_SECONDS,
-                )
-                transcript = ""
-            if transcript.strip():
-                logger.info("✅ Локальное распознавание успешно")
-                text = transcript.strip()
-                if len(text) > self.MAX_TEXT_LENGTH:
-                    text = text[: self.MAX_TEXT_LENGTH]
-                return ParseResult(text=text, image_url=None)
-            logger.warning(
-                "⚠️ Локальное распознавание дало пустой текст. Переключаюсь на Apify",
+            if audio_path:
+                await _notify("transcribing")
+                try:
+                    transcript = await asyncio.wait_for(
+                        self._transcribe_audio(audio_path, on_progress=on_progress),
+                        timeout=self.TRANSCRIBE_TIMEOUT_SECONDS,
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "⚠️ Распознавание Whisper превысило %.0f с — переключаюсь на Apify",
+                        self.TRANSCRIBE_TIMEOUT_SECONDS,
+                    )
+                    transcript = ""
+                if transcript.strip():
+                    logger.info("✅ Локальное распознавание речи успешно")
+        else:
+            logger.info(
+                "ℹ️ Локальное распознавание отключено (нет ffmpeg) — использую Apify",
             )
+            await _notify("apify_fallback", "нет ffmpeg")
 
-        # --- 2. Fallback: старый путь через Apify -------------------------- #
+        text = _instagram_compose_text(title, description, transcript)
+        if text.strip() and (
+            self._description_is_sufficient(description) or transcript.strip()
+        ):
+            if len(text) > self.MAX_TEXT_LENGTH:
+                text = text[: self.MAX_TEXT_LENGTH]
+            return ParseResult(text=text, image_url=image_path)
+
+        logger.warning(
+            "⚠️ Локально недостаточно данных (description=%d симв., transcript=%d) — Apify",
+            len(description),
+            len(transcript),
+        )
+
+        # --- 3. Fallback: Apify (субтитры + img, если yt-dlp не дал обложку) - #
         await _notify("apify_fallback")
-        text, img_url = await asyncio.to_thread(self._parse_sync, url)
-        image_path = await self._download_instagram_image(img_url)
-        return ParseResult(text=text, image_url=image_path)
+        apify_text, apify_img = await asyncio.to_thread(self._parse_sync, url)
+        if not image_path and apify_img:
+            image_path = await self._download_instagram_image(apify_img)
+        if len(apify_text) > self.MAX_TEXT_LENGTH:
+            apify_text = apify_text[: self.MAX_TEXT_LENGTH]
+        return ParseResult(text=apify_text, image_url=image_path)
+
+    def _ytdlp_base_opts(self) -> dict[str, Any]:
+        """Базовые опции yt-dlp с cookie и без лишнего шума в логах."""
+        opts: dict[str, Any] = {
+            "quiet": True,
+            "no_warnings": True,
+        }
+        if self._ffmpeg_path:
+            opts["ffmpeg_location"] = os.path.dirname(self._ffmpeg_path) or self._ffmpeg_path
+        return opts
+
+    async def _fetch_ytdlp_info(self, url: str, *, download: bool = False) -> dict:
+        """Получить метаданные (или скачать медиа) через yt-dlp в фоновом потоке."""
+        import yt_dlp  # type: ignore[import-untyped]
+
+        ydl_opts = self._ytdlp_base_opts()
+        if not download:
+            ydl_opts["skip_download"] = True
+
+        cookie_path = self._create_cookie_file()
+        if cookie_path:
+            ydl_opts["cookiefile"] = cookie_path
+
+        def _extract() -> dict:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                result = ydl.extract_info(url, download=download)
+                if not isinstance(result, dict):
+                    raise RuntimeError("yt-dlp вернул пустые метаданные")
+                return result
+
+        try:
+            return await asyncio.to_thread(_extract)
+        finally:
+            if cookie_path and os.path.isfile(cookie_path):
+                with contextlib.suppress(OSError):
+                    os.remove(cookie_path)
 
     # ----------------------------------------------------------------------- #
     # Локальное распознавание речи: yt-dlp + Whisper
@@ -1590,6 +1747,7 @@ class InstagramParser(BaseParser):
         logger.info("🎵 Скачиваю аудио из Instagram Reels...")
 
         ydl_opts: dict[str, Any] = {
+            **self._ytdlp_base_opts(),
             "format": "bestaudio/best",
             "outtmpl": self.AUDIO_OUTTMPL,
             "postprocessors": [
@@ -1599,16 +1757,10 @@ class InstagramParser(BaseParser):
                     "preferredquality": "192",
                 }
             ],
-            "quiet": True,
-            "no_warnings": True,
-            # Явно указываем КАТАЛОГ с ffmpeg: yt-dlp найдёт в нём и ffmpeg,
-            # и ffprobe. Это снимает ошибку "ffprobe and ffmpeg not found",
-            # когда PATH воркера на Railway не содержит /usr/bin.
-            "ffmpeg_location": os.path.dirname(self._ffmpeg_path) or self._ffmpeg_path,
         }
         logger.debug(
             "yt-dlp ffmpeg_location=%s (ffmpeg=%s, ffprobe=%s)",
-            ydl_opts["ffmpeg_location"],
+            ydl_opts.get("ffmpeg_location"),
             self._ffmpeg_path,
             self._ffprobe_path or "—",
         )
@@ -1857,8 +2009,7 @@ class InstagramParser(BaseParser):
             logger.error("Ошибка получения Instagram субтитров")
             raise RuntimeError("Не удалось извлечь текст из Instagram (пустой ответ Apify)")
 
-        chunks = [title, description, transcript_text]
-        text = "\n\n".join(c for c in chunks if c and str(c).strip())
+        text = _instagram_compose_text(title, description, transcript_text)
 
         if not text.strip():
             logger.error("Ошибка получения Instagram субтитров")
@@ -2303,6 +2454,36 @@ if __name__ == "__main__":
         assert ig_seg_img == ""
         print("✅ Instagram can_parse / shortcode + мок apple_yang dataset")
 
+        assert not InstagramParser._description_is_sufficient("")
+        assert not InstagramParser._description_is_sufficient("просто короткий пост")
+        assert InstagramParser._description_is_sufficient("x" * 120)
+        assert InstagramParser._description_is_sufficient(
+            "Ингредиенты: мука 200 г, яйца 2 шт, соль по вкусу",
+        )
+        thumb_info = {
+            "thumbnails": [
+                {"url": "https://cdn.example.test/small.jpg", "width": 150, "height": 150},
+                {"url": "https://cdn.example.test/cover_hd.jpg", "width": 1080, "height": 1920},
+            ],
+            "thumbnail": "https://cdn.example.test/fallback.jpg",
+        }
+        assert InstagramParser._pick_best_thumbnail(thumb_info) == "https://cdn.example.test/cover_hd.jpg"
+        assert InstagramParser._pick_best_thumbnail({"thumbnail": "https://only.jpg"}) == "https://only.jpg"
+        meta_title, meta_desc, meta_thumb = InstagramParser._metadata_from_info({
+            "title": "Reel Title",
+            "description": "Полный рецепт борща с говядиной",
+            "uploader": "chef_maria",
+            "thumbnails": thumb_info["thumbnails"],
+        })
+        assert meta_title == "Reel Title"
+        assert "борщ" in meta_desc and "@chef_maria" in meta_desc
+        assert meta_thumb == "https://cdn.example.test/cover_hd.jpg"
+        composed = _instagram_compose_text("T", "Описание", "Речь")
+        assert "приоритетный источник" in composed and "дополнение" in composed
+        print("✅ Instagram description priority + thumbnail metadata helpers")
+
+        _ig_metadata_empty: dict[str, Any] = {}
+
         apify_calls: List[tuple[str, str, dict[str, Any] | None]] = []
 
         def _mock_ig_apify(method: str, req_url: str, token: str, body: Optional[dict[str, Any]] = None):
@@ -2333,6 +2514,11 @@ if __name__ == "__main__":
         # роняем, чтобы проверить именно ветку Apify + скачивание картинки.
         with patch.object(
             InstagramParser,
+            "_fetch_ytdlp_info",
+            new_callable=AsyncMock,
+            return_value=_ig_metadata_empty,
+        ), patch.object(
+            InstagramParser,
             "_download_audio",
             new_callable=AsyncMock,
             side_effect=RuntimeError("local disabled in test"),
@@ -2360,8 +2546,56 @@ if __name__ == "__main__":
         assert no_img is None
         print("✅ Instagram parse() с Apify-fallback (локальный путь отключён)")
 
+        # --- Достаточное описание → Whisper и аудио не вызываются -------------- #
+        _ig_recipe_caption = (
+            "Ингредиенты:\n"
+            "• фарш 500 г\n"
+            "• лук 1 шт\n"
+            "• яйцо 1 шт\n"
+            "Запекать 40 мин при 180°C. " * 3
+        )
+        with patch.object(
+            InstagramParser,
+            "_fetch_ytdlp_info",
+            new_callable=AsyncMock,
+            return_value={
+                "title": "Котлеты в духовке",
+                "description": _ig_recipe_caption,
+                "thumbnails": thumb_info["thumbnails"],
+            },
+        ), patch.object(
+            InstagramParser,
+            "_download_audio",
+            new_callable=AsyncMock,
+        ) as mock_dl_skip, patch.object(
+            InstagramParser,
+            "_transcribe_audio",
+            new_callable=AsyncMock,
+        ) as mock_tr_skip, patch.object(
+            InstagramParser,
+            "_download_binary_to_path",
+            side_effect=_fake_ig_image_download,
+        ), patch.object(mod, "IMAGES_DIR", td_ig):
+            ig_caption = InstagramParser(apify_api_token="dummy")
+            ig_caption._local_enabled = True
+            caption_out = await ig_caption.parse(
+                "https://www.instagram.com/reel/fullcaption123/",
+            )
+        mock_dl_skip.assert_not_awaited()
+        mock_tr_skip.assert_not_awaited()
+        assert "Описание Reels (приоритетный источник)" in caption_out.text
+        assert "фарш 500" in caption_out.text
+        assert "Речь в видео" not in caption_out.text
+        assert caption_out.image_url is not None and caption_out.image_url.startswith(td_ig)
+        print("✅ Instagram: достаточное описание → без Whisper + обложка yt-dlp")
+
         # --- Локальное распознавание (yt-dlp + Whisper), happy path ------- #
         with patch.object(
+            InstagramParser,
+            "_fetch_ytdlp_info",
+            new_callable=AsyncMock,
+            return_value={"title": "", "description": "короткий пост без рецепта"},
+        ), patch.object(
             InstagramParser,
             "_download_audio",
             new_callable=AsyncMock,
@@ -2391,6 +2625,11 @@ if __name__ == "__main__":
         # --- Пустой транскрипт → fallback на Apify ------------------------ #
         with patch.object(
             InstagramParser,
+            "_fetch_ytdlp_info",
+            new_callable=AsyncMock,
+            return_value=_ig_metadata_empty,
+        ), patch.object(
+            InstagramParser,
             "_download_audio",
             new_callable=AsyncMock,
             return_value="/tmp/reels_audio_empty.mp3",
@@ -2419,6 +2658,11 @@ if __name__ == "__main__":
             return "late"
 
         with patch.object(
+            InstagramParser,
+            "_fetch_ytdlp_info",
+            new_callable=AsyncMock,
+            return_value=_ig_metadata_empty,
+        ), patch.object(
             InstagramParser,
             "_download_audio",
             new_callable=AsyncMock,
@@ -2485,6 +2729,11 @@ if __name__ == "__main__":
         ):
             ig_route = InstagramParser(apify_api_token="dummy")
         with patch.object(
+            InstagramParser,
+            "_fetch_ytdlp_info",
+            new_callable=AsyncMock,
+            return_value=_ig_metadata_empty,
+        ), patch.object(
             InstagramParser, "_download_audio", new_callable=AsyncMock
         ) as mock_no_dl, patch.object(
             InstagramParser,
