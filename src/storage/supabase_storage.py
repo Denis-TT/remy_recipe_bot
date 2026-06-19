@@ -42,7 +42,8 @@ _ALLOWED_COLUMNS = frozenset({
     "cuisine", "meal_type", "dish_type", "main_ingredient", "difficulty",
     "prep_time", "cook_time", "total_time", "servings",
     "ingredients", "steps",
-    "nutrition", "nutrition_per_serving", "nutrition_note", "total_nutrition",
+    "nutrition", "nutrition_per_serving", "nutrition_note", "nutrition_estimated",
+    "total_nutrition",
     "equipment", "tips", "tags",
     "storage",
     "is_vegetarian", "is_vegan", "is_gluten_free", "is_lactose_free",
@@ -168,6 +169,36 @@ class SupabaseStorage(BaseStorage):
 
         logger.info("📄 Загружен рецепт %s", recipe_id)
         return rows[0]
+
+    async def consume_pending_share(self, user_id: int) -> Optional[str]:
+        """Забрать recipe_id из очереди Mini App «Поделиться» (один раз на user)."""
+        uid = int(user_id)
+        params = {"user_id": f"eq.{uid}", "limit": "1", "select": "recipe_id"}
+        try:
+            _, body = await self._request("GET", "/pending_shares", params=params)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("⚠️ pending_shares GET: %s", exc)
+            return None
+
+        rows = self._parse_json_body(body)
+        if not isinstance(rows, list) or not rows:
+            return None
+
+        recipe_id = str(rows[0].get("recipe_id") or "").strip()
+        if not recipe_id:
+            return None
+
+        try:
+            await self._request(
+                "DELETE",
+                "/pending_shares",
+                params={"user_id": f"eq.{uid}"},
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("⚠️ pending_shares DELETE: %s", exc)
+
+        logger.info("📤 pending_shares: user %s → recipe %s", uid, recipe_id)
+        return recipe_id
 
     async def get_user_recipes(
         self,

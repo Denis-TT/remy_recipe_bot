@@ -209,6 +209,74 @@ def _html_caption_for_photo(formatted_html: str) -> str:
     return out
 
 
+def _compact_photo_caption(recipe: Mapping[str, Any], bot: "RemyBot") -> str:
+    """Короткая подпись к фото: только заголовок и одна строка метаданных."""
+    loc = bot.loc
+    title = _html_escape(str(recipe.get("title") or "Без названия").strip())
+    meal_type = recipe.get("meal_type") or "other"
+    meal_emoji = loc.get_meal_type_emoji(meal_type)
+    cuisine = _html_escape(loc.get_cuisine_name(recipe.get("cuisine") or "other"))
+    total = _int(recipe.get("total_time"))
+    parts = [f"{meal_emoji} <b>{title}</b>", "", cuisine]
+    if total:
+        parts.append(f"⏱ {total} мин")
+    parts.append("")
+    parts.append("<i>Полный рецепт — в следующем сообщении</i>")
+    return "\n".join(parts)
+
+
+async def _send_recipe_html_messages(
+    message: Message,
+    formatted_html: str,
+    reply_markup: Optional[InlineKeyboardMarkup] = None,
+) -> None:
+    """Отправить длинный HTML-рецепт одним или несколькими сообщениями."""
+    text = formatted_html
+    if len(text) <= _TG_MESSAGE_LIMIT:
+        await message.reply_text(
+            text,
+            reply_markup=reply_markup,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+        return
+
+    chunks: List[str] = []
+    rest = text
+    while rest:
+        if len(rest) <= _TG_MESSAGE_LIMIT:
+            chunks.append(rest)
+            break
+        cut = rest[: _TG_MESSAGE_LIMIT - 80]
+        sp = cut.rfind("\n\n")
+        if sp < _TG_MESSAGE_LIMIT // 3:
+            sp = cut.rfind("\n")
+        if sp > _TG_MESSAGE_LIMIT // 4:
+            cut = rest[:sp].rstrip()
+        else:
+            cut = rest[: _TG_MESSAGE_LIMIT - 80].rstrip()
+        cut = _close_open_html_tags(re.sub(r"<[^>]*$", "", cut).rstrip())
+        chunks.append(cut)
+        rest = rest[len(cut) :].lstrip()
+
+    for idx, chunk in enumerate(chunks):
+        kb = reply_markup if idx == len(chunks) - 1 else None
+        try:
+            await message.reply_text(
+                chunk,
+                reply_markup=kb,
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+            )
+        except BadRequest:
+            plain = re.sub(r"<[^>]+>", "", chunk)
+            await message.reply_text(
+                plain[:_TG_MESSAGE_LIMIT],
+                reply_markup=kb,
+                disable_web_page_preview=True,
+            )
+
+
 async def _present_recipe_with_optional_photo(
     message: Message,
     status: Message,
@@ -219,7 +287,7 @@ async def _present_recipe_with_optional_photo(
     kb = save_recipe_keyboard()
     img_path = _local_recipe_image_path(recipe)
     if img_path:
-        caption_html = _html_caption_for_photo(formatted)
+        caption_html = _compact_photo_caption(recipe, bot)
         try:
             blob = _jpeg_bytes_for_telegram_photo(str(img_path))
             bio = BytesIO(blob)
@@ -228,7 +296,6 @@ async def _present_recipe_with_optional_photo(
                 photo=InputFile(bio, filename="recipe.jpg"),
                 caption=caption_html or " ",
                 parse_mode=ParseMode.HTML,
-                reply_markup=kb,
                 read_timeout=15.0,
                 write_timeout=60.0,
             )
@@ -237,26 +304,12 @@ async def _present_recipe_with_optional_photo(
                 "Фото отправлено для рецепта %s",
                 t if isinstance(t, str) and t.strip() else "без названия",
             )
-        except Exception as exc:  # noqa: BLE001 — таймауты httpx/Telegram и I/O
+        except Exception as exc:  # noqa: BLE001
             logger.warning(
-                "Не удалось отправить фото рецепта: %s. Отправляю карточку текстом.",
+                "Не удалось отправить фото рецепта: %s. Отправляю только текст.",
                 exc,
             )
-            try:
-                await message.reply_text(
-                    formatted,
-                    reply_markup=kb,
-                    parse_mode=ParseMode.HTML,
-                    disable_web_page_preview=True,
-                )
-            except BadRequest as rb_exc:
-                logger.warning("⚠️  reply_text HTML (фолбэк): %s — без разметки", rb_exc)
-                plain = re.sub(r"<[^>]+>", "", formatted)
-                await message.reply_text(
-                    plain[:_TG_MESSAGE_LIMIT],
-                    reply_markup=kb,
-                    disable_web_page_preview=True,
-                )
+        await _send_recipe_html_messages(message, formatted, kb)
         try:
             await status.delete()
         except BadRequest:
@@ -264,12 +317,16 @@ async def _present_recipe_with_optional_photo(
         return
 
     try:
-        await status.edit_text(
-            formatted,
-            reply_markup=kb,
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True,
-        )
+        if len(formatted) <= _TG_MESSAGE_LIMIT:
+            await status.edit_text(
+                formatted,
+                reply_markup=kb,
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+            )
+        else:
+            await status.edit_text("✅ Готово", reply_markup=None)
+            await _send_recipe_html_messages(message, formatted, kb)
     except BadRequest as exc:
         logger.warning("⚠️  Ошибка edit_text с HTML: %s — отправляю без разметки", exc)
         plain = re.sub(r"<[^>]+>", "", formatted)
@@ -289,6 +346,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     message = update.effective_message
     user = update.effective_user
     if message is None or user is None:
+        return
+
+    if await try_handle_pending_share(message, context, user.id):
         return
 
     raw_text: str = (message.text or "").strip()
@@ -847,6 +907,13 @@ async def _handle_url(
 # Форматирование рецепта
 # --------------------------------------------------------------------------- #
 
+def _nutrition_num(value: Any, *, estimated: bool) -> str:
+    n = _int(value)
+    if not n:
+        return "0"
+    return f"~{n}" if estimated else str(n)
+
+
 def format_recipe(recipe: Mapping[str, Any], bot: "RemyBot") -> str:
     """Собрать HTML-представление распарсенного рецепта.
 
@@ -899,8 +966,12 @@ def format_recipe(recipe: Mapping[str, Any], bot: "RemyBot") -> str:
 
     # --- КБЖУ ---------------------------------------------------------------
     nutrition_note = str(recipe.get("nutrition_note") or "").strip()
+    nutrition_estimated = bool(recipe.get("nutrition_estimated"))
     nutrition = recipe.get("nutrition_per_serving") or {}
-    if nutrition_note:
+    if nutrition_note and not (
+        isinstance(nutrition, Mapping)
+        and any(_int(nutrition.get(k)) for k in ("calories", "protein", "fat", "carbs"))
+    ):
         lines.extend(["", f"📊 КБЖУ: {_html_escape(nutrition_note)}"])
     elif isinstance(nutrition, Mapping):
         cal = _int(nutrition.get("calories"))
@@ -908,11 +979,19 @@ def format_recipe(recipe: Mapping[str, Any], bot: "RemyBot") -> str:
         fat = _int(nutrition.get("fat"))
         carbs = _int(nutrition.get("carbs"))
         if cal or protein or fat or carbs:
+            est_label = " (примерно)" if nutrition_estimated else ""
             lines.extend([
                 "",
-                "📊 КБЖУ на порцию:",
-                f"🔥 {cal} ккал | 💪 {protein} г | 🧈 {fat} г | 🍚 {carbs} г",
+                f"📊 КБЖУ на порцию{est_label}:",
+                (
+                    f"🔥 {_nutrition_num(cal, estimated=nutrition_estimated)} ккал | "
+                    f"💪 {_nutrition_num(protein, estimated=nutrition_estimated)} г | "
+                    f"🧈 {_nutrition_num(fat, estimated=nutrition_estimated)} г | "
+                    f"🍚 {_nutrition_num(carbs, estimated=nutrition_estimated)} г"
+                ),
             ])
+            if nutrition_note:
+                lines.append(_html_escape(nutrition_note))
 
     # --- Ингредиенты --------------------------------------------------------
     ingredients = recipe.get("ingredients") or []
@@ -955,7 +1034,48 @@ format_recipe_for_telegram = format_recipe
 
 
 # --------------------------------------------------------------------------- #
-# Шаринг рецепта
+# Шаринг / очередь Mini App
+# --------------------------------------------------------------------------- #
+
+
+async def try_handle_pending_share(
+    message: Message,
+    context: ContextTypes.DEFAULT_TYPE,
+    user_id: int,
+) -> bool:
+    """Если Mini App поставил рецепт в очередь — отправить карточку в чат."""
+    bot = _get_bot(context)
+    try:
+        recipe_id = await bot.storage.consume_pending_share(user_id)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("⚠️ pending_shares: %s", exc)
+        return False
+
+    if not recipe_id:
+        return False
+
+    logger.info("📤 Обработка pending_shares для user %s, recipe %s", user_id, recipe_id)
+    try:
+        recipe = await bot.storage.get_recipe(recipe_id)
+    except Exception as exc:  # noqa: BLE001
+        logger.error("❌ pending_shares: загрузка %s: %s", recipe_id, exc)
+        await message.reply_text("❌ Не удалось загрузить рецепт для отправки.")
+        return True
+
+    if recipe is None or not _recipe_belongs_to_user(recipe, user_id):
+        await message.reply_text("❌ Рецепт не найден.")
+        return True
+
+    try:
+        await _send_shared_recipe(message.chat_id, recipe, context.bot)
+    except Exception as exc:  # noqa: BLE001
+        logger.error("❌ pending_shares: отправка %s: %s", recipe_id, exc)
+        await message.reply_text("❌ Не удалось отправить рецепт. Попробуй ещё раз.")
+    return True
+
+
+# --------------------------------------------------------------------------- #
+# Шаринг рецепта (карточка для пересылки)
 # --------------------------------------------------------------------------- #
 
 def _recipe_belongs_to_user(recipe: Mapping[str, Any], user_id: int) -> bool:
@@ -1064,16 +1184,25 @@ async def _send_shared_recipe(chat_id: int, recipe: Mapping[str, Any], bot: Any)
     image_url = _public_image_url(recipe)
 
     if image_url:
-        caption = _truncate_html_message(text, _TG_PHOTO_CAPTION_LIMIT)
+        short_caption = (
+            f"<b>🍲 {_html_escape(title)}</b>\n\n"
+            "<i>Полный рецепт — в следующем сообщении</i>"
+        )
         try:
             await bot.send_photo(
                 chat_id=chat_id,
                 photo=image_url,
-                caption=caption or " ",
+                caption=short_caption,
+                parse_mode=ParseMode.HTML,
+            )
+            await bot.send_message(
+                chat_id=chat_id,
+                text=_truncate_html_message(text, _TG_MESSAGE_LIMIT),
                 parse_mode=ParseMode.HTML,
                 reply_markup=markup,
+                disable_web_page_preview=True,
             )
-            logger.info("Рецепт %s отправлен для шаринга", title)
+            logger.info("Рецепт %s отправлен для шаринга (фото + текст)", title)
             return
         except Exception as exc:  # noqa: BLE001
             logger.warning("Не удалось отправить shared recipe с фото: %s; отправляю текстом", exc)
@@ -1265,11 +1394,17 @@ if __name__ == "__main__":
 
         asyncio.run(_run_present())
         _mock_msg.reply_photo.assert_called_once()
-        _kwargs = _mock_msg.reply_photo.call_args.kwargs
-        assert _kwargs.get("parse_mode") == ParseMode.HTML
-        assert _kwargs.get("reply_markup") is not None
-        assert len(_kwargs.get("caption") or "") <= _TG_PHOTO_CAPTION_LIMIT
-        _mock_msg.reply_text.assert_not_called()
+        _photo_kwargs = _mock_msg.reply_photo.call_args.kwargs
+        assert _photo_kwargs.get("parse_mode") == ParseMode.HTML
+        assert _photo_kwargs.get("reply_markup") is None
+        assert len(_photo_kwargs.get("caption") or "") <= _TG_PHOTO_CAPTION_LIMIT
+        assert "следующем сообщении" in (_photo_kwargs.get("caption") or "")
+        _mock_msg.reply_text.assert_called_once()
+        _text_call = _mock_msg.reply_text.call_args
+        _text_body = (_text_call.args[0] if _text_call.args else "") or _text_call.kwargs.get("text") or ""
+        _text_kwargs = _text_call.kwargs
+        assert _text_kwargs.get("reply_markup") is not None
+        assert _RECIPE_AI_DISCLAIMER_TEXT in _text_body
     finally:
         os.unlink(_tmp_img.name)
 

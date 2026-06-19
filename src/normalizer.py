@@ -64,10 +64,12 @@ SYSTEM_PROMPT = """\
 упомянуты в источнике. Если точный вес не указан, пишите «по вкусу», «на глаз» или \
 сохраняйте штуки/ложки так, как сказал автор. Категорически запрещено выдумывать точные \
 граммовки (например, «350 г филе 70/30»), если их не было в исходном тексте.
-3. ПРАВИЛО КБЖУ: Рассчитывайте КБЖУ только если в исходных данных указаны точные граммовки \
-ВСЕХ основных калорийных ингредиентов. Иначе: nutrition_calculable=false, \
-nutrition_note=\"Невозможно рассчитать без точных граммовок\", все поля nutrition_* = 0, \
-confidence.nutrition=\"low\".
+3. ПРАВИЛО КБЖУ: \
+- Если в источнике указаны точные граммовки ВСЕХ основных калорийных ингредиентов — рассчитайте \
+КБЖУ точно: nutrition_estimated=false, nutrition_calculable=true, заполните nutrition_* цифрами. \
+- Если граммовки частичные, «на глаз» или неполные — дайте обоснованную ОЦЕНКУ КБЖУ: \
+nutrition_estimated=true, nutrition_calculable=false, заполните nutrition_* оценочными значениями. \
+- Если оценить нельзя (нет состава) — нули, nutrition_estimated=false, nutrition_calculable=false.
 4. ФИЛЬТРАЦИЯ РЕЧЕВЫХ АРТЕФАКТОВ: Игнорируйте звуки-паразиты, шутки автора; исправляйте \
 ошибки распознавания аудио (например, «столёная соль» → «соль»).
 5. СЕКРЕТЫ ШЕФА: Обязательно выносите в шаги важные технологические предупреждения автора \
@@ -97,6 +99,7 @@ confidence.nutrition=\"low\".
     "nutrition_per_serving": {"calories": 0, "protein": 0, "fat": 0, "carbs": 0},
     "nutrition": {"calories": 0, "protein": 0, "fat": 0, "carbs": 0},
     "nutrition_calculable": true,
+    "nutrition_estimated": false,
     "nutrition_note": "",
     "tips": [],
     "storage": "",
@@ -702,6 +705,7 @@ class RecipeNormalizer:
         )
         data["nutrition"] = self._normalize_nutrition(data.get("nutrition"))
         data["nutrition_note"] = str(data.get("nutrition_note") or "").strip()
+        data["nutrition_estimated"] = bool(data.get("nutrition_estimated", False))
         self._apply_nutrition_policy(data)
         data.pop("nutrition_calculable", None)
 
@@ -803,34 +807,47 @@ class RecipeNormalizer:
         data["description"] = f"{prefix}\n\n{desc}" if desc else prefix
 
     def _apply_nutrition_policy(self, data: Dict[str, Any]) -> None:
-        """Обнулить выдуманное КБЖУ, если расчёт невозможен или confidence low."""
-        note = str(data.get("nutrition_note") or "").strip()
-        calculable = data.get("nutrition_calculable")
+        """Сохранить оценочное/точное КБЖУ; не обнулять обоснованные оценки модели."""
         conf = data.get("confidence")
         if not isinstance(conf, dict):
             conf = {}
             data["confidence"] = conf
 
-        unavailable = (
-            calculable is False
-            or NUTRITION_UNAVAILABLE_MSG.lower() in note.lower()
-            or self._confidence_is_low(conf.get("nutrition"))
-        )
         nps = data.get("nutrition_per_serving") or {}
         has_numbers = isinstance(nps, dict) and any(
             self._to_int(nps.get(k), default=0) > 0 for k in ("calories", "protein", "fat", "carbs")
         )
 
-        if unavailable or (not has_numbers and self._confidence_is_low(conf.get("nutrition"))):
-            data["nutrition_note"] = NUTRITION_UNAVAILABLE_MSG
-            data["nutrition_per_serving"] = {
-                "calories": 0, "protein": 0, "fat": 0, "carbs": 0,
-            }
-            data["nutrition"] = {"calories": 0, "protein": 0, "fat": 0, "carbs": 0}
-            conf["nutrition"] = "low"
-            return
+        calculable = data.get("nutrition_calculable")
+        estimated = bool(data.get("nutrition_estimated"))
+        note = str(data.get("nutrition_note") or "").strip()
 
-        if not note and has_numbers:
+        if self._confidence_is_low(conf.get("nutrition")):
+            if has_numbers:
+                estimated = True
+                calculable = False
+            else:
+                data["nutrition_per_serving"] = {
+                    "calories": 0, "protein": 0, "fat": 0, "carbs": 0,
+                }
+                data["nutrition"] = {"calories": 0, "protein": 0, "fat": 0, "carbs": 0}
+                data["nutrition_estimated"] = False
+                data["nutrition_note"] = ""
+                conf["nutrition"] = "low"
+                return
+
+        if calculable is False or estimated:
+            data["nutrition_estimated"] = True
+            data["nutrition_calculable"] = False
+            if not note:
+                data["nutrition_note"] = ""
+        elif calculable is True and has_numbers:
+            data["nutrition_estimated"] = False
+            data["nutrition_note"] = ""
+        elif has_numbers:
+            data["nutrition_estimated"] = estimated
+        else:
+            data["nutrition_estimated"] = False
             data["nutrition_note"] = ""
 
     # ------------------------------------------------------------------ #
@@ -1146,10 +1163,11 @@ if __name__ == "__main__":
                     }
                 ],
                 "steps": [{"step_number": 1, "description": "Сварить пасту."}],
-                "nutrition_per_serving": {"calories": 0, "protein": 0, "fat": 0, "carbs": 0},
+                "nutrition_per_serving": {"calories": 320, "protein": 10, "fat": 8, "carbs": 45},
                 "nutrition": {"calories": 0, "protein": 0, "fat": 0, "carbs": 0},
                 "nutrition_calculable": False,
-                "nutrition_note": NUTRITION_UNAVAILABLE_MSG,
+                "nutrition_estimated": True,
+                "nutrition_note": "",
                 "tips": [],
                 "storage": "",
                 "tags": [],
@@ -1159,7 +1177,7 @@ if __name__ == "__main__":
                     "ingredients": "medium",
                     "steps": "high",
                     "times": "medium",
-                    "nutrition": "low",
+                    "nutrition": "medium",
                 },
                 "is_vegetarian": True,
                 "is_vegan": True,
@@ -1172,8 +1190,9 @@ if __name__ == "__main__":
         assert est_ing["amount"] == 0
         assert "по вкусу" in est_ing["notes"]
         assert "*" not in est_ing["notes"]
-        assert r_est.get("nutrition_note") == NUTRITION_UNAVAILABLE_MSG
-        print("✅ «по вкусу» без выдуманных граммов + nutrition_note")
+        assert r_est.get("nutrition_estimated") is True
+        assert r_est["nutrition_per_serving"].get("calories") == 320
+        print("✅ «по вкусу» без выдуманных граммов + оценочное КБЖУ")
 
         with patch.object(RecipeNormalizer, "_call_api", new_callable=AsyncMock) as mock_text2:
             mock_text2.return_value = json.dumps({
@@ -1201,6 +1220,7 @@ if __name__ == "__main__":
                 "nutrition_per_serving": {"calories": 400, "protein": 30, "fat": 20, "carbs": 0},
                 "nutrition": {"calories": 0, "protein": 0, "fat": 0, "carbs": 0},
                 "nutrition_calculable": True,
+                "nutrition_estimated": False,
                 "nutrition_note": "",
                 "tips": [],
                 "storage": "",
@@ -1223,7 +1243,7 @@ if __name__ == "__main__":
         assert exp_ing["estimated"] is True
         assert exp_ing["amount"] == 350
         assert "*" in exp_ing["notes"]
-        assert r_explicit.get("nutrition_note") == ""
+        assert r_explicit.get("nutrition_estimated") is False
         print("✅ явная оценка граммов сохраняется")
 
         # ---- Тест 1 (с API): реальная нормализация ----

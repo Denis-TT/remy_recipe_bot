@@ -82,8 +82,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     Поддерживает deep link ``/start share_<recipe_id>`` — так Mini App,
     запущенный через Menu Button или inline-кнопку, инициирует шаринг
-    рецепта (в этих режимах ``WebApp.sendData`` не доставляет данные боту,
-    поэтому фронтенд открывает ссылку ``t.me/<bot>?start=share_<id>``).
+    При первом сообщении после «Поделиться» из Mini App бот проверяет
+    очередь ``pending_shares`` и отправляет карточку рецепта (Menu Button
+    не поддерживает ``WebApp.sendData``).
 
     Reply-клавиатура содержит только «📋 Меню». Точка входа в Mini App
     «📖 Книга рецептов» — Menu Button бота (BotFather) плюс inline-меню
@@ -97,8 +98,16 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if message is None:
         return
 
+    user = update.effective_user
+    if user is not None and await try_handle_pending_share(message, context, user.id):
+        return
+
     args = list(getattr(context, "args", None) or [])
     payload = str(args[0]).strip() if args else ""
+    if not payload and message.text:
+        parts = message.text.strip().split(maxsplit=1)
+        if len(parts) > 1 and parts[0].startswith("/start"):
+            payload = parts[1].strip()
     if payload.startswith("share_"):
         recipe_id = payload[len("share_"):]
         if await _start_share_deeplink(update, context, recipe_id):
