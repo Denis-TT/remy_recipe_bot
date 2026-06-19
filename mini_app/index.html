@@ -1919,11 +1919,17 @@
             }
             if (badges.childNodes.length) screen.appendChild(badges);
 
-            // 4. КБЖУ на порцию — компактная сетка 4 колонки.
+            // 4. КБЖУ на порцию — компактная сетка 4 колонки или пояснение.
+            const nutritionNote = String(r.nutrition_note || "").trim();
             const nut = nutritionPerServing(r) || {};
-            const hasNutrition = ["calories", "protein", "fat", "carbs"]
+            const hasNutrition = !nutritionNote && ["calories", "protein", "fat", "carbs"]
                 .some(function (k) { return Number(nut[k]) > 0; });
-            if (hasNutrition) {
+            if (nutritionNote) {
+                const noteBlock = el("div", { class: "section nutrition-note" });
+                noteBlock.appendChild(el("h3", {}, ["📊 КБЖУ"]));
+                noteBlock.appendChild(el("p", {}, [nutritionNote]));
+                screen.appendChild(noteBlock);
+            } else if (hasNutrition) {
                 const grid = el("div", { class: "nutrition" });
                 [
                     { v: nut.calories, l: "ккал",     e: "🔥" },

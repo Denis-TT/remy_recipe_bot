@@ -86,7 +86,11 @@ class RemyBot:
         self.loc: Localization = Localization("ru")
         ensure_images_dir()
         self.parser: ParserRegistry = create_parser_registry(self.config)
-        self.normalizer: RecipeNormalizer = RecipeNormalizer(self.config.github_token)
+        self.normalizer: RecipeNormalizer = RecipeNormalizer(
+            self.config.github_token,
+            model=self.config.github_model,
+            reasoning_effort=self.config.github_reasoning_effort,
+        )
         self.storage: SupabaseStorage = SupabaseStorage(
             self.config.supabase_url,
             self.config.supabase_key,

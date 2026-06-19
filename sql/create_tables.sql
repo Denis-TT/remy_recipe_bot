@@ -41,6 +41,7 @@ CREATE TABLE IF NOT EXISTS recipes (
     steps                  JSONB       DEFAULT '[]'::jsonb,
     nutrition              JSONB       DEFAULT '{}'::jsonb,  -- на 100 г
     nutrition_per_serving  JSONB       DEFAULT '{}'::jsonb,  -- на порцию
+    nutrition_note         TEXT        DEFAULT '',             -- если КБЖУ не рассчитано
     total_nutrition        JSONB       DEFAULT '{}'::jsonb,  -- на всё блюдо
 
     -- Массивы коротких строк
@@ -66,6 +67,7 @@ CREATE TABLE IF NOT EXISTS recipes (
 
 -- Существующие проекты без колонки — безопасное добавление.
 ALTER TABLE recipes ADD COLUMN IF NOT EXISTS image_url TEXT DEFAULT '';
+ALTER TABLE recipes ADD COLUMN IF NOT EXISTS nutrition_note TEXT DEFAULT '';
 
 
 -- --------------------------------------------------------------------

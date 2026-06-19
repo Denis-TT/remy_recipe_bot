@@ -56,6 +56,10 @@ class Config:
     hf_api_key: str = ""
     # Устарело: ранее yt-dlp; поле оставлено для совместимости существующих .env.
     youtube_cookie_file: str = ""
+    # GitHub Models: модель нормализации рецептов (например gpt-5-mini).
+    github_model: str = "gpt-5-mini"
+    # Усилие рассуждения для reasoning-моделей (minimal, low, medium, high).
+    github_reasoning_effort: str = "medium"
 
     @property
     def is_development(self) -> bool:
@@ -132,6 +136,21 @@ class Config:
 
         youtube_cookie_file = os.getenv("YOUTUBE_COOKIE_FILE", "").strip()
 
+        github_model = (
+            os.getenv("GITHUB_MODEL") or os.getenv("GITHUB_MODELS_MODEL") or "gpt-5-mini"
+        ).strip() or "gpt-5-mini"
+
+        github_reasoning_effort = (
+            os.getenv("GITHUB_REASONING_EFFORT") or "medium"
+        ).strip().lower() or "medium"
+        if github_reasoning_effort not in {"minimal", "low", "medium", "high", "xhigh"}:
+            print(
+                f"⚠️  Неизвестный GITHUB_REASONING_EFFORT='{github_reasoning_effort}', "
+                "используем medium.",
+                file=sys.stderr,
+            )
+            github_reasoning_effort = "medium"
+
         environment = os.getenv("ENVIRONMENT", "production").strip().lower() or "production"
         if environment not in _ALLOWED_ENVIRONMENTS:
             print(
@@ -156,6 +175,8 @@ class Config:
             images_dir=images_dir,
             hf_api_key=hf_api_key,
             youtube_cookie_file=youtube_cookie_file,
+            github_model=github_model,
+            github_reasoning_effort=github_reasoning_effort,
         )
 
     @staticmethod

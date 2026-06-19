@@ -898,8 +898,11 @@ def format_recipe(recipe: Mapping[str, Any], bot: "RemyBot") -> str:
         lines.append(f"👥 Порций: {servings}")
 
     # --- КБЖУ ---------------------------------------------------------------
+    nutrition_note = str(recipe.get("nutrition_note") or "").strip()
     nutrition = recipe.get("nutrition_per_serving") or {}
-    if isinstance(nutrition, Mapping):
+    if nutrition_note:
+        lines.extend(["", f"📊 КБЖУ: {_html_escape(nutrition_note)}"])
+    elif isinstance(nutrition, Mapping):
         cal = _int(nutrition.get("calories"))
         protein = _int(nutrition.get("protein"))
         fat = _int(nutrition.get("fat"))
@@ -983,6 +986,7 @@ def _shared_meta_line(recipe: Mapping[str, Any], loc: Localization) -> str:
     dish = loc.get_dish_type_display(recipe.get("dish_type") or "main")
     total = _int(recipe.get("total_time"))
     nutrition = recipe.get("nutrition_per_serving") or {}
+    nutrition_note = str(recipe.get("nutrition_note") or "").strip()
     calories = _int(nutrition.get("calories")) if isinstance(nutrition, Mapping) else 0
 
     parts: List[str] = []
@@ -992,7 +996,9 @@ def _shared_meta_line(recipe: Mapping[str, Any], loc: Localization) -> str:
         parts.append(f"📋 {dish}")
     if total:
         parts.append(f"⏱ {total} мин")
-    if calories:
+    if nutrition_note:
+        parts.append("📊 КБЖУ: см. карточку")
+    elif calories:
         parts.append(f"🔥 {calories} ккал/порция")
     return " | ".join(parts)
 

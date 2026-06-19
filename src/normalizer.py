@@ -50,32 +50,57 @@ logger = logging.getLogger(__name__)
 # --------------------------------------------------------------------------- #
 
 SYSTEM_PROMPT = """\
-You are a professional chef and nutritionist. Extract a recipe STRICTLY from the user-provided source text.
+Вы — профессиональный шеф-повар и дотошный кулинарный редактор. Ваша задача — \
+трансформировать неструктурированный текст (субтитры, транскрипты, хаотичные описания) \
+в идеальную технологическую карту рецепта.
 
-Return ONLY a valid JSON object with this EXACT structure:
+СТРОГИЕ ПРАВИЛА:
+1. КУЛИНАРНАЯ ТОЧНОСТЬ И ЛОГИКА: Внимательно анализируйте контекст. Если ингредиент \
+используется необычным способом (например, запекается целая головка чеснока для соуса, \
+сухари настаиваются 24 часа перед фильтрацией), вы ОБЯЗАНЫ полностью сохранить эту \
+кулинарную технологию в шагах приготовления. Никогда не заменяйте уникальные авторские \
+фишки на стандартные бытовые шаблоны (например, запекание на обжарку на сковороде).
+2. ЗАПРЕТ НА ДОДУМЫВАНИЕ ИНГРЕДИЕНТОВ: Записывайте строго те ингредиенты, которые прямо \
+упомянуты в источнике. Если точный вес не указан, пишите «по вкусу», «на глаз» или \
+сохраняйте штуки/ложки так, как сказал автор. Категорически запрещено выдумывать точные \
+граммовки (например, «350 г филе 70/30»), если их не было в исходном тексте.
+3. ПРАВИЛО КБЖУ: Рассчитывайте КБЖУ только если в исходных данных указаны точные граммовки \
+ВСЕХ основных калорийных ингредиентов. Иначе: nutrition_calculable=false, \
+nutrition_note=\"Невозможно рассчитать без точных граммовок\", все поля nutrition_* = 0, \
+confidence.nutrition=\"low\".
+4. ФИЛЬТРАЦИЯ РЕЧЕВЫХ АРТЕФАКТОВ: Игнорируйте звуки-паразиты, шутки автора; исправляйте \
+ошибки распознавания аудио (например, «столёная соль» → «соль»).
+5. СЕКРЕТЫ ШЕФА: Обязательно выносите в шаги важные технологические предупреждения автора \
+(«мешать только деревянной лопаткой», «насухо вытереть ягоды», «срезать специи с корочки»).
+
+ФОРМАТ ВЫВОДА:
+Пишите коротко, ёмко, без приветствий. Верните ТОЛЬКО валидный JSON (без markdown):
+
 {
-    "title": "Recipe name in Russian",
-    "description": "Brief description in Russian (2-3 sentences)",
-    "cuisine": "italian",
+    "title": "Название на русском",
+    "description": "Краткое описание (2–3 предложения)",
+    "cuisine": "russian",
     "meal_type": "lunch",
     "dish_type": "main",
-    "main_ingredient": "pasta",
+    "main_ingredient": "beef",
     "difficulty": "medium",
     "prep_time": 20,
     "cook_time": 40,
     "total_time": 60,
     "servings": 4,
     "ingredients": [
-        {"name": "Мука пшеничная", "amount": 200, "unit": "г", "notes": "просеянная", "estimated": false}
+        {"name": "Соль", "amount": 0, "unit": "", "notes": "по вкусу", "estimated": false}
     ],
     "steps": [
-        {"step_number": 1, "description": "Разогреть духовку до 180°C"}
+        {"step_number": 1, "description": "Конкретное действие из источника"}
     ],
-    "nutrition_per_serving": {"calories": 350, "protein": 20, "fat": 15, "carbs": 40},
-    "nutrition": {"calories": 150, "protein": 8, "fat": 5, "carbs": 15},
-    "tips": ["Совет 1", "Совет 2"],
-    "storage": "How to store",
-    "tags": ["паста", "италия", "быстро"],
+    "nutrition_per_serving": {"calories": 0, "protein": 0, "fat": 0, "carbs": 0},
+    "nutrition": {"calories": 0, "protein": 0, "fat": 0, "carbs": 0},
+    "nutrition_calculable": true,
+    "nutrition_note": "",
+    "tips": [],
+    "storage": "",
+    "tags": [],
     "image_url": "",
     "confidence": {
         "title": "high",
@@ -91,44 +116,37 @@ Return ONLY a valid JSON object with this EXACT structure:
     "is_lactose_free": false
 }
 
-Each value in "confidence" MUST be exactly one of: high, medium, low — reflecting how well that block is supported by the source text.
-
-STEPS FROM VIDEO OR SPARSE TEXT:
-Если в тексте нет чётких шагов приготовления, попытайся извлечь их из описания. Если это невозможно, верни в steps один объект: {"step_number": 1, "description": "Пошаговая инструкция отсутствует в источнике. Рекомендую посмотреть видео."}
-Never paste the full description or a raw ingredient list into "steps". Each step must be a short actionable cooking instruction, or use exactly that single fallback object.
-
-GROUNDING RULES (mandatory):
-1. Use ONLY information that appears in the provided source text. Do not invent facts.
-2. If a parameter is missing in the text, you may give a realistic estimate ONLY if necessary for valid JSON; set the corresponding confidence key to "low" or "medium" and mention the assumption briefly in "description" or in ingredient/step "notes".
-2a. Ingredient amounts: every ingredient object MUST include boolean "estimated". If the source explicitly gives the amount, set "estimated": false. If the source omits the amount, estimate a realistic amount from recipe context, servings, and other ingredients, set "estimated": true, and use unit "г", "мл", or "шт". Always return "amount" as a number or numeric string. For ingredients like "соль по вкусу", use amount 0 or a small default such as 1, keep "по вкусу" in notes, and set "estimated": true if no exact source amount exists.
-3. Do NOT invent ingredients, cooking steps, or times that are not implied by the source. If the text does not list ingredients or steps, return minimal empty lists and set confidence.ingredients / confidence.steps to "low".
-4. Do NOT fabricate nutrition numbers: if the source does not allow a grounded estimate, use zeros and set confidence.nutrition to "low".
-5. If the source is contradictory, choose the most probable interpretation, set confidence for affected blocks to "medium" or "low", and briefly note the ambiguity in "description".
-6. ALL text fields (title, description, ingredients, steps, tips, storage) MUST be in Russian.
-7. meal_type MUST be one of the allowed values below.
-8. dish_type and main_ingredient MUST be lower-case English keys from the lists below; infer only from what the source supports.
-9. difficulty MUST be one of: easy, medium, hard.
-10. cuisine MUST be in lower case English from the allowed list.
-11. prep_time + cook_time MUST equal total_time when all three are grounded; if times are uncertain, estimate conservatively and set confidence.times to "low" or "medium".
-12. Return ONLY valid JSON, no markdown, no additional text.
-13. The field \"image_url\" is an optional string: public URL or absolute filesystem path to a hero image already stored on the server. If the user message includes a line starting with `[SERVER image_url — copy verbatim...]`, set \"image_url\" in your JSON to that exact string. Otherwise use an empty string \"\". Never invent URLs or paths.
+ДОПОЛНИТЕЛЬНО:
+- estimated=true ТОЛЬКО если вы сами оценили количество при явной нехватке данных; \
+никогда не ставьте estimated=true для «по вкусу» / «на глаз» из источника.
+- Если шагов нет в источнике — один шаг: «Пошаговая инструкция отсутствует в источнике. \
+Рекомендую посмотреть видео.»
+- Не выдумывайте ингредиенты, шаги, время. При неопределённости — confidence low/medium.
+- meal_type, dish_type, main_ingredient, cuisine, difficulty — только из списков ниже.
+- image_url: копировать только из строки [SERVER image_url — copy verbatim...], иначе \"\".
+- Каждое значение confidence: high, medium или low.
 
 ALLOWED VALUES:
-- cuisine: italian, russian, japanese, french, chinese, georgian, korean, indian, thai, mexican, mediterranean, american, european, asian, other
+- cuisine: italian, russian, japanese, french, chinese, georgian, korean, indian, thai, \
+mexican, mediterranean, american, european, asian, other
 - meal_type: breakfast, lunch, dinner, dessert, snack, salad, soup, baking, drink, other
-- dish_type (Latin only): soup, side, salad, appetizer, main, dessert, drink, baking, sauce, preserve
-- main_ingredient (Latin only): chicken, beef, pork, fish, seafood, vegetables, mushrooms, eggs, grains, pasta, cheese, fruits, nuts, dough, other
+- dish_type: soup, side, salad, appetizer, main, dessert, drink, baking, sauce, preserve
+- main_ingredient: chicken, beef, pork, fish, seafood, vegetables, mushrooms, eggs, \
+grains, pasta, cheese, fruits, nuts, dough, other
 - difficulty: easy, medium, hard
 """
 
 
 IMAGE_VISION_SYSTEM_PROMPT = """\
-Ты — анализатор изображений. Определи, содержит ли изображение кулинарный рецепт (ингредиенты, шаги приготовления). \
-Если да — извлеки всю информацию и верни в стандартном JSON формате рецепта (как в SYSTEM_PROMPT: title, description, cuisine, \
-meal_type, dish_type, main_ingredient, difficulty, времена, servings, ingredients, steps, nutrition_per_serving, nutrition, \
-tips, storage, tags, confidence, флаги диет) и добавь поле "is_recipe": true. \
-Если нет — верни только JSON с полем "is_recipe": false и "explanation" (пояснение по-русски). \
-Все текстовые поля рецепта на русском. Только валидный JSON, без markdown."""
+Вы — профессиональный шеф-повар и дотошный кулинарный редактор. Определите, содержит ли \
+изображение кулинарный рецепт (ингредиенты, шаги). Соблюдайте те же СТРОГИЕ ПРАВИЛА, что \
+в текстовом режиме: не выдумывайте граммовки и КБЖУ без оснований; сохраняйте уникальную \
+технологию; выносите предупреждения автора в шаги.
+
+Если рецепт есть — верните JSON рецепта (поля как в SYSTEM_PROMPT, включая nutrition_note, \
+nutrition_calculable, confidence) и "is_recipe": true.
+Если нет — только {"is_recipe": false, "explanation": "пояснение по-русски"}.
+Только валидный JSON, без markdown. Все текстовые поля рецепта на русском."""
 
 
 #: Дисклеймер при низкой уверенности в ингредиентах/шагах (источник — видео и т. п.).
@@ -140,6 +158,15 @@ _LOW_CONFIDENCE_VIDEO_DISCLAIMER = (
 _STEPS_MISSING_SOURCE_MESSAGE = (
     "Пошаговая инструкция отсутствует в источнике. Рекомендую посмотреть видео."
 )
+
+#: Сообщение, когда КБЖУ нельзя посчитать без точных граммовок.
+NUTRITION_UNAVAILABLE_MSG = "Невозможно рассчитать без точных граммовок"
+
+#: Модель по умолчанию (GitHub Models / Azure inference).
+DEFAULT_MODEL = "gpt-5-mini"
+
+#: Лимит completion-токенов для reasoning-моделей (включая внутренние рассуждения).
+REASONING_COMPLETION_TOKENS = 16_384
 
 #: Глаголы действия в типичных шагах рецепта (рус.).
 _STEPS_ACTION_VERBS_RE = re.compile(
@@ -190,6 +217,21 @@ _MARKDOWN_FENCE_RE = re.compile(
     re.DOTALL | re.IGNORECASE,
 )
 
+#: «По вкусу» / «на глаз» — не выдумывать граммы в постобработке.
+_VAGUE_AMOUNT_NOTES_RE = re.compile(
+    r"по\s+вкусу|на\s+глаз",
+    re.IGNORECASE,
+)
+
+
+def _model_basename(model: str) -> str:
+    return (model or "").strip().lower().split("/")[-1]
+
+
+def _is_reasoning_model(model: str) -> bool:
+    base = _model_basename(model)
+    return base.startswith(("gpt-5", "o1", "o3", "o4"))
+
 
 # --------------------------------------------------------------------------- #
 # Нормализатор
@@ -203,30 +245,34 @@ class RecipeNormalizer:
 
     Attributes:
         github_token: PAT с правом вызова GitHub Models.
-        model: Имя модели в Models API (по умолчанию ``"gpt-4o-mini"``).
+        model: Имя модели в Models API (по умолчанию ``openai/gpt-5-mini``).
         api_url: Полный URL эндпоинта Chat Completions.
+        reasoning_effort: Усилие рассуждения для GPT-5/o-серии (minimal…high).
     """
 
     def __init__(
         self,
         github_token: str,
-        model: str = "gpt-4o-mini",
+        model: str = DEFAULT_MODEL,
         api_url: str = DEFAULT_API_URL,
+        reasoning_effort: str = "medium",
     ) -> None:
         """Инициализировать нормализатор.
 
         Args:
             github_token: Токен для авторизации в GitHub Models.
-            model: Имя модели (например, ``"gpt-4o-mini"``).
+            model: Имя модели (например, ``openai/gpt-5-mini``).
             api_url: URL эндпоинта Chat Completions. По умолчанию —
                 публичный эндпоинт GitHub Models.
+            reasoning_effort: Параметр reasoning_effort для reasoning-моделей.
         """
         if not github_token:
             raise ValueError("github_token не должен быть пустым")
 
         self.github_token: str = github_token
-        self.model: str = model
+        self.model: str = model or DEFAULT_MODEL
         self.api_url: str = api_url
+        self.reasoning_effort: str = (reasoning_effort or "medium").strip().lower()
 
     # ------------------------------------------------------------------ #
     # Основной публичный метод
@@ -321,7 +367,7 @@ class RecipeNormalizer:
 
         raw_placeholder = "[изображение]"
         models_try: List[str] = []
-        for cand in (self.model, "gpt-4o"):
+        for cand in (self.model, "gpt-5-chat", "gpt-4o"):
             if cand and cand not in models_try:
                 models_try.append(cand)
 
@@ -386,6 +432,41 @@ class RecipeNormalizer:
     # HTTP-слой
     # ------------------------------------------------------------------ #
 
+    def _apply_completion_limits(self, payload: Dict[str, Any], *, model: Optional[str] = None) -> None:
+        """Настроить лимиты токенов под reasoning- и обычные модели."""
+        m = model or self.model
+        if _is_reasoning_model(m):
+            payload["max_completion_tokens"] = REASONING_COMPLETION_TOKENS
+            payload["reasoning_effort"] = self.reasoning_effort
+            payload.pop("max_tokens", None)
+            payload.pop("temperature", None)
+        else:
+            payload.setdefault("temperature", 0.1)
+            payload["max_tokens"] = 8000
+            payload.pop("max_completion_tokens", None)
+            payload.pop("reasoning_effort", None)
+
+    def _build_chat_payload(
+        self,
+        *,
+        system: str,
+        user_content: Any,
+        model: Optional[str] = None,
+        json_mode: bool = True,
+    ) -> Dict[str, Any]:
+        m = model or self.model
+        payload: Dict[str, Any] = {
+            "model": m,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user_content},
+            ],
+        }
+        self._apply_completion_limits(payload, model=m)
+        if json_mode:
+            payload["response_format"] = {"type": "json_object"}
+        return payload
+
     async def _call_api(self, user_text: str, image_url: Optional[str] = None) -> str:
         """Выполнить POST-запрос к Chat Completions и вернуть `content`.
 
@@ -404,16 +485,10 @@ class RecipeNormalizer:
                 f"{user_text}\n\n[SERVER image_url — copy verbatim to JSON field \"image_url\"]: "
                 f"{json.dumps(str(image_url).strip(), ensure_ascii=True)}"
             )
-        payload = {
-            "model": self.model,
-            "messages": [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": user_content},
-            ],
-            "temperature": 0.2,
-            "max_tokens": 2500,
-            "response_format": {"type": "json_object"},
-        }
+        payload = self._build_chat_payload(
+            system=SYSTEM_PROMPT,
+            user_content=user_content,
+        )
         headers = {
             "Authorization": f"Bearer {self.github_token}",
             "Content-Type": "application/json",
@@ -463,24 +538,17 @@ class RecipeNormalizer:
     ) -> str:
         """Vision-запрос (image URL data-uri + текст). ``max_tokens`` по ТЗ — 2000."""
         data_url = f"data:{mime_type};base64,{image_base64}"
-        payload: Dict[str, Any] = {
-            "model": model,
-            "messages": [
-                {"role": "system", "content": IMAGE_VISION_SYSTEM_PROMPT},
+        payload = self._build_chat_payload(
+            system=IMAGE_VISION_SYSTEM_PROMPT,
+            user_content=[
                 {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": "Проанализируй это изображение на наличие рецепта.",
-                        },
-                        {"type": "image_url", "image_url": {"url": data_url}},
-                    ],
+                    "type": "text",
+                    "text": "Проанализируй это изображение на наличие рецепта.",
                 },
+                {"type": "image_url", "image_url": {"url": data_url}},
             ],
-            "temperature": 0.2,
-            "max_tokens": 2000,
-        }
+            model=model,
+        )
         headers = {
             "Authorization": f"Bearer {self.github_token}",
             "Content-Type": "application/json",
@@ -633,6 +701,9 @@ class RecipeNormalizer:
             data.get("nutrition_per_serving")
         )
         data["nutrition"] = self._normalize_nutrition(data.get("nutrition"))
+        data["nutrition_note"] = str(data.get("nutrition_note") or "").strip()
+        self._apply_nutrition_policy(data)
+        data.pop("nutrition_calculable", None)
 
         # ---- массивы ----
         data["tips"] = self._clean_string_list(data.get("tips"))
@@ -731,6 +802,37 @@ class RecipeNormalizer:
             return
         data["description"] = f"{prefix}\n\n{desc}" if desc else prefix
 
+    def _apply_nutrition_policy(self, data: Dict[str, Any]) -> None:
+        """Обнулить выдуманное КБЖУ, если расчёт невозможен или confidence low."""
+        note = str(data.get("nutrition_note") or "").strip()
+        calculable = data.get("nutrition_calculable")
+        conf = data.get("confidence")
+        if not isinstance(conf, dict):
+            conf = {}
+            data["confidence"] = conf
+
+        unavailable = (
+            calculable is False
+            or NUTRITION_UNAVAILABLE_MSG.lower() in note.lower()
+            or self._confidence_is_low(conf.get("nutrition"))
+        )
+        nps = data.get("nutrition_per_serving") or {}
+        has_numbers = isinstance(nps, dict) and any(
+            self._to_int(nps.get(k), default=0) > 0 for k in ("calories", "protein", "fat", "carbs")
+        )
+
+        if unavailable or (not has_numbers and self._confidence_is_low(conf.get("nutrition"))):
+            data["nutrition_note"] = NUTRITION_UNAVAILABLE_MSG
+            data["nutrition_per_serving"] = {
+                "calories": 0, "protein": 0, "fat": 0, "carbs": 0,
+            }
+            data["nutrition"] = {"calories": 0, "protein": 0, "fat": 0, "carbs": 0}
+            conf["nutrition"] = "low"
+            return
+
+        if not note and has_numbers:
+            data["nutrition_note"] = ""
+
     # ------------------------------------------------------------------ #
     # Эвристики-фолбэки
     # ------------------------------------------------------------------ #
@@ -827,20 +929,25 @@ class RecipeNormalizer:
         unit = str(raw.get("unit") or "").strip()
         notes = str(raw.get("notes") or "").strip()
         estimated = bool(raw.get("estimated", False))
+        vague = bool(_VAGUE_AMOUNT_NOTES_RE.search(notes))
 
-        if estimated:
-            if amount <= 0:
-                amount = 1
+        if vague or (estimated and amount <= 0):
+            estimated = False
+            amount = max(amount, 0)
+            if vague and not notes:
+                notes = "по вкусу"
+
+        if estimated and amount > 0:
             low_unit = unit.lower()
             if low_unit in {"гр"}:
                 unit = "г"
             elif low_unit in {"штука", "штуки", "штук"}:
                 unit = "шт"
-            if unit.lower() not in {"г", "гр", "мл", "шт", "штука", "штуки", "штук"}:
+            if unit.lower() not in {"г", "гр", "мл", "шт", "штука", "штуки", "штук", "ст.л.", "ч.л.", "ст. л.", "ч. л."}:
                 unit = "г"
             if "*" not in notes:
                 notes = f"{notes} *".strip() if notes else "*"
-            logger.warning(
+            logger.info(
                 "Ингредиент %s: количество оценено ИИ как %s %s",
                 name or "без названия",
                 amount,
@@ -1006,6 +1113,15 @@ if __name__ == "__main__":
 
         print("✅ analyze_image: мок vision API")
 
+        assert _is_reasoning_model("gpt-5-mini") is True
+        assert _is_reasoning_model("gpt-4o-mini") is False
+        payload: Dict[str, Any] = {"model": "gpt-5-mini", "messages": []}
+        temp_normalizer._apply_completion_limits(payload)
+        assert "max_completion_tokens" in payload
+        assert payload.get("reasoning_effort") == "medium"
+        assert "max_tokens" not in payload
+        print("✅ reasoning payload (gpt-5-mini)")
+
         # ---- estimated ingredients (мок text API, без сети) ----
         with patch.object(RecipeNormalizer, "_call_api", new_callable=AsyncMock) as mock_text:
             mock_text.return_value = json.dumps({
@@ -1032,6 +1148,8 @@ if __name__ == "__main__":
                 "steps": [{"step_number": 1, "description": "Сварить пасту."}],
                 "nutrition_per_serving": {"calories": 0, "protein": 0, "fat": 0, "carbs": 0},
                 "nutrition": {"calories": 0, "protein": 0, "fat": 0, "carbs": 0},
+                "nutrition_calculable": False,
+                "nutrition_note": NUTRITION_UNAVAILABLE_MSG,
                 "tips": [],
                 "storage": "",
                 "tags": [],
@@ -1050,11 +1168,63 @@ if __name__ == "__main__":
             })
             r_est = await temp_normalizer.normalize("Паста. Соль по вкусу.")
         est_ing = r_est["ingredients"][0]
-        assert est_ing["estimated"] is True
-        assert est_ing["amount"] > 0
-        assert est_ing["unit"] in {"г", "мл", "шт"}
-        assert "*" in est_ing["notes"]
-        print("✅ estimated ingredients: amount/unit/marker")
+        assert est_ing["estimated"] is False
+        assert est_ing["amount"] == 0
+        assert "по вкусу" in est_ing["notes"]
+        assert "*" not in est_ing["notes"]
+        assert r_est.get("nutrition_note") == NUTRITION_UNAVAILABLE_MSG
+        print("✅ «по вкусу» без выдуманных граммов + nutrition_note")
+
+        with patch.object(RecipeNormalizer, "_call_api", new_callable=AsyncMock) as mock_text2:
+            mock_text2.return_value = json.dumps({
+                "title": "Стейк",
+                "description": "Тест",
+                "cuisine": "american",
+                "meal_type": "dinner",
+                "dish_type": "main",
+                "main_ingredient": "beef",
+                "difficulty": "medium",
+                "prep_time": 5,
+                "cook_time": 10,
+                "total_time": 15,
+                "servings": 2,
+                "ingredients": [
+                    {
+                        "name": "Говядина",
+                        "amount": 350,
+                        "unit": "г",
+                        "notes": "",
+                        "estimated": True,
+                    }
+                ],
+                "steps": [{"step_number": 1, "description": "Жарить."}],
+                "nutrition_per_serving": {"calories": 400, "protein": 30, "fat": 20, "carbs": 0},
+                "nutrition": {"calories": 0, "protein": 0, "fat": 0, "carbs": 0},
+                "nutrition_calculable": True,
+                "nutrition_note": "",
+                "tips": [],
+                "storage": "",
+                "tags": [],
+                "confidence": {
+                    "title": "high",
+                    "description": "high",
+                    "ingredients": "high",
+                    "steps": "high",
+                    "times": "medium",
+                    "nutrition": "high",
+                },
+                "is_vegetarian": False,
+                "is_vegan": False,
+                "is_gluten_free": True,
+                "is_lactose_free": True,
+            })
+            r_explicit = await temp_normalizer.normalize("Говядина 350 г. Жарить.")
+        exp_ing = r_explicit["ingredients"][0]
+        assert exp_ing["estimated"] is True
+        assert exp_ing["amount"] == 350
+        assert "*" in exp_ing["notes"]
+        assert r_explicit.get("nutrition_note") == ""
+        print("✅ явная оценка граммов сохраняется")
 
         # ---- Тест 1 (с API): реальная нормализация ----
         token = os.getenv("GITHUB_TOKEN")
@@ -1062,7 +1232,11 @@ if __name__ == "__main__":
             print("⚠️  GITHUB_TOKEN не задан — пропускаю тест с реальным API")
             return
 
-        normalizer = RecipeNormalizer(token)
+        normalizer = RecipeNormalizer(
+            token,
+            model=os.getenv("GITHUB_MODEL", DEFAULT_MODEL),
+            reasoning_effort=os.getenv("GITHUB_REASONING_EFFORT", "medium"),
+        )
 
         test_text = """
         Борщ классический
@@ -1072,7 +1246,13 @@ if __name__ == "__main__":
         Добавить свёклу и капусту. Варить 20 минут.
         """
 
-        result = await normalizer.normalize(test_text)
+        try:
+            result = await normalizer.normalize(test_text)
+        except Exception as exc:  # noqa: BLE001
+            print(f"⚠️  Live API ({normalizer.model}): {exc}")
+            return
+
+        print(f"✅ Live API ({normalizer.model})")
         print(f"✅ Название: {result['title']}")
         print(f"✅ meal_type: {result['meal_type']}")
         print(f"✅ difficulty: {result['difficulty']}")
@@ -1080,7 +1260,11 @@ if __name__ == "__main__":
         print(f"✅ Ингредиентов: {len(result['ingredients'])}")
         print(f"✅ Шагов: {len(result['steps'])}")
         print(f"✅ КБЖУ (на порцию): {result['nutrition_per_serving']}")
+        print(f"✅ nutrition_note: {result.get('nutrition_note', '')!r}")
         print(f"✅ КБЖУ (на 100 г): {result['nutrition']}")
-        print(f"✅ Время: prep={result['prep_time']} + cook={result['cook_time']} = total={result['total_time']}")
+        print(
+            f"✅ Время: prep={result['prep_time']} + cook={result['cook_time']} "
+            f"= total={result['total_time']}"
+        )
 
     asyncio.run(_test())

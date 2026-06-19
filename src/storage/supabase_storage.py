@@ -42,7 +42,7 @@ _ALLOWED_COLUMNS = frozenset({
     "cuisine", "meal_type", "dish_type", "main_ingredient", "difficulty",
     "prep_time", "cook_time", "total_time", "servings",
     "ingredients", "steps",
-    "nutrition", "nutrition_per_serving", "total_nutrition",
+    "nutrition", "nutrition_per_serving", "nutrition_note", "total_nutrition",
     "equipment", "tips", "tags",
     "storage",
     "is_vegetarian", "is_vegan", "is_gluten_free", "is_lactose_free",
