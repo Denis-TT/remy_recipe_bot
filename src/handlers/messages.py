@@ -471,7 +471,6 @@ _DEFAULT_PROGRESS_STEPS: tuple[tuple[str, str], ...] = (
 # Соответствие внутренних стадий InstagramParser → id шага в чеклисте.
 _IG_PARSER_STAGE_TO_STEP: dict[str, str] = {
     "fetching_metadata": "metadata",
-    "description_sufficient": "transcribe",
     "downloading_audio": "transcribe",
     "transcribing": "transcribe",
     "apify_fallback": "transcribe",
@@ -580,8 +579,6 @@ async def _handle_url(
         step_id = _IG_PARSER_STAGE_TO_STEP.get(stage, stage)
         if stage == "apify_fallback":
             await progress.set_stage(step_id, detail or "запасной путь")
-        elif stage == "description_sufficient":
-            await progress.set_stage(step_id, detail or "не требуется")
         elif detail:
             await progress.set_stage(step_id, detail)
         else:

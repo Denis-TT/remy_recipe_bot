@@ -1411,8 +1411,8 @@ class InstagramParser(BaseParser):
     Локальный бесплатный пайплайн:
 
       1. ``yt-dlp`` без скачивания видео — описание (caption), название, обложка;
-      2. если описания достаточно для рецепта — Whisper **не вызывается**;
-      3. иначе — аудио + ``faster-whisper`` (модель ``small``, int8);
+      2. аудио + ``faster-whisper`` (модель ``small``, int8) — шаги из видео;
+      3. описание и речь **объединяются** (caption — ингредиенты, речь — шаги);
       4. при сбое — Apify Actor ``apple_yang~instagram-transcripts-scraper``.
 
     Actor: https://apify.com/apple_yang/instagram-transcripts-scraper
@@ -1430,22 +1430,6 @@ class InstagramParser(BaseParser):
     WHISPER_MODEL_NAME: str = "small"
     WHISPER_COMPUTE_TYPE: str = "int8"
     TRANSCRIBE_TIMEOUT_SECONDS: float = 120.0
-
-    # Минимальная длина caption, чтобы считать описание «полноценным» без Whisper.
-    MIN_DESCRIPTION_CHARS: int = 120
-    # Короткое описание допустимо, если есть явные признаки рецепта / граммовок.
-    MIN_DESCRIPTION_WITH_RECIPE_HINT_CHARS: int = 40
-
-    _RECIPE_HINT_RE = re.compile(
-        r"(ингредиент|рецепт|приготов|готовим|состав|понадоб|нужно|"
-        r"нарез|запек|варить|жарить|смешать|духовк)",
-        re.IGNORECASE,
-    )
-    _QUANTITY_HINT_RE = re.compile(
-        r"\d+[\d.,/]*\s*(?:г|гр|кг|мл|л|шт|ст\.?\s*л\.?|ч\.?\s*л\.?|"
-        r"столов|чайн|порци)",
-        re.IGNORECASE,
-    )
 
     # Стандартные пути бинарников после `apt install ffmpeg` (Railway / Debian).
     FFMPEG_FALLBACK_PATH: str = "/usr/bin/ffmpeg"
@@ -1507,19 +1491,6 @@ class InstagramParser(BaseParser):
                 re.IGNORECASE,
             )
         )
-
-    @classmethod
-    def _description_is_sufficient(cls, description: str) -> bool:
-        """Проверить, хватает ли caption Reels для нормализации без Whisper."""
-        text = (description or "").strip()
-        if not text:
-            return False
-        if len(text) >= cls.MIN_DESCRIPTION_CHARS:
-            return True
-        if len(text) >= cls.MIN_DESCRIPTION_WITH_RECIPE_HINT_CHARS:
-            if cls._RECIPE_HINT_RE.search(text) or cls._QUANTITY_HINT_RE.search(text):
-                return True
-        return False
 
     @staticmethod
     def _pick_best_thumbnail(info: Optional[dict]) -> str:
@@ -1598,17 +1569,7 @@ class InstagramParser(BaseParser):
         except Exception as exc:  # noqa: BLE001
             logger.warning("Не удалось получить метаданные Instagram через yt-dlp: %s", exc)
 
-        # --- 1. Достаточно caption → возвращаем без Whisper ---------------- #
-        if self._description_is_sufficient(description):
-            text = _instagram_compose_text(title, description, "")
-            if text.strip():
-                logger.info("✅ Описание Reels достаточно — Whisper пропущен")
-                await _notify("description_sufficient", "из описания")
-                if len(text) > self.MAX_TEXT_LENGTH:
-                    text = text[: self.MAX_TEXT_LENGTH]
-                return ParseResult(text=text, image_url=image_path)
-
-        # --- 2. Дополняем речью: локальный Whisper или Apify ---------------- #
+        # --- 1. Речь в видео (Whisper) + объединение с описанием ------------- #
         transcript = ""
         if self._local_enabled:
             await _notify("downloading_audio")
@@ -1643,9 +1604,7 @@ class InstagramParser(BaseParser):
             await _notify("apify_fallback", "нет ffmpeg")
 
         text = _instagram_compose_text(title, description, transcript)
-        if text.strip() and (
-            self._description_is_sufficient(description) or transcript.strip()
-        ):
+        if text.strip():
             if len(text) > self.MAX_TEXT_LENGTH:
                 text = text[: self.MAX_TEXT_LENGTH]
             return ParseResult(text=text, image_url=image_path)
@@ -2454,12 +2413,6 @@ if __name__ == "__main__":
         assert ig_seg_img == ""
         print("✅ Instagram can_parse / shortcode + мок apple_yang dataset")
 
-        assert not InstagramParser._description_is_sufficient("")
-        assert not InstagramParser._description_is_sufficient("просто короткий пост")
-        assert InstagramParser._description_is_sufficient("x" * 120)
-        assert InstagramParser._description_is_sufficient(
-            "Ингредиенты: мука 200 г, яйца 2 шт, соль по вкусу",
-        )
         thumb_info = {
             "thumbnails": [
                 {"url": "https://cdn.example.test/small.jpg", "width": 150, "height": 150},
@@ -2480,7 +2433,7 @@ if __name__ == "__main__":
         assert meta_thumb == "https://cdn.example.test/cover_hd.jpg"
         composed = _instagram_compose_text("T", "Описание", "Речь")
         assert "приоритетный источник" in composed and "дополнение" in composed
-        print("✅ Instagram description priority + thumbnail metadata helpers")
+        print("✅ Instagram thumbnail metadata + compose helpers")
 
         _ig_metadata_empty: dict[str, Any] = {}
 
@@ -2546,13 +2499,12 @@ if __name__ == "__main__":
         assert no_img is None
         print("✅ Instagram parse() с Apify-fallback (локальный путь отключён)")
 
-        # --- Достаточное описание → Whisper и аудио не вызываются -------------- #
+        # --- Описание + Whisper объединяются (ингредиенты в caption, шаги в видео) #
         _ig_recipe_caption = (
             "Ингредиенты:\n"
             "• фарш 500 г\n"
             "• лук 1 шт\n"
-            "• яйцо 1 шт\n"
-            "Запекать 40 мин при 180°C. " * 3
+            "• яйцо 1 шт"
         )
         with patch.object(
             InstagramParser,
@@ -2567,27 +2519,29 @@ if __name__ == "__main__":
             InstagramParser,
             "_download_audio",
             new_callable=AsyncMock,
-        ) as mock_dl_skip, patch.object(
+            return_value="/tmp/reels_audio_caption.mp3",
+        ) as mock_dl_combo, patch.object(
             InstagramParser,
             "_transcribe_audio",
             new_callable=AsyncMock,
-        ) as mock_tr_skip, patch.object(
+            return_value="Смешать фарш с луком, сформировать котлеты и запекать 40 минут.",
+        ) as mock_tr_combo, patch.object(
             InstagramParser,
             "_download_binary_to_path",
             side_effect=_fake_ig_image_download,
         ), patch.object(mod, "IMAGES_DIR", td_ig):
-            ig_caption = InstagramParser(apify_api_token="dummy")
-            ig_caption._local_enabled = True
-            caption_out = await ig_caption.parse(
+            ig_combo = InstagramParser(apify_api_token="dummy")
+            ig_combo._local_enabled = True
+            combo_out = await ig_combo.parse(
                 "https://www.instagram.com/reel/fullcaption123/",
             )
-        mock_dl_skip.assert_not_awaited()
-        mock_tr_skip.assert_not_awaited()
-        assert "Описание Reels (приоритетный источник)" in caption_out.text
-        assert "фарш 500" in caption_out.text
-        assert "Речь в видео" not in caption_out.text
-        assert caption_out.image_url is not None and caption_out.image_url.startswith(td_ig)
-        print("✅ Instagram: достаточное описание → без Whisper + обложка yt-dlp")
+        mock_dl_combo.assert_awaited_once()
+        mock_tr_combo.assert_awaited_once()
+        assert "Описание Reels (приоритетный источник)" in combo_out.text
+        assert "фарш 500" in combo_out.text
+        assert "Речь в видео" in combo_out.text and "запекать" in combo_out.text
+        assert combo_out.image_url is not None and combo_out.image_url.startswith(td_ig)
+        print("✅ Instagram: описание + Whisper объединяются + обложка yt-dlp")
 
         # --- Локальное распознавание (yt-dlp + Whisper), happy path ------- #
         with patch.object(
