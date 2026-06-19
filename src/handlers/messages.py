@@ -8,7 +8,8 @@
 * Фото — анализ через GitHub Models (vision), нормализация, карточка с кнопками;
 * URL (http/https) — цепочка «парсинг → нормализация → одно сообщение с кнопками»
   (при наличии картинки — фото с HTML-подписью до 1024 символов и те же кнопки);
-* Любой другой текст — короткая подсказка отправить ссылку.
+* Текст рецепта (пересланный или вставленный) — нормализация через AI без парсера;
+* Любой другой текст — короткая подсказка отправить ссылку или рецепт.
 
 Дополнительно: :func:`format_recipe` и псевдоним :func:`format_recipe_for_telegram`
 (одна реализация) — HTML-карточка рецепта для Telegram.
@@ -17,6 +18,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import logging
 import os
@@ -73,9 +75,29 @@ _URL_REGEX = re.compile(r"https?://\S+", re.IGNORECASE)
 
 # Подсказка, если пользователь прислал что-то непонятное.
 _NOT_A_URL_HINT: str = (
-    "🤔 Не вижу ссылки. Отправь URL рецепта (начинается с http:// или https://),\n"
-    "или нажми 📋 Меню, чтобы увидеть доступные действия."
+    "🤔 Не вижу ссылки и не похоже на рецепт. Отправь:\n"
+    "• ссылку на рецепт (http:// или https://)\n"
+    "• или текст рецепта (ингредиенты и шаги)\n"
+    "• или нажми 📋 Меню, чтобы увидеть доступные действия."
 )
+
+# Минимальная длина текста, чтобы пробовать распознать рецепт.
+_RECIPE_TEXT_MIN_CHARS: int = 35
+
+# Признаки рецепта в свободном тексте (ингредиенты, шаги, единицы измерения).
+_RECIPE_TEXT_SIGNAL_RE = re.compile(
+    r"(?:"
+    r"ингредиент|состав|понадобится|понадобятся|нужно:|"
+    r"готовк|приготов|нарез|смешай|запек|варить|тушить|"
+    r"рецепт|"
+    r"\d+\s*(?:г|кг|мл|л|шт|ст\.?\s*л\.?|ч\.?\s*л\.?)\b|"
+    r"(?:^|\n)\s*\d+[\.\)]\s"
+    r")",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+# Длинный текст без URL — часто пересланный рецепт из мессенджера.
+_RECIPE_TEXT_LONG_CHARS: int = 120
 
 # Лимит подписи к фото (Telegram).
 _TG_PHOTO_CAPTION_LIMIT: int = 1024
@@ -299,6 +321,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await _handle_url(message, context, user.id, url_match.group(0))
         return
 
+    # Свободный текст → рецепт без ссылки.
+    if _looks_like_recipe_text(raw_text):
+        await _handle_text_recipe(message, context, user.id, raw_text)
+        return
+
     # Всё остальное — подсказка.
     await message.reply_text(
         _NOT_A_URL_HINT,
@@ -461,6 +488,13 @@ _VIDEO_PROGRESS_STEPS: tuple[tuple[str, str], ...] = (
     ("present", "Формирую карточку"),
 )
 
+# Этапы для текста рецепта (без парсера URL).
+_TEXT_PROGRESS_STEPS: tuple[tuple[str, str], ...] = (
+    ("parse", "Читаю текст"),
+    ("normalize", "Анализирую рецепт"),
+    ("present", "Формирую карточку"),
+)
+
 # Этапы для обычных сайтов.
 _DEFAULT_PROGRESS_STEPS: tuple[tuple[str, str], ...] = (
     ("parse", "Читаю страницу"),
@@ -483,7 +517,12 @@ class RecipeProgress:
 
     def __init__(self, status: Message, *, video: bool = False, source_type: str = "") -> None:
         self._status = status
-        self._steps = _VIDEO_PROGRESS_STEPS if video else _DEFAULT_PROGRESS_STEPS
+        if source_type == "text":
+            self._steps = _TEXT_PROGRESS_STEPS
+        elif video:
+            self._steps = _VIDEO_PROGRESS_STEPS
+        else:
+            self._steps = _DEFAULT_PROGRESS_STEPS
         self._completed: set[str] = set()
         self._current: Optional[str] = None
         self._detail = ""
@@ -495,6 +534,8 @@ class RecipeProgress:
             self._title = "🎵 <b>TikTok</b>"
         elif source_type == "vk":
             self._title = "📺 <b>VK Видео</b>"
+        elif source_type == "text":
+            self._title = "📝 <b>Текст рецепта</b>"
         elif video:
             self._title = "🎬 <b>Видео</b>"
         else:
@@ -537,6 +578,113 @@ class RecipeProgress:
 
     async def _render(self) -> None:
         await _safe_edit(self._status, self._render_text())
+
+
+# --------------------------------------------------------------------------- #
+# Текстовый рецепт (без URL)
+# --------------------------------------------------------------------------- #
+
+
+def _looks_like_recipe_text(text: str) -> bool:
+    """Эвристика: похоже ли сообщение на рецепт, а не на болтовню."""
+    t = (text or "").strip()
+    if len(t) < _RECIPE_TEXT_MIN_CHARS:
+        return False
+    if _RECIPE_TEXT_SIGNAL_RE.search(t):
+        return True
+    if len(t) >= _RECIPE_TEXT_LONG_CHARS:
+        return True
+    lines = [ln.strip() for ln in t.splitlines() if ln.strip()]
+    bullet_lines = sum(1 for ln in lines if re.search(r"^[-•—*]\s", ln))
+    return len(lines) >= 4 and bullet_lines >= 2
+
+
+def _text_processing_key(text: str) -> str:
+    normalized = re.sub(r"\s+", " ", (text or "").strip().lower())
+    digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
+    return f"txt:{digest}"
+
+
+async def _handle_text_recipe(
+    message: Message,
+    context: ContextTypes.DEFAULT_TYPE,
+    user_id: int,
+    raw_text: str,
+) -> None:
+    """Нормализовать свободный текст рецепта и показать карточку."""
+    bot = _get_bot(context)
+    job_key = _text_processing_key(raw_text)
+
+    if bot.processing_urls.get(user_id) == job_key:
+        await message.reply_text(
+            "⏳ Этот текст уже обрабатывается. Подожди — скоро пришлю результат.",
+        )
+        return
+
+    bot.processing_urls[user_id] = job_key
+
+    status: Message = await message.reply_text("⏳ Запускаю обработку…")
+    progress = RecipeProgress(status, source_type="text")
+    await progress.start()
+
+    try:
+        await progress.set_stage("parse")
+        text = raw_text.strip()
+        if not text:
+            await _safe_edit(status, "❌ Пустое сообщение")
+            return
+
+        await progress.set_stage("normalize")
+        try:
+            recipe = await bot.normalizer.normalize(text)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("❌ Ошибка нормализации текста: %s", exc)
+            await _safe_edit(
+                status,
+                f"❌ Не удалось обработать рецепт:\n<code>{_html_escape(str(exc))}</code>",
+            )
+            return
+
+        title_ok = bool((recipe.get("title") or "").strip())
+        ingredients_ok = bool(recipe.get("ingredients"))
+        if not (title_ok and ingredients_ok):
+            logger.warning(
+                "⚠️  Текст не прошёл валидацию рецепта (title=%s, ingredients=%s)",
+                title_ok,
+                ingredients_ok,
+            )
+            await _safe_edit(
+                status,
+                "❌ Не удалось распознать рецепт в этом тексте.\n"
+                "Проверь, что есть название, ингредиенты и шаги приготовления.",
+            )
+            return
+
+        recipe["source_url"] = ""
+        if not recipe.get("image_url") and not recipe.get("image_path"):
+            from ..parser import _generate_and_save_image, attach_recipe_image
+
+            gen_path = await _generate_and_save_image(
+                str(recipe.get("title") or "блюдо")[:400],
+                hf_api_key=bot.config.hf_api_key,
+            )
+            if gen_path:
+                await attach_recipe_image(recipe, gen_path, bot.storage)
+
+        bot.temp_recipes[user_id] = {"recipe": recipe, "timestamp": time.time()}
+        bot.cleanup_expired_temp_recipes()
+
+        logger.info(
+            "✅ Рецепт из текста: «%s», meal_type=%s",
+            recipe.get("title"),
+            recipe.get("meal_type"),
+        )
+
+        await progress.set_stage("present")
+        await _present_recipe_with_optional_photo(message, status, recipe, bot)
+    finally:
+        if bot.processing_urls.get(user_id) == job_key:
+            bot.processing_urls.pop(user_id, None)
 
 
 # --------------------------------------------------------------------------- #
@@ -1069,6 +1217,30 @@ if __name__ == "__main__":
     assert "🔄 2/4 Распознаю речь — 42 с" in _progress_text
     assert "⏳ 3/4 Анализирую рецепт" in _progress_text
     print("✅ RecipeProgress чеклист (Instagram)")
+
+    _text_prog = RecipeProgress(_mock_status_msg, source_type="text")
+    _text_prog._current = "normalize"
+    _text_prog._completed.add("parse")
+    _text_render = _text_prog._render_text()
+    assert "📝" in _text_render and "1/3 Читаю текст" in _text_render
+    assert "🔄 2/3 Анализирую рецепт" in _text_render
+    print("✅ RecipeProgress чеклист (текст)")
+
+    _sample_recipe = (
+        "Блины классические\n\n"
+        "Ингредиенты:\n"
+        "мука 500 г\n"
+        "молоко 800 мл\n"
+        "яйца 3 шт\n"
+        "соль 1 ч.л.\n\n"
+        "1. Смешать все ингредиенты.\n"
+        "2. Жарить на сковороде с двух сторон."
+    )
+    assert _looks_like_recipe_text(_sample_recipe)
+    assert not _looks_like_recipe_text("привет")
+    assert not _looks_like_recipe_text("ок")
+    assert _looks_like_recipe_text("а" * 130)
+    print("✅ _looks_like_recipe_text")
 
     _tmp_img = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
     _tmp_img.write(b"\xff\xd8\xff\xd9")
