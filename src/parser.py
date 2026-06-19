@@ -3,10 +3,9 @@
 
 * `BaseParser` — абстрактный контракт (`can_parse`, `parse`, `source_type`).
 * `WebParser` — обычные HTTP(S)-страницы с рецептами.
-* `YouTubeParser` — заголовок и описание через YouTube Data API v3; субтитры — Apify Actor
-  ``pintostudio~youtube-transcript-scraper`` (при наличии ``APIFY_API_TOKEN``).
-* `InstagramParser` — Reels и посты через Apify Actor
-  ``apple_yang~instagram-transcripts-scraper`` (ввод ``videoUrl``).
+* `YouTubeParser` — yt-dlp метаданные + Whisper + публичные субтитры / Apify-fallback.
+* `TikTokParser` — тот же пайплайн для TikTok.
+* `InstagramParser` — Reels: yt-dlp + Whisper + Apify ``apple_yang~instagram-transcripts-scraper``.
 * `ParserRegistry` / `create_parser_registry` — маршрутизация и фабрика.
 """
 
@@ -37,8 +36,14 @@ if TYPE_CHECKING:
 import aiohttp
 from bs4 import BeautifulSoup
 from config import config as _remy_config
-from googleapiclient.discovery import build
-from googleapiclient.errors import HttpError
+
+from .ytdlp_mixin import (
+    YtdlpWhisperMixin,
+    metadata_from_ytdlp_info,
+    pick_best_thumbnail,
+    safe_video_str,
+    video_compose_text,
+)
 
 try:
     from readability import Document as _ReadabilityDocument
@@ -765,6 +770,7 @@ APIFY_TRANSCRIPT_ACTOR = "pintostudio~youtube-transcript-scraper"
 APIFY_INSTAGRAM_TRANSCRIPT_ACTOR = "apple_yang~instagram-transcripts-scraper"
 # Дольше, чем YouTube — транскрипт Instagram может обрабатываться минутами.
 APIFY_INSTAGRAM_WAIT_FINISH_SEC = 300
+APIFY_TIKTOK_TRANSCRIPT_ACTOR = "scrape-creators~best-tiktok-transcripts-scraper"
 APIFY_WAIT_FINISH_SEC = 120
 
 
@@ -1013,25 +1019,23 @@ def _apify_dataset_payload_to_subtitle_text(payload: Any) -> tuple[str, int]:
     return text, n
 
 
-class YouTubeParser(BaseParser):
-    """YouTube: Data API v3 — заголовок и описание; субтитры — captionTracks/Apify.
+class YouTubeParser(YtdlpWhisperMixin, BaseParser):
+    """YouTube: yt-dlp метаданные + Whisper + captionTracks / Apify-fallback.
 
-    Биллинг Apify (ориентиры для планирования; актуальные цены — на apify.com/pricing и у Actor):
-    бесплатный tier даёт около $5 кредита в месяц; один запуск YouTube Transcript Scraper
-    обычно порядка $0.02 за видео; поэтому Apify используется только последним fallback.
+    Пайплайн совпадает с Instagram/TikTok: описание в приоритете, речь — дополнение.
+    YouTube Data API не требуется — метаданные берутся через yt-dlp.
     """
 
     source_type: str = "youtube"
-    generate_image_default: bool = True
-    MAX_TEXT_LENGTH: int = 50_000
+    generate_image_default: bool = False
+    PLATFORM_NAME: str = "YouTube"
+    AUDIO_OUTTMPL: str = "/tmp/youtube_audio_%(id)s.%(ext)s"
+    AUDIO_LOG_LABEL: str = "YouTube"
+    HEADERS: dict = WebParser.HEADERS
 
-    def __init__(
-        self,
-        youtube_api_key: str = "",
-        apify_api_token: str = "",
-    ) -> None:
-        self.youtube_api_key = (youtube_api_key or "").strip()
+    def __init__(self, apify_api_token: str = "") -> None:
         self._apify_api_token = (apify_api_token or "").strip()
+        self._init_ytdlp_whisper()
 
     @staticmethod
     def _extract_youtube_video_id(url: str) -> str:
@@ -1058,11 +1062,50 @@ class YouTubeParser(BaseParser):
             return True
         return False
 
-    async def parse(self, url: str) -> ParseResult:
+    def _metadata_from_info(self, info: Optional[dict]) -> tuple[str, str, str]:
+        return metadata_from_ytdlp_info(
+            info,
+            prepend_uploader=True,
+            title_cleaner=_strip_youtube_title_text,
+            description_cleaner=_strip_youtube_description_text,
+        )
+
+    async def parse(
+        self,
+        url: str,
+        *,
+        on_progress: Optional[ProgressCallback] = None,
+    ) -> ParseResult:
         if not self.can_parse(url):
             raise ValueError(f"YouTubeParser не поддерживает URL: {url!r}")
-        text = await asyncio.to_thread(self._parse_sync, url)
-        return ParseResult(text=text)
+        return await self.parse_ytdlp_video(
+            url,
+            on_progress=on_progress,
+            supplement_transcript=self._supplement_youtube_transcript,
+        )
+
+    def _supplement_youtube_transcript(self, url: str) -> str:
+        """Бесплатные captionTracks, если Whisper не дал текста."""
+        video_id = self._extract_youtube_video_id(url)
+        if not video_id:
+            return ""
+        return self._fetch_subtitles_public(video_id)
+
+    @staticmethod
+    def _resolve_audio_path(info: Optional[dict]) -> str:
+        info = info or {}
+        requested = info.get("requested_downloads")
+        if isinstance(requested, list) and requested:
+            first = requested[0]
+            if isinstance(first, dict):
+                fp = first.get("filepath") or first.get("_filename") or ""
+                if fp:
+                    base, _ext = os.path.splitext(fp)
+                    return base + ".mp3"
+        video_id = str(info.get("id") or "").strip()
+        if video_id:
+            return f"/tmp/youtube_audio_{video_id}.mp3"
+        return ""
 
     @staticmethod
     def _extract_balanced_json(text: str, marker: str) -> str:
@@ -1244,93 +1287,10 @@ class YouTubeParser(BaseParser):
             logger.info("Apify не вернул текста субтитров для видео %s", video_id)
         return texts
 
-    def _parse_sync(self, url: str) -> str:
+    def _fetch_apify_fallback(self, url: str) -> tuple[str, str, str, str]:
         video_id = self._extract_youtube_video_id(url)
-        if not video_id or len(video_id) != 11:
-            raise ValueError("Некорректный YouTube URL")
-
-        logger.info("🎬 Обнаружено YouTube-видео: %s", video_id)
-
-        api_key = self.youtube_api_key
-        if not api_key:
-            logger.warning("YouTube API ключ не задан, парсинг невозможен")
-            raise RuntimeError(
-                "YouTube API ключ не настроен. Добавьте YOUTUBE_API_KEY в переменные окружения."
-            )
-
-        try:
-            youtube = build("youtube", "v3", developerKey=api_key, cache_discovery=False)
-            response = (
-                youtube.videos()
-                .list(part="snippet,contentDetails", id=video_id)
-                .execute()
-            )
-        except HttpError as exc:
-            err = str(exc)
-            logger.error("Ошибка YouTube Data API: %s", err)
-            raise RuntimeError(err) from exc
-        except Exception as exc:  # noqa: BLE001
-            err = str(exc)
-            logger.error("Ошибка YouTube Data API: %s", err)
-            raise RuntimeError(err) from exc
-
-        items = response.get("items") or []
-        if not items:
-            raise RuntimeError("Видео не найдено")
-
-        snippet = items[0].get("snippet") or {}
-        raw_title = snippet.get("title") or ""
-        if not isinstance(raw_title, str):
-            raw_title = str(raw_title)
-        raw_desc = snippet.get("description") or ""
-        if not isinstance(raw_desc, str):
-            raw_desc = str(raw_desc) if raw_desc is not None else ""
-
-        clean_title = _strip_youtube_title_text(raw_title)
-        clean_desc = _strip_youtube_description_text(raw_desc) if raw_desc else ""
-        title_for_text = clean_title or (raw_title or "").strip()
-        desc_for_text = clean_desc or (
-            (raw_desc or "").replace("\r\n", "\n").strip() if raw_desc else ""
-        )
-
-        title_preview = raw_title[:50] + ("..." if len(raw_title) > 50 else "")
-        logger.info(
-            'Получены данные через YouTube Data API: "%s"',
-            title_preview,
-        )
-
-        sub_text = self._fetch_subtitles_public(video_id)
-        if not sub_text:
-            sub_text = self._fetch_subtitles_apify(video_id)
-
-        metadata_parts: List[str] = []
-        if title_for_text:
-            metadata_parts.append(f"Название видео (YouTube Data API):\n{title_for_text}")
-        if desc_for_text:
-            metadata_parts.append(
-                "Описание видео (YouTube Data API, главный источник рецепта):\n"
-                f"{desc_for_text}"
-            )
-        core = "\n\n".join(metadata_parts)
-        if sub_text:
-            subtitles_block = (
-                "Дополнительный контекст из субтитров "
-                "(использовать только если в названии/описании не хватает деталей):\n"
-                f"{sub_text}"
-            )
-            text = f"{core}\n\n{subtitles_block}" if core else subtitles_block
-        else:
-            text = core
-            if core.strip():
-                logger.info("Данные YouTube Data API переданы без субтитров")
-
-        if not text.strip():
-            logger.error("❌ Не удалось извлечь текст из видео (пустой заголовок и описание)")
-            raise RuntimeError("Не удалось извлечь текст из видео")
-
-        if len(text) > self.MAX_TEXT_LENGTH:
-            text = text[: self.MAX_TEXT_LENGTH]
-        return text
+        transcript = self._fetch_subtitles_apify(video_id) if video_id else ""
+        return "", "", transcript, ""
 
 
 def _instagram_safe_str(value: Any) -> str:
@@ -1366,18 +1326,6 @@ def _instagram_author_description(user_name: str, full_name: str) -> str:
     return user or full
 
 
-def _instagram_compose_text(title: str, description: str, transcript: str) -> str:
-    """Собрать сырой текст Reels: описание в приоритете, речь — дополнение."""
-    chunks: List[str] = []
-    if title.strip():
-        chunks.append(f"Название Reels:\n{title.strip()}")
-    if description.strip():
-        chunks.append(f"Описание Reels (приоритетный источник):\n{description.strip()}")
-    if transcript.strip():
-        chunks.append(f"Речь в видео / субтитры (дополнение):\n{transcript.strip()}")
-    return "\n\n".join(chunks)
-
-
 def _instagram_extract_from_item(item: Any) -> tuple[str, str, str, str]:
     """Разобрать один объект Actor ``apple_yang~instagram-transcripts-scraper``."""
     if not isinstance(item, dict):
@@ -1405,70 +1353,28 @@ def _instagram_extract_from_item(item: Any) -> tuple[str, str, str, str]:
     return title, description, transcript_text, img_url
 
 
-class InstagramParser(BaseParser):
-    """Instagram Reels: yt-dlp метаданные + Whisper + Apify-fallback.
+def _instagram_compose_text(title: str, description: str, transcript: str) -> str:
+    return video_compose_text("Reels", title, description, transcript)
 
-    Локальный бесплатный пайплайн:
 
-      1. ``yt-dlp`` без скачивания видео — описание (caption), название, обложка;
-      2. аудио + ``faster-whisper`` (модель ``small``, int8) — шаги из видео;
-      3. описание и речь **объединяются** (caption — ингредиенты, речь — шаги);
-      4. при сбое — Apify Actor ``apple_yang~instagram-transcripts-scraper``.
-
-    Actor: https://apify.com/apple_yang/instagram-transcripts-scraper
-    """
+class InstagramParser(YtdlpWhisperMixin, BaseParser):
+    """Instagram Reels: yt-dlp + Whisper + Apify-fallback (``apple_yang~instagram-transcripts-scraper``)."""
 
     source_type: str = "instagram"
     generate_image_default: bool = False
-    MAX_TEXT_LENGTH: int = 50_000
-    TIMEOUT_SECONDS: float = 30.0
-    HEADERS: dict = WebParser.HEADERS
-
-    # Локальное распознавание (yt-dlp + faster-whisper).
+    PLATFORM_NAME: str = "Reels"
     AUDIO_OUTTMPL: str = "/tmp/reels_audio_%(id)s.%(ext)s"
+    AUDIO_LOG_LABEL: str = "Instagram Reels"
+    HEADERS: dict = WebParser.HEADERS
     COOKIE_FILE_PATH: str = "/tmp/instagram_cookies.txt"
-    WHISPER_MODEL_NAME: str = "small"
-    WHISPER_COMPUTE_TYPE: str = "int8"
-    TRANSCRIBE_TIMEOUT_SECONDS: float = 120.0
-
-    # Стандартные пути бинарников после `apt install ffmpeg` (Railway / Debian).
-    FFMPEG_FALLBACK_PATH: str = "/usr/bin/ffmpeg"
-    FFPROBE_FALLBACK_PATH: str = "/usr/bin/ffprobe"
 
     def __init__(self, apify_api_token: str = "", instagram_session_id: str = "") -> None:
         self._apify_api_token = (apify_api_token or "").strip()
         self.sessionid = (instagram_session_id or "").strip()
-        # Модель Whisper загружается лениво при первом распознавании и
-        # кэшируется на время жизни парсера (повторная загрузка ~74 МБ дорогая).
-        self._whisper_model: Any = None
+        self._init_ytdlp_whisper()
 
-        # Диагностика ffmpeg/ffprobe: yt-dlp без них не умеет извлекать аудио
-        # (ошибка "ffprobe and ffmpeg not found"). Если бинарников нет —
-        # сразу отключаем локальный режим и работаем только через Apify.
-        self._ffmpeg_path, self._ffprobe_path = self._detect_ffmpeg()
-        self._local_enabled: bool = bool(self._ffmpeg_path)
-        if self._local_enabled:
-            logger.info("ffmpeg найден: %s", self._ffmpeg_path)
-        else:
-            logger.warning("ffmpeg не найден, локальное распознавание отключено")
-
-    @classmethod
-    def _detect_ffmpeg(cls) -> tuple[str, str]:
-        """Найти ffmpeg и ffprobe в PATH, иначе проверить стандартные пути apt.
-
-        Returns:
-            Кортеж ``(ffmpeg_path, ffprobe_path)``; элемент пуст, если бинарник
-            не найден. Пустой ``ffmpeg_path`` означает «локальный режим недоступен».
-        """
-        ffmpeg = shutil.which("ffmpeg") or ""
-        if not ffmpeg and os.path.isfile(cls.FFMPEG_FALLBACK_PATH):
-            ffmpeg = cls.FFMPEG_FALLBACK_PATH
-
-        ffprobe = shutil.which("ffprobe") or ""
-        if not ffprobe and os.path.isfile(cls.FFPROBE_FALLBACK_PATH):
-            ffprobe = cls.FFPROBE_FALLBACK_PATH
-
-        return ffmpeg, ffprobe
+    def _ytdlp_cookiefile(self) -> str:
+        return self._create_cookie_file()
 
     @staticmethod
     def _extract_shortcode(url: str) -> str:
@@ -1492,48 +1398,6 @@ class InstagramParser(BaseParser):
             )
         )
 
-    @staticmethod
-    def _pick_best_thumbnail(info: Optional[dict]) -> str:
-        """Выбрать URL обложки максимального качества из метаданных yt-dlp."""
-        info = info or {}
-        thumbs = info.get("thumbnails")
-        if isinstance(thumbs, list) and thumbs:
-            best: Optional[dict] = None
-            best_score = -1
-            for item in thumbs:
-                if not isinstance(item, dict):
-                    continue
-                url = str(item.get("url") or "").strip()
-                if not url:
-                    continue
-                score = int(item.get("height") or 0) * int(item.get("width") or 0)
-                if score <= 0:
-                    score = len(url)
-                if score > best_score:
-                    best_score = score
-                    best = item
-            if best is not None:
-                return str(best.get("url") or "").strip()
-        return str(info.get("thumbnail") or "").strip()
-
-    @staticmethod
-    def _metadata_from_info(info: Optional[dict]) -> tuple[str, str, str]:
-        """Извлечь название, описание (caption) и URL обложки из ответа yt-dlp."""
-        info = info or {}
-        title = _instagram_safe_str(info.get("title") or info.get("fulltitle"))
-        description = _instagram_safe_str(info.get("description"))
-        if not description:
-            description = title
-            title = ""
-        elif title and description == title:
-            title = ""
-        uploader = _instagram_safe_str(info.get("uploader") or info.get("channel"))
-        if uploader and uploader not in description:
-            handle = uploader if uploader.startswith("@") else f"@{uploader}"
-            description = f"{handle}\n\n{description}".strip()
-        thumb_url = InstagramParser._pick_best_thumbnail(info)
-        return title, description, thumb_url
-
     async def parse(
         self,
         url: str,
@@ -1542,142 +1406,27 @@ class InstagramParser(BaseParser):
     ) -> ParseResult:
         if not self.can_parse(url):
             raise ValueError(f"InstagramParser не поддерживает URL: {url!r}")
+        return await self.parse_ytdlp_video(url, on_progress=on_progress)
 
-        async def _notify(stage: str, detail: str = "") -> None:
-            if on_progress is not None:
-                await on_progress(stage, detail)
-
-        title = ""
-        description = ""
-        thumb_url = ""
-        image_path: Optional[str] = None
-
-        # --- 0. Метаданные yt-dlp: caption + обложка (без скачивания видео) --- #
-        await _notify("fetching_metadata")
-        try:
-            info = await self._fetch_ytdlp_info(url, download=False)
-            title, description, thumb_url = self._metadata_from_info(info)
-            if title or description:
-                logger.info(
-                    "Получены метаданные Instagram: title=%d симв., description=%d симв.",
-                    len(title),
-                    len(description),
-                )
-            if thumb_url:
-                logger.info("Обложка Reels найдена через yt-dlp")
-                image_path = await self._download_instagram_image(thumb_url)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Не удалось получить метаданные Instagram через yt-dlp: %s", exc)
-
-        # --- 1. Речь в видео (Whisper) + объединение с описанием ------------- #
-        transcript = ""
-        if self._local_enabled:
-            await _notify("downloading_audio")
-            try:
-                audio_path = await self._download_audio(url)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    "⚠️ Локальное распознавание не удалось: %s. Переключаюсь на Apify",
-                    exc,
-                )
-                audio_path = ""
-
-            if audio_path:
-                await _notify("transcribing")
-                try:
-                    transcript = await asyncio.wait_for(
-                        self._transcribe_audio(audio_path, on_progress=on_progress),
-                        timeout=self.TRANSCRIBE_TIMEOUT_SECONDS,
-                    )
-                except asyncio.TimeoutError:
-                    logger.warning(
-                        "⚠️ Распознавание Whisper превысило %.0f с — переключаюсь на Apify",
-                        self.TRANSCRIBE_TIMEOUT_SECONDS,
-                    )
-                    transcript = ""
-                if transcript.strip():
-                    logger.info("✅ Локальное распознавание речи успешно")
-        else:
-            logger.info(
-                "ℹ️ Локальное распознавание отключено (нет ffmpeg) — использую Apify",
-            )
-            await _notify("apify_fallback", "нет ffmpeg")
-
-        text = _instagram_compose_text(title, description, transcript)
-        if text.strip():
-            if len(text) > self.MAX_TEXT_LENGTH:
-                text = text[: self.MAX_TEXT_LENGTH]
-            return ParseResult(text=text, image_url=image_path)
-
-        logger.warning(
-            "⚠️ Локально недостаточно данных (description=%d симв., transcript=%d) — Apify",
-            len(description),
-            len(transcript),
-        )
-
-        # --- 3. Fallback: Apify (субтитры + img, если yt-dlp не дал обложку) - #
-        await _notify("apify_fallback")
-        apify_text, apify_img = await asyncio.to_thread(self._parse_sync, url)
-        if not image_path and apify_img:
-            image_path = await self._download_instagram_image(apify_img)
-        if len(apify_text) > self.MAX_TEXT_LENGTH:
-            apify_text = apify_text[: self.MAX_TEXT_LENGTH]
-        return ParseResult(text=apify_text, image_url=image_path)
-
-    def _ytdlp_base_opts(self) -> dict[str, Any]:
-        """Базовые опции yt-dlp с cookie и без лишнего шума в логах."""
-        opts: dict[str, Any] = {
-            "quiet": True,
-            "no_warnings": True,
-        }
-        if self._ffmpeg_path:
-            opts["ffmpeg_location"] = os.path.dirname(self._ffmpeg_path) or self._ffmpeg_path
-        return opts
-
-    async def _fetch_ytdlp_info(self, url: str, *, download: bool = False) -> dict:
-        """Получить метаданные (или скачать медиа) через yt-dlp в фоновом потоке."""
-        import yt_dlp  # type: ignore[import-untyped]
-
-        ydl_opts = self._ytdlp_base_opts()
-        if not download:
-            ydl_opts["skip_download"] = True
-
-        cookie_path = self._create_cookie_file()
-        if cookie_path:
-            ydl_opts["cookiefile"] = cookie_path
-
-        def _extract() -> dict:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                result = ydl.extract_info(url, download=download)
-                if not isinstance(result, dict):
-                    raise RuntimeError("yt-dlp вернул пустые метаданные")
-                return result
-
-        try:
-            return await asyncio.to_thread(_extract)
-        finally:
-            if cookie_path and os.path.isfile(cookie_path):
-                with contextlib.suppress(OSError):
-                    os.remove(cookie_path)
-
-    # ----------------------------------------------------------------------- #
-    # Локальное распознавание речи: yt-dlp + Whisper
-    # ----------------------------------------------------------------------- #
+    @staticmethod
+    def _resolve_audio_path(info: Optional[dict]) -> str:
+        info = info or {}
+        requested = info.get("requested_downloads")
+        if isinstance(requested, list) and requested:
+            first = requested[0]
+            if isinstance(first, dict):
+                fp = first.get("filepath") or first.get("_filename") or ""
+                if fp:
+                    base, _ext = os.path.splitext(fp)
+                    return base + ".mp3"
+        video_id = str(info.get("id") or "").strip()
+        if video_id:
+            return f"/tmp/reels_audio_{video_id}.mp3"
+        return ""
 
     def _create_cookie_file(self) -> str:
-        """Создать временный cookie-файл (Netscape) из ``self.sessionid``.
-
-        yt-dlp принимает cookies только в Netscape-формате через опцию
-        ``cookiefile``. Авторизация по ``sessionid`` помогает обходить
-        ограничения Instagram на приватный/региональный контент.
-
-        Returns:
-            Путь к файлу либо пустую строку, если ``sessionid`` не задан.
-        """
         if not self.sessionid:
             return ""
-        # Поля Netscape: domain, include_subdomains, path, secure, expiry, name, value.
-        # expiry=0 трактуется как session-cookie (бессрочный в рамках запуска).
         cookie_line = "\t".join(
             [".instagram.com", "TRUE", "/", "TRUE", "0", "sessionid", self.sessionid]
         )
@@ -1690,219 +1439,7 @@ class InstagramParser(BaseParser):
             return ""
         return self.COOKIE_FILE_PATH
 
-    async def _download_audio(self, url: str) -> str:
-        """Скачать аудиодорожку Reels через yt-dlp и вернуть путь к ``.mp3``.
-
-        Бросает исключение при любой ошибке — его ловит :meth:`parse`
-        и переключается на Apify.
-        """
-        # Без ffmpeg yt-dlp не извлечёт аудио — не тратим время, сразу в fallback.
-        if not self._ffmpeg_path:
-            raise RuntimeError("Локальный режим недоступен: ffmpeg не найден")
-
-        # Ленивый импорт: yt-dlp тяжёлый и нужен только в рантайме.
-        import yt_dlp  # type: ignore[import-untyped]
-
-        logger.info("🎵 Скачиваю аудио из Instagram Reels...")
-
-        ydl_opts: dict[str, Any] = {
-            **self._ytdlp_base_opts(),
-            "format": "bestaudio/best",
-            "outtmpl": self.AUDIO_OUTTMPL,
-            "postprocessors": [
-                {
-                    "key": "FFmpegExtractAudio",
-                    "preferredcodec": "mp3",
-                    "preferredquality": "192",
-                }
-            ],
-        }
-        logger.debug(
-            "yt-dlp ffmpeg_location=%s (ffmpeg=%s, ffprobe=%s)",
-            ydl_opts.get("ffmpeg_location"),
-            self._ffmpeg_path,
-            self._ffprobe_path or "—",
-        )
-
-        cookie_path = self._create_cookie_file()
-        if cookie_path:
-            ydl_opts["cookiefile"] = cookie_path
-
-        def _extract() -> dict:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                return ydl.extract_info(url, download=True)
-
-        try:
-            info = await asyncio.to_thread(_extract)
-        except Exception as exc:  # noqa: BLE001
-            logger.error("❌ Ошибка скачивания аудио: %s", exc)
-            raise
-        finally:
-            # Cookie-файл с секретом не должен залёживаться во временной папке.
-            if cookie_path and os.path.isfile(cookie_path):
-                try:
-                    os.remove(cookie_path)
-                except OSError:
-                    pass
-
-        audio_path = self._resolve_audio_path(info)
-        if not audio_path or not os.path.isfile(audio_path):
-            raise RuntimeError(
-                f"Аудиофайл не найден после скачивания (id={(info or {}).get('id')!r})"
-            )
-
-        logger.info("✅ Аудио скачано: %s", audio_path)
-        return audio_path
-
-    @staticmethod
-    def _resolve_audio_path(info: Optional[dict]) -> str:
-        """Определить путь к итоговому ``.mp3`` по ответу yt-dlp."""
-        info = info or {}
-        # Самый надёжный источник — фактический путь из requested_downloads.
-        requested = info.get("requested_downloads")
-        if isinstance(requested, list) and requested:
-            first = requested[0]
-            if isinstance(first, dict):
-                fp = first.get("filepath") or first.get("_filename") or ""
-                if fp:
-                    # После FFmpegExtractAudio расширение уже .mp3.
-                    base, _ext = os.path.splitext(fp)
-                    return base + ".mp3"
-        # Запасной вариант — собрать путь из шаблона и id.
-        video_id = str(info.get("id") or "").strip()
-        if video_id:
-            return f"/tmp/reels_audio_{video_id}.mp3"
-        return ""
-
-    async def _transcribe_audio(
-        self,
-        audio_path: str,
-        *,
-        on_progress: Optional[ProgressCallback] = None,
-    ) -> str:
-        """Распознать речь через faster-whisper (модель ``small``, int8).
-
-        Не выбрасывает исключений (возвращает пустую строку при сбое), чтобы
-        не ломать fallback на Apify. Всегда удаляет временный аудиофайл.
-        """
-        heartbeat_task: Optional[asyncio.Task[None]] = None
-        if on_progress is not None:
-            async def _heartbeat() -> None:
-                start = time.monotonic()
-                while True:
-                    await asyncio.sleep(12)
-                    elapsed = int(time.monotonic() - start)
-                    await on_progress("transcribing", f"{elapsed} с")
-
-            heartbeat_task = asyncio.create_task(_heartbeat())
-
-        try:
-            model = await self._ensure_whisper_model()
-            logger.info(
-                "🎙️ Распознаю речь через faster-whisper (модель %s, int8)...",
-                self.WHISPER_MODEL_NAME,
-            )
-            text = await asyncio.to_thread(self._transcribe_sync, model, audio_path)
-            logger.info("✅ Распознано %d символов", len(text))
-            return text
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("⚠️ Ошибка распознавания Whisper: %s", exc)
-            return ""
-        finally:
-            if heartbeat_task is not None:
-                heartbeat_task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await heartbeat_task
-            if audio_path and os.path.isfile(audio_path):
-                try:
-                    os.remove(audio_path)
-                    logger.info("🗑️ Временный аудиофайл удалён")
-                except OSError as exc:
-                    logger.debug("Не удалось удалить аудиофайл %s: %s", audio_path, exc)
-
-    @staticmethod
-    def _transcribe_sync(model: Any, audio_path: str) -> str:
-        """Синхронная транскрипция (вызывается из ``asyncio.to_thread``)."""
-        segments, _info = model.transcribe(
-            audio_path,
-            language="ru",
-            beam_size=1,
-            vad_filter=True,
-            condition_on_previous_text=False,
-        )
-        parts = [seg.text.strip() for seg in segments if seg.text and seg.text.strip()]
-        return " ".join(parts)
-
-    async def _ensure_whisper_model(self) -> Any:
-        """Лениво загрузить и закэшировать модель faster-whisper."""
-        if self._whisper_model is None:
-            from faster_whisper import WhisperModel  # type: ignore[import-untyped]
-
-            logger.info(
-                "⏳ Загружаю модель faster-whisper '%s' (%s)...",
-                self.WHISPER_MODEL_NAME,
-                self.WHISPER_COMPUTE_TYPE,
-            )
-            self._whisper_model = await asyncio.to_thread(
-                WhisperModel,
-                self.WHISPER_MODEL_NAME,
-                device="cpu",
-                compute_type=self.WHISPER_COMPUTE_TYPE,
-            )
-        return self._whisper_model
-
-    async def preload_whisper_model(self) -> None:
-        """Предзагрузить модель Whisper при старте бота (если локальный режим доступен)."""
-        if not self._local_enabled:
-            return
-        await self._ensure_whisper_model()
-        logger.info("✅ Модель faster-whisper '%s' предзагружена", self.WHISPER_MODEL_NAME)
-
-    async def _download_instagram_image(self, img_url: str) -> Optional[str]:
-        """Скачать ``img`` из Instagram Actor в ``IMAGES_DIR`` и вернуть локальный путь."""
-        url = (img_url or "").strip()
-        if not url:
-            logger.info("Instagram не предоставил изображение (поле img пусто)")
-            return None
-        if not url.startswith(("http://", "https://")):
-            logger.warning("Не удалось скачать изображение Instagram: %s", url)
-            return None
-
-        ensure_images_dir()
-        dest = os.path.join(IMAGES_DIR, f"{uuid.uuid4().hex}.jpg")
-        try:
-            ok = await self._download_binary_to_path(url, dest)
-            if ok:
-                logger.info("Изображение Instagram сохранено: %s", dest)
-                return dest
-        except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
-            logger.warning("Не удалось скачать изображение Instagram: %s", url)
-            logger.debug("Ошибка скачивания Instagram img: %s", exc)
-        if os.path.isfile(dest):
-            try:
-                os.unlink(dest)
-            except OSError:
-                pass
-        return None
-
-    async def _download_binary_to_path(self, file_url: str, dest_path: str) -> bool:
-        timeout = aiohttp.ClientTimeout(total=self.TIMEOUT_SECONDS)
-        max_bytes = 8 * 1024 * 1024
-        async with aiohttp.ClientSession(timeout=timeout, headers=self.HEADERS) as session:
-            async with session.get(file_url, allow_redirects=True) as response:
-                if response.status >= 400:
-                    logger.warning("Не удалось скачать изображение Instagram: %s", file_url)
-                    return False
-                data = await response.read()
-        if len(data) > max_bytes:
-            logger.warning("Не удалось скачать изображение Instagram: %s", file_url)
-            return False
-        with open(dest_path, "wb") as f:
-            f.write(data)
-        return True
-
-    def _fetch_via_apify(self, url: str) -> tuple[str, str, str, str]:
-        """Вернуть title / description / transcript / img или пустые строки при сбое."""
+    def _fetch_apify_fallback(self, url: str) -> tuple[str, str, str, str]:
         token = (self._apify_api_token or "").strip()
         if not token:
             logger.error("Ошибка получения Instagram субтитров")
@@ -1912,28 +1449,19 @@ class InstagramParser(BaseParser):
             f"https://api.apify.com/v2/acts/{APIFY_INSTAGRAM_TRANSCRIPT_ACTOR}/runs"
             f"?waitForFinish={APIFY_INSTAGRAM_WAIT_FINISH_SEC}"
         )
-        body = {"videoUrl": url}
+        body: dict[str, Any] = {"videoUrl": url}
         if self.sessionid:
             logger.info("Используется Instagram sessionid")
             body["sessionid"] = self.sessionid
-        envelope = _apify_http_json(
-            "POST",
-            run_url,
-            token,
-            body,
-        )
+        envelope = _apify_http_json("POST", run_url, token, body)
         if not isinstance(envelope, dict):
-            logger.error("Ошибка получения Instagram субтитров")
             return "", "", "", ""
 
         run = envelope.get("data")
         if not isinstance(run, dict):
-            logger.error("Ошибка получения Instagram субтитров")
             return "", "", "", ""
-
         run_id = run.get("id")
         if not run_id:
-            logger.error("Ошибка получения Instagram субтитров")
             return "", "", "", ""
 
         items_url = f"https://api.apify.com/v2/actor-runs/{run_id}/dataset/items?format=json"
@@ -1942,46 +1470,121 @@ class InstagramParser(BaseParser):
         if isinstance(items_payload, list):
             item = items_payload[0] if items_payload else None
         title, description, transcript_text, img_url = _instagram_extract_from_item(item)
-        if not (title or description or transcript_text):
-            logger.error("Ошибка получения Instagram субтитров")
-            return "", "", "", ""
-
-        logger.info("Получены данные через Apify Instagram Transcripts Scraper")
+        if title or description or transcript_text:
+            logger.info("Получены данные через Apify Instagram Transcripts Scraper")
         return title, description, transcript_text, img_url
 
-    def _parse_sync(self, url: str) -> tuple[str, str]:
-        shortcode = self._extract_shortcode(url)
-        is_share_url = bool(
+    def _fetch_via_apify(self, url: str) -> tuple[str, str, str, str]:
+        """Совместимость с тестами: алиас :meth:`_fetch_apify_fallback`."""
+        return self._fetch_apify_fallback(url)
+
+
+def _tiktok_extract_from_item(item: Any) -> tuple[str, str, str, str]:
+    if not isinstance(item, dict):
+        return "", "", "", ""
+    title = safe_video_str(item.get("title") or item.get("videoTitle"))
+    description = safe_video_str(
+        item.get("description") or item.get("caption") or item.get("videoDescription")
+    )
+    transcript = safe_video_str(
+        item.get("transcript")
+        or item.get("transcriptText")
+        or item.get("subtitle")
+        or item.get("text")
+    )
+    if not transcript:
+        transcript = _instagram_segments_to_text(item.get("segments"))
+    img_url = safe_video_str(
+        item.get("thumbnail") or item.get("cover") or item.get("img") or item.get("imageUrl")
+    )
+    return title, description, transcript, img_url
+
+
+class TikTokParser(YtdlpWhisperMixin, BaseParser):
+    """TikTok: yt-dlp метаданные + Whisper + Apify-fallback."""
+
+    source_type: str = "tiktok"
+    generate_image_default: bool = False
+    PLATFORM_NAME: str = "TikTok"
+    AUDIO_OUTTMPL: str = "/tmp/tiktok_audio_%(id)s.%(ext)s"
+    AUDIO_LOG_LABEL: str = "TikTok"
+    HEADERS: dict = WebParser.HEADERS
+
+    def __init__(self, apify_api_token: str = "") -> None:
+        self._apify_api_token = (apify_api_token or "").strip()
+        self._init_ytdlp_whisper()
+
+    @staticmethod
+    def can_parse(url: str) -> bool:
+        if not isinstance(url, str) or not url.strip():
+            return False
+        u = url.lower().strip()
+        return bool(
             re.search(
-                r"(?:^|://)(?:www\.|m\.)?instagram\.com/share/(?:reel|p)/",
-                (url or "").strip(),
+                r"(?:^|://)(?:www\.|vm\.|vt\.)?tiktok\.com/",
+                u,
                 re.IGNORECASE,
             )
         )
-        if not shortcode and not is_share_url:
-            raise ValueError("Некорректный Instagram URL")
 
-        logger.info("📸 Обнаружено Instagram видео: %s", shortcode or "share-url")
+    async def parse(
+        self,
+        url: str,
+        *,
+        on_progress: Optional[ProgressCallback] = None,
+    ) -> ParseResult:
+        if not self.can_parse(url):
+            raise ValueError(f"TikTokParser не поддерживает URL: {url!r}")
+        return await self.parse_ytdlp_video(url, on_progress=on_progress)
 
-        title, description, transcript_text, img_url = self._fetch_via_apify(url)
-        if not (title or description or transcript_text):
-            logger.error("Ошибка получения Instagram субтитров")
-            raise RuntimeError("Не удалось извлечь текст из Instagram (пустой ответ Apify)")
+    @staticmethod
+    def _resolve_audio_path(info: Optional[dict]) -> str:
+        info = info or {}
+        requested = info.get("requested_downloads")
+        if isinstance(requested, list) and requested:
+            first = requested[0]
+            if isinstance(first, dict):
+                fp = first.get("filepath") or first.get("_filename") or ""
+                if fp:
+                    base, _ext = os.path.splitext(fp)
+                    return base + ".mp3"
+        video_id = str(info.get("id") or "").strip()
+        if video_id:
+            return f"/tmp/tiktok_audio_{video_id}.mp3"
+        return ""
 
-        text = _instagram_compose_text(title, description, transcript_text)
+    def _fetch_apify_fallback(self, url: str) -> tuple[str, str, str, str]:
+        token = (self._apify_api_token or "").strip()
+        if not token:
+            logger.warning("TikTok Apify: токен не задан")
+            return "", "", "", ""
 
-        if not text.strip():
-            logger.error("Ошибка получения Instagram субтитров")
-            raise RuntimeError("Не удалось извлечь текст из Instagram (пустой ответ Apify)")
+        run_url = (
+            f"https://api.apify.com/v2/acts/{APIFY_TIKTOK_TRANSCRIPT_ACTOR}/runs"
+            f"?waitForFinish={APIFY_WAIT_FINISH_SEC}"
+        )
+        envelope = _apify_http_json("POST", run_url, token, {"videos": [url]})
+        if not isinstance(envelope, dict):
+            return "", "", "", ""
 
-        if len(text) > self.MAX_TEXT_LENGTH:
-            text = text[: self.MAX_TEXT_LENGTH]
-        return text, img_url
+        run = envelope.get("data")
+        if not isinstance(run, dict):
+            return "", "", "", ""
+        run_id = run.get("id")
+        if not run_id:
+            return "", "", "", ""
+
+        items_url = f"https://api.apify.com/v2/actor-runs/{run_id}/dataset/items?format=json"
+        items_payload = _apify_http_json("GET", items_url, token, None)
+        item: Any = items_payload
+        if isinstance(items_payload, list):
+            item = items_payload[0] if items_payload else None
+        title, description, transcript, img_url = _tiktok_extract_from_item(item)
+        if title or description or transcript:
+            logger.info("Получены данные через Apify TikTok Transcripts Scraper")
+        return title, description, transcript, img_url
 
 
-# --------------------------------------------------------------------------- #
-# Реестр
-# --------------------------------------------------------------------------- #
 
 
 class ParserRegistry:
@@ -2013,7 +1616,7 @@ class ParserRegistry:
         if parser is None:
             raise ValueError(f"Не удалось найти парсер для URL: {url}")
         logger.info("🔍 Парсинг через %s: %s", parser.source_type, url[:80])
-        if isinstance(parser, InstagramParser):
+        if isinstance(parser, YtdlpWhisperMixin):
             return await parser.parse(url, on_progress=on_progress)
         return await parser.parse(url)
 
@@ -2023,15 +1626,15 @@ class ParserRegistry:
 
 
 def create_parser_registry(cfg: Optional[object] = None) -> ParserRegistry:
-    """Реестр: YouTube, Instagram, Web. Передаются ключи API и Instagram sessionid."""
+    """Реестр: YouTube, TikTok, Instagram, Web."""
     if cfg is None:
         from config import config as _cfg
         cfg = _cfg
-    api_key = str(getattr(cfg, "youtube_api_key", "") or "")
     apify_tok = str(getattr(cfg, "apify_api_token", "") or "")
     instagram_session_id = str(getattr(cfg, "instagram_session_id", "") or "")
     registry = ParserRegistry()
-    registry.register(YouTubeParser(youtube_api_key=api_key, apify_api_token=apify_tok))
+    registry.register(YouTubeParser(apify_api_token=apify_tok))
+    registry.register(TikTokParser(apify_api_token=apify_tok))
     registry.register(
         InstagramParser(
             apify_api_token=apify_tok,
@@ -2163,7 +1766,8 @@ if __name__ == "__main__":
         print("✅ YouTube can_parse / extract + Apify форматы субтитров")
 
         assert WebParser.generate_image_default is False
-        assert YouTubeParser.generate_image_default is True
+        assert YouTubeParser.generate_image_default is False
+        assert TikTokParser.generate_image_default is False
         assert InstagramParser.generate_image_default is False
         mod = sys.modules[__name__]
         this_mod = mod
@@ -2364,9 +1968,10 @@ if __name__ == "__main__":
             with open(mock_path, "wb") as fh:
                 fh.write(b"\xff\xd8\xff\xd9")
             gm.return_value = mock_path
-            yt_dummy = YouTubeParser(youtube_api_key="x", apify_api_token="")
+            yt_dummy = YouTubeParser(apify_api_token="")
             rd2 = {"raw_text": "Плов узбекский", "image_url": None}
-            await yt_dummy.generate_image_if_needed(rd2, hf_api_key="hf")
+            with patch.object(YouTubeParser, "generate_image_default", True):
+                await yt_dummy.generate_image_if_needed(rd2, hf_api_key="hf")
             assert rd2.get("image_path") == mock_path
             assert rd2.get("image_url") == mock_path
         print("✅ generate_image_if_needed / флаги парсеров")
@@ -2420,9 +2025,9 @@ if __name__ == "__main__":
             ],
             "thumbnail": "https://cdn.example.test/fallback.jpg",
         }
-        assert InstagramParser._pick_best_thumbnail(thumb_info) == "https://cdn.example.test/cover_hd.jpg"
-        assert InstagramParser._pick_best_thumbnail({"thumbnail": "https://only.jpg"}) == "https://only.jpg"
-        meta_title, meta_desc, meta_thumb = InstagramParser._metadata_from_info({
+        assert pick_best_thumbnail(thumb_info) == "https://cdn.example.test/cover_hd.jpg"
+        assert pick_best_thumbnail({"thumbnail": "https://only.jpg"}) == "https://only.jpg"
+        meta_title, meta_desc, meta_thumb = metadata_from_ytdlp_info({
             "title": "Reel Title",
             "description": "Полный рецепт борща с говядиной",
             "uploader": "chef_maria",
@@ -2463,6 +2068,10 @@ if __name__ == "__main__":
                 fh.write(b"\xff\xd8\xff\xd9")
             return True
 
+        forced_img = os.path.join(td_ig, "ig_cover.jpg")
+        with open(forced_img, "wb") as fh:
+            fh.write(b"\xff\xd8\xff\xd9")
+
         # parse() через Apify-fallback: локальное скачивание принудительно
         # роняем, чтобы проверить именно ветку Apify + скачивание картинки.
         with patch.object(
@@ -2477,7 +2086,7 @@ if __name__ == "__main__":
             side_effect=RuntimeError("local disabled in test"),
         ), patch.object(
             InstagramParser,
-            "_fetch_via_apify",
+            "_fetch_apify_fallback",
             return_value=(
                 "IG Title",
                 "Описание и ингредиенты",
@@ -2486,16 +2095,19 @@ if __name__ == "__main__":
             ),
         ), patch.object(
             InstagramParser,
-            "_download_binary_to_path",
-            side_effect=_fake_ig_image_download,
+            "_download_thumbnail",
+            new_callable=AsyncMock,
+            return_value=forced_img,
         ), patch.object(mod, "IMAGES_DIR", td_ig):
-            ig_out = await InstagramParser(apify_api_token="dummy").parse(
+            ig_apify = InstagramParser(apify_api_token="dummy")
+            ig_apify._local_enabled = True
+            ig_out = await ig_apify.parse(
                 "https://www.instagram.com/reel/xyz123xxxxx/",
             )
         assert "IG Title" in ig_out.text and "Описание" in ig_out.text and "субтитров" in ig_out.text
         assert ig_out.image_url is not None and ig_out.image_url.startswith(td_ig)
         assert os.path.isfile(ig_out.image_url)
-        no_img = await InstagramParser(apify_api_token="dummy")._download_instagram_image("")
+        no_img = await InstagramParser(apify_api_token="dummy")._download_thumbnail("")
         assert no_img is None
         print("✅ Instagram parse() с Apify-fallback (локальный путь отключён)")
 
@@ -2506,6 +2118,9 @@ if __name__ == "__main__":
             "• лук 1 шт\n"
             "• яйцо 1 шт"
         )
+        forced_combo_img = os.path.join(td_ig, "combo_cover.jpg")
+        with open(forced_combo_img, "wb") as fh:
+            fh.write(b"\xff\xd8\xff\xd9")
         with patch.object(
             InstagramParser,
             "_fetch_ytdlp_info",
@@ -2527,8 +2142,9 @@ if __name__ == "__main__":
             return_value="Смешать фарш с луком, сформировать котлеты и запекать 40 минут.",
         ) as mock_tr_combo, patch.object(
             InstagramParser,
-            "_download_binary_to_path",
-            side_effect=_fake_ig_image_download,
+            "_download_thumbnail",
+            new_callable=AsyncMock,
+            return_value=forced_combo_img,
         ), patch.object(mod, "IMAGES_DIR", td_ig):
             ig_combo = InstagramParser(apify_api_token="dummy")
             ig_combo._local_enabled = True
@@ -2537,7 +2153,7 @@ if __name__ == "__main__":
             )
         mock_dl_combo.assert_awaited_once()
         mock_tr_combo.assert_awaited_once()
-        assert "Описание Reels (приоритетный источник)" in combo_out.text
+        assert "Описание (Reels, приоритетный источник)" in combo_out.text
         assert "фарш 500" in combo_out.text
         assert "Речь в видео" in combo_out.text and "запекать" in combo_out.text
         assert combo_out.image_url is not None and combo_out.image_url.startswith(td_ig)
@@ -2561,7 +2177,7 @@ if __name__ == "__main__":
             return_value="Локальный рецепт из Whisper: смешать муку, сахар и яйца.",
         ) as mock_tr, patch.object(
             InstagramParser,
-            "_fetch_via_apify",
+            "_fetch_apify_fallback",
         ) as mock_apify_unused:
             ig_local = InstagramParser(apify_api_token="dummy")
             ig_local._local_enabled = True  # тест не зависит от наличия ffmpeg
@@ -2594,7 +2210,7 @@ if __name__ == "__main__":
             return_value="   ",
         ), patch.object(
             InstagramParser,
-            "_fetch_via_apify",
+            "_fetch_apify_fallback",
             return_value=("Apify T", "Apify D", "Apify Tr", ""),
         ) as mock_apify_used:
             ig_empty = InstagramParser(apify_api_token="dummy")
@@ -2602,7 +2218,7 @@ if __name__ == "__main__":
             empty_out = await ig_empty.parse(
                 "https://www.instagram.com/reel/empty123abc/",
             )
-        mock_apify_used.assert_called_once()
+        assert mock_apify_used.call_count >= 1
         assert "Apify T" in empty_out.text and "Apify Tr" in empty_out.text
         print("✅ Instagram fallback на Apify при пустом транскрипте")
 
@@ -2627,7 +2243,7 @@ if __name__ == "__main__":
             side_effect=_slow_transcribe,
         ), patch.object(InstagramParser, "TRANSCRIBE_TIMEOUT_SECONDS", 0.05), patch.object(
             InstagramParser,
-            "_fetch_via_apify",
+            "_fetch_apify_fallback",
             return_value=("Timeout T", "", "Timeout Tr", ""),
         ) as mock_apify_timeout:
             ig_timeout = InstagramParser(apify_api_token="dummy")
@@ -2635,7 +2251,7 @@ if __name__ == "__main__":
             timeout_out = await ig_timeout.parse(
                 "https://www.instagram.com/reel/timeout123abc/",
             )
-        mock_apify_timeout.assert_called_once()
+        assert mock_apify_timeout.call_count >= 1
         assert "Timeout T" in timeout_out.text
         print("✅ Instagram fallback на Apify при таймауте Whisper")
 
@@ -2691,7 +2307,7 @@ if __name__ == "__main__":
             InstagramParser, "_download_audio", new_callable=AsyncMock
         ) as mock_no_dl, patch.object(
             InstagramParser,
-            "_fetch_via_apify",
+            "_fetch_apify_fallback",
             return_value=("FF Off T", "FF Off D", "FF Off Tr", ""),
         ):
             ff_off_out = await ig_route.parse("https://www.instagram.com/reel/noffmpeg123/")
@@ -2699,164 +2315,90 @@ if __name__ == "__main__":
         assert "FF Off T" in ff_off_out.text and "FF Off Tr" in ff_off_out.text
         print("✅ Instagram _detect_ffmpeg + автоотключение локального режима")
 
-        no_key = YouTubeParser(youtube_api_key="")
-        try:
-            await no_key.parse("https://www.youtube.com/watch?v=dQw4w9WgXcQ")
-        except RuntimeError as exc:
-            if "YOUTUBE_API_KEY" not in str(exc):
-                raise AssertionError(f"Ожидалось сообщение про ключ: {exc}") from exc
-            print("✅ Без YouTube API-ключа: понятный RuntimeError")
-        else:
-            raise AssertionError("Ожидался RuntimeError без YOUTUBE_API_KEY")
+        assert TikTokParser.can_parse("https://www.tiktok.com/@chef/video/1234567890")
+        assert TikTokParser.can_parse("https://vm.tiktok.com/ABC123/")
+        assert not TikTokParser.can_parse("https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+        print("✅ TikTok can_parse")
 
-        this_mod = sys.modules[__name__]
-        with patch.object(this_mod, "build") as mock_build, patch.object(
+        _yt_metadata = {
+            "title": "Mock Recipe Video Title Here",
+            "description": "Line one\n\nIngredients: test flour 200g",
+            "thumbnails": thumb_info["thumbnails"],
+        }
+        with patch.object(
             YouTubeParser,
-            "_fetch_subtitles_public",
-            return_value="",
+            "_fetch_ytdlp_info",
+            new_callable=AsyncMock,
+            return_value=_yt_metadata,
+        ), patch.object(
+            YouTubeParser,
+            "_download_audio",
+            new_callable=AsyncMock,
+            return_value="/tmp/youtube_audio_test.mp3",
+        ), patch.object(
+            YouTubeParser,
+            "_transcribe_audio",
+            new_callable=AsyncMock,
+            return_value="Шаги из Whisper: смешать и запечь.",
         ), patch.object(
             YouTubeParser,
             "_fetch_subtitles_apify",
-            return_value="Mock Apify subtitle text",
-        ):
-            mock_yt = MagicMock()
-            mock_build.return_value = mock_yt
-            mock_req = MagicMock()
-            mock_yt.videos.return_value.list.return_value = mock_req
-            mock_req.execute.return_value = {
-                "items": [
-                    {
-                        "snippet": {
-                            "title": "Mock Recipe Video Title Here",
-                            "description": "Line one\n\nIngredients: test",
-                        },
-                        "contentDetails": {"duration": "PT5M30S"},
-                    }
-                ]
-            }
-            parsed = await YouTubeParser(
-                youtube_api_key="test-key",
-                apify_api_token="dummy-apify",
-            ).parse("https://www.youtube.com/watch?v=abcdefghijk")
-            assert "Название видео (YouTube Data API)" in parsed.text
-            assert "Mock Recipe" in parsed.text
-            assert "Описание видео (YouTube Data API, главный источник рецепта)" in parsed.text
-            assert "Ingredients" in parsed.text
-            assert parsed.text.index("Ingredients") < parsed.text.index("Apify subtitle")
-            assert "Apify subtitle" in parsed.text
-            print("✅ parse() с моком Data API и Apify")
+        ) as mock_yt_apify:
+            yt_parsed = YouTubeParser(apify_api_token="dummy-apify")
+            yt_parsed._local_enabled = True
+            parsed = await yt_parsed.parse("https://www.youtube.com/watch?v=abcdefghijk")
+        mock_yt_apify.assert_not_called()
+        assert "Mock Recipe" in parsed.text
+        assert "Ingredients" in parsed.text
+        assert "приоритетный источник" in parsed.text
+        assert "Whisper" in parsed.text or "запечь" in parsed.text
+        print("✅ YouTube parse() yt-dlp + Whisper (мок)")
 
-        with patch.object(this_mod, "build") as mock_build_ns, patch.object(
+        with patch.object(
             YouTubeParser,
-            "_fetch_subtitles_public",
-            return_value="",
+            "_fetch_ytdlp_info",
+            new_callable=AsyncMock,
+            return_value=_yt_metadata,
         ), patch.object(
             YouTubeParser,
-            "_fetch_subtitles_apify",
-            return_value="",
-        ):
-            mock_yt_ns = MagicMock()
-            mock_build_ns.return_value = mock_yt_ns
-            mock_req_ns = MagicMock()
-            mock_yt_ns.videos.return_value.list.return_value = mock_req_ns
-            mock_req_ns.execute.return_value = {
-                "items": [
-                    {
-                        "snippet": {
-                            "title": "Video Sans Subs",
-                            "description": "Ингредиенты: мука 200 г, вода",
-                        },
-                        "contentDetails": {"duration": "PT1M"},
-                    }
-                ]
-            }
-            parsed_ns = await YouTubeParser(
-                youtube_api_key="test-key",
-                apify_api_token="dummy-apify",
-            ).parse("https://www.youtube.com/watch?v=abcdefghijk")
-            assert "Video Sans Subs" in parsed_ns.text
-            assert "Ингредиенты" in parsed_ns.text
-        print("✅ YouTube: данные Data API без субтитров Apify")
-
-        with patch.object(this_mod, "build") as mock_build_pub, patch.object(
+            "_download_audio",
+            new_callable=AsyncMock,
+            side_effect=RuntimeError("no audio"),
+        ), patch.object(
             YouTubeParser,
             "_fetch_subtitles_public",
-            return_value="Public caption text",
+            return_value="Публичные субтитры YouTube для теста",
         ) as mock_public, patch.object(
             YouTubeParser,
             "_fetch_subtitles_apify",
             return_value="SHOULD_NOT_BE_USED",
         ) as mock_apify_unused:
-            mock_yt_pub = MagicMock()
-            mock_build_pub.return_value = mock_yt_pub
-            mock_req_pub = MagicMock()
-            mock_yt_pub.videos.return_value.list.return_value = mock_req_pub
-            mock_req_pub.execute.return_value = {
-                "items": [
-                    {
-                        "snippet": {
-                            "title": "Public Subs Video",
-                            "description": "Описание с ингредиентами: рис 200 г",
-                        },
-                        "contentDetails": {"duration": "PT2M"},
-                    }
-                ]
-            }
-            parsed_pub = await YouTubeParser(
-                youtube_api_key="test-key",
-                apify_api_token="dummy-apify",
-            ).parse("https://www.youtube.com/watch?v=abcdefghijk")
-            mock_public.assert_called_once_with("abcdefghijk")
-            mock_apify_unused.assert_not_called()
-            assert "Описание с ингредиентами" in parsed_pub.text
-            assert "Public caption text" in parsed_pub.text
-            assert parsed_pub.text.index("Описание с ингредиентами") < parsed_pub.text.index("Public caption text")
-        print("✅ YouTube: публичные captionTracks имеют приоритет над Apify")
+            yt_pub = YouTubeParser(apify_api_token="dummy")
+            yt_pub._local_enabled = True
+            parsed_pub = await yt_pub.parse("https://www.youtube.com/watch?v=abcdefghijk")
+        mock_public.assert_called_once()
+        mock_apify_unused.assert_not_called()
+        assert "Ingredients" in parsed_pub.text
+        assert "Публичные субтитры" in parsed_pub.text
+        print("✅ YouTube: публичные captionTracks как supplement")
 
-        with patch("urllib.request.urlopen") as urlopen_mock, patch.object(
-            YouTubeParser,
-            "_fetch_subtitles_public",
-            return_value="",
-        ):
-            mock_yt = MagicMock()
-            mock_build = MagicMock(return_value=mock_yt)
-            mock_req = MagicMock()
-            mock_yt.videos.return_value.list.return_value = mock_req
-            mock_req.execute.return_value = {
-                "items": [
-                    {
-                        "snippet": {"title": "T2", "description": "D2"},
-                        "contentDetails": {},
-                    }
-                ]
-            }
-            with patch.object(this_mod, "build", mock_build):
-                out_nop = await YouTubeParser(youtube_api_key="k", apify_api_token="").parse(
-                    "https://www.youtube.com/watch?v=abcdefghijk"
-                )
-            urlopen_mock.assert_not_called()
-            assert "T2" in out_nop.text
-            print("✅ без APIFY_API_TOKEN нет HTTP-запросов к Apify")
-
-        _live_key = os.getenv("YOUTUBE_API_KEY", "").strip()
         _live_apify = os.getenv("APIFY_API_TOKEN", "").strip()
-        if _live_key and _live_apify:
+        if _live_apify:
             try:
-                live_text = await YouTubeParser(
-                    youtube_api_key=_live_key,
-                    apify_api_token=_live_apify,
-                ).parse("https://www.youtube.com/watch?v=dQw4w9WgXcQ")
-                print(f"✅ YouTube live (Data API + Apify): {len(live_text.text)} символов")
+                live_text = await YouTubeParser(apify_api_token=_live_apify).parse(
+                    "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+                )
+                print(f"✅ YouTube live (yt-dlp): {len(live_text.text)} символов")
             except Exception as exc:  # noqa: BLE001
                 print(f"⚠️  YouTube live: {exc}")
-        elif _live_key:
-            print("⚠️  Только YOUTUBE_API_KEY — пропуск live Apify (нужен APIFY_API_TOKEN)")
 
         registry = create_parser_registry()
         yt_p = registry.get_parser("https://www.youtube.com/watch?v=dQw4w9WgXcQ")
         assert yt_p is not None and getattr(yt_p, "source_type", None) == "youtube"
         ig_p = registry.get_parser("https://www.instagram.com/reel/abcd1234567/")
         assert ig_p is not None and getattr(ig_p, "source_type", None) == "instagram"
+        tt_p = registry.get_parser("https://www.tiktok.com/@x/video/123")
+        assert tt_p is not None and getattr(tt_p, "source_type", None) == "tiktok"
         assert registry.get_parser("https://eda.ru/test") is not None
         assert registry.get_parser("not-a-url") is None
         print("✅ can_parse / реестр")

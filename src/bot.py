@@ -45,6 +45,7 @@ from .handlers import callbacks, commands, messages
 from .localization import Localization
 from .normalizer import RecipeNormalizer
 from .parser import InstagramParser, ParserRegistry, create_parser_registry, ensure_images_dir
+from .ytdlp_mixin import YtdlpWhisperMixin
 from .storage import SupabaseStorage
 
 
@@ -125,15 +126,15 @@ class RemyBot:
     def _preload_whisper_background(self) -> None:
         """Запустить предзагрузку faster-whisper в фоне (не блокирует polling)."""
         for parser in self.parser.parsers:
-            if not isinstance(parser, InstagramParser) or not parser._local_enabled:
+            if not isinstance(parser, YtdlpWhisperMixin) or not parser._local_enabled:
                 continue
 
-            def _run_preload(ig: InstagramParser = parser) -> None:
+            def _run_preload(vp: YtdlpWhisperMixin = parser) -> None:
                 import asyncio
 
                 loop = asyncio.new_event_loop()
                 try:
-                    loop.run_until_complete(ig.preload_whisper_model())
+                    loop.run_until_complete(vp.preload_whisper_model())
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("⚠️ Предзагрузка Whisper не удалась: %s", exc)
                 finally:

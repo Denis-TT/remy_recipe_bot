@@ -453,44 +453,50 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 # Прогресс обработки URL (чеклист этапов в одном статусном сообщении)
 # --------------------------------------------------------------------------- #
 
-# Этапы Instagram Reels, которые отображаются пользователю.
-_IG_PROGRESS_STEPS: tuple[tuple[str, str], ...] = (
-    ("metadata", "Читаю описание Reels"),
+# Этапы коротких видео (Instagram, YouTube, TikTok).
+_VIDEO_PROGRESS_STEPS: tuple[tuple[str, str], ...] = (
+    ("metadata", "Читаю описание видео"),
     ("transcribe", "Распознаю речь"),
     ("normalize", "Анализирую рецепт"),
     ("present", "Формирую карточку"),
 )
 
-# Этапы для обычных ссылок (YouTube, сайты).
+# Этапы для обычных сайтов.
 _DEFAULT_PROGRESS_STEPS: tuple[tuple[str, str], ...] = (
     ("parse", "Читаю страницу"),
     ("normalize", "Анализирую рецепт"),
     ("present", "Формирую карточку"),
 )
 
-# Соответствие внутренних стадий InstagramParser → id шага в чеклисте.
-_IG_PARSER_STAGE_TO_STEP: dict[str, str] = {
+_VIDEO_PARSER_STAGE_TO_STEP: dict[str, str] = {
     "fetching_metadata": "metadata",
     "downloading_audio": "transcribe",
     "transcribing": "transcribe",
     "apify_fallback": "transcribe",
 }
 
+_VIDEO_SOURCE_TYPES = frozenset({"instagram", "youtube", "tiktok"})
+
 
 class RecipeProgress:
     """Чеклист этапов: одно сообщение в Telegram, обновляется по ходу пайплайна."""
 
-    def __init__(self, status: Message, *, instagram: bool = False) -> None:
+    def __init__(self, status: Message, *, video: bool = False, source_type: str = "") -> None:
         self._status = status
-        self._steps = _IG_PROGRESS_STEPS if instagram else _DEFAULT_PROGRESS_STEPS
+        self._steps = _VIDEO_PROGRESS_STEPS if video else _DEFAULT_PROGRESS_STEPS
         self._completed: set[str] = set()
         self._current: Optional[str] = None
         self._detail = ""
-        self._title = (
-            "📸 <b>Instagram Reel</b>"
-            if instagram
-            else "🔍 <b>Обработка ссылки</b>"
-        )
+        if source_type == "instagram":
+            self._title = "📸 <b>Instagram Reel</b>"
+        elif source_type == "youtube":
+            self._title = "▶️ <b>YouTube</b>"
+        elif source_type == "tiktok":
+            self._title = "🎵 <b>TikTok</b>"
+        elif video:
+            self._title = "🎬 <b>Видео</b>"
+        else:
+            self._title = "🔍 <b>Обработка ссылки</b>"
 
     async def start(self) -> None:
         """Показать чеклист, первый этап — активный."""
@@ -543,6 +549,16 @@ def _url_processing_key(url: str, source_type: str) -> str:
         shortcode = InstagramParser._extract_shortcode(url)
         if shortcode:
             return f"ig:{shortcode}"
+    if source_type in ("youtube", "tiktok"):
+        from ..parser import TikTokParser, YouTubeParser
+
+        if source_type == "youtube":
+            vid = YouTubeParser._extract_youtube_video_id(url)
+            if vid:
+                return f"yt:{vid}"
+        else:
+            normalized = url.strip().lower().rstrip("/")
+            return f"tt:{normalized}"
     return url.strip().lower().rstrip("/")
 
 
@@ -570,13 +586,12 @@ async def _handle_url(
     bot.processing_urls[user_id] = job_key
 
     status: Message = await message.reply_text("⏳ Запускаю обработку…")
-    progress = RecipeProgress(status, instagram=(source_type == "instagram"))
+    is_video = source_type in _VIDEO_SOURCE_TYPES
+    progress = RecipeProgress(status, video=is_video, source_type=source_type)
     await progress.start()
 
-    is_instagram = source_type == "instagram"
-
     async def _on_parser_progress(stage: str, detail: str = "") -> None:
-        step_id = _IG_PARSER_STAGE_TO_STEP.get(stage, stage)
+        step_id = _VIDEO_PARSER_STAGE_TO_STEP.get(stage, stage)
         if stage == "apify_fallback":
             await progress.set_stage(step_id, detail or "запасной путь")
         elif detail:
@@ -587,9 +602,13 @@ async def _handle_url(
     try:
         # 1) Парсинг
         try:
+            if is_video:
+                await progress.set_stage("metadata")
+            else:
+                await progress.set_stage("parse")
             parsed = await bot.parser.parse(
                 url,
-                on_progress=_on_parser_progress if is_instagram else None,
+                on_progress=_on_parser_progress if is_video else None,
             )
             raw_text = parsed.text
         except Exception as exc:  # noqa: BLE001 — логируем любую причину
@@ -1034,13 +1053,13 @@ if __name__ == "__main__":
     from unittest.mock import AsyncMock, MagicMock
 
     _mock_status_msg = MagicMock()
-    _prog = RecipeProgress(_mock_status_msg, instagram=True)
+    _prog = RecipeProgress(_mock_status_msg, video=True, source_type="instagram")
     _prog._current = "transcribe"
     _prog._completed.add("metadata")
     _prog._detail = "42 с"
     _progress_text = _prog._render_text()
     assert "📸" in _progress_text and "1/4" in _progress_text
-    assert "✅ 1/4 Читаю описание Reels" in _progress_text
+    assert "✅ 1/4 Читаю описание видео" in _progress_text
     assert "🔄 2/4 Распознаю речь — 42 с" in _progress_text
     assert "⏳ 3/4 Анализирую рецепт" in _progress_text
     print("✅ RecipeProgress чеклист (Instagram)")
