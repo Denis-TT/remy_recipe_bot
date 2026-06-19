@@ -26,6 +26,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from typing import Any, Dict, Optional
 
@@ -43,7 +44,7 @@ from config import Config, config as default_config
 from .handlers import callbacks, commands, messages
 from .localization import Localization
 from .normalizer import RecipeNormalizer
-from .parser import ParserRegistry, create_parser_registry, ensure_images_dir
+from .parser import InstagramParser, ParserRegistry, create_parser_registry, ensure_images_dir
 from .storage import SupabaseStorage
 
 
@@ -90,6 +91,9 @@ class RemyBot:
             self.config.supabase_key,
         )
         self.temp_recipes: Dict[int, Dict[str, Any]] = {}
+        # user_id → ключ обрабатываемой ссылки (shortcode Instagram или URL),
+        # чтобы не запускать два тяжёлых Whisper-процесса на один Reels.
+        self.processing_urls: Dict[int, str] = {}
 
         self._app: Optional[Application] = None
 
@@ -117,6 +121,31 @@ class RemyBot:
             logger.info("🧹 Очищено просроченных рецептов: %d", len(expired))
 
         return len(expired)
+
+    def _preload_whisper_background(self) -> None:
+        """Запустить предзагрузку faster-whisper в фоне (не блокирует polling)."""
+        for parser in self.parser.parsers:
+            if not isinstance(parser, InstagramParser) or not parser._local_enabled:
+                continue
+
+            def _run_preload(ig: InstagramParser = parser) -> None:
+                import asyncio
+
+                loop = asyncio.new_event_loop()
+                try:
+                    loop.run_until_complete(ig.preload_whisper_model())
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("⚠️ Предзагрузка Whisper не удалась: %s", exc)
+                finally:
+                    loop.close()
+
+            threading.Thread(
+                target=_run_preload,
+                name="whisper-preload",
+                daemon=True,
+            ).start()
+            logger.info("⏳ Предзагрузка faster-whisper запущена в фоне...")
+            return
 
     # ------------------------------------------------------------------ #
     # Запуск / остановка
@@ -166,6 +195,7 @@ class RemyBot:
         app.add_error_handler(self._on_error)
 
         self._app = app
+        self._preload_whisper_background()
         logger.info("🚀 Бот Remy запущен (polling)...")
 
         try:

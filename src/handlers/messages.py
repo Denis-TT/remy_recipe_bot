@@ -450,8 +450,100 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 # --------------------------------------------------------------------------- #
+# Прогресс обработки URL (чеклист этапов в одном статусном сообщении)
+# --------------------------------------------------------------------------- #
+
+# Этапы Instagram Reels, которые отображаются пользователю.
+_IG_PROGRESS_STEPS: tuple[tuple[str, str], ...] = (
+    ("download", "Скачиваю аудио"),
+    ("transcribe", "Распознаю речь"),
+    ("normalize", "Анализирую рецепт"),
+    ("present", "Формирую карточку"),
+)
+
+# Этапы для обычных ссылок (YouTube, сайты).
+_DEFAULT_PROGRESS_STEPS: tuple[tuple[str, str], ...] = (
+    ("parse", "Читаю страницу"),
+    ("normalize", "Анализирую рецепт"),
+    ("present", "Формирую карточку"),
+)
+
+# Соответствие внутренних стадий InstagramParser → id шага в чеклисте.
+_IG_PARSER_STAGE_TO_STEP: dict[str, str] = {
+    "downloading_audio": "download",
+    "transcribing": "transcribe",
+    "apify_fallback": "transcribe",
+}
+
+
+class RecipeProgress:
+    """Чеклист этапов: одно сообщение в Telegram, обновляется по ходу пайплайна."""
+
+    def __init__(self, status: Message, *, instagram: bool = False) -> None:
+        self._status = status
+        self._steps = _IG_PROGRESS_STEPS if instagram else _DEFAULT_PROGRESS_STEPS
+        self._completed: set[str] = set()
+        self._current: Optional[str] = None
+        self._detail = ""
+        self._title = (
+            "📸 <b>Instagram Reel</b>"
+            if instagram
+            else "🔍 <b>Обработка ссылки</b>"
+        )
+
+    async def start(self) -> None:
+        """Показать чеклист, первый этап — активный."""
+        if self._steps:
+            self._current = self._steps[0][0]
+        await self._render()
+
+    async def set_stage(self, stage_id: str, detail: str = "") -> None:
+        """Переключить активный этап; предыдущие отметить выполненными."""
+        self._detail = detail
+        found = False
+        for sid, _label in self._steps:
+            if sid == stage_id:
+                found = True
+                self._current = stage_id
+                break
+            if not found:
+                self._completed.add(sid)
+        if not found:
+            self._current = stage_id
+        await self._render()
+
+    def _render_text(self) -> str:
+        total = len(self._steps)
+        lines = [self._title, ""]
+        for idx, (sid, label) in enumerate(self._steps, 1):
+            prefix = f"{idx}/{total}"
+            if sid in self._completed:
+                lines.append(f"✅ {prefix} {label}")
+            elif sid == self._current:
+                suffix = f" — {self._detail}" if self._detail else "…"
+                lines.append(f"🔄 {prefix} {label}{suffix}")
+            else:
+                lines.append(f"⏳ {prefix} {label}")
+        return "\n".join(lines)
+
+    async def _render(self) -> None:
+        await _safe_edit(self._status, self._render_text())
+
+
+# --------------------------------------------------------------------------- #
 # URL-пайплайн
 # --------------------------------------------------------------------------- #
+
+def _url_processing_key(url: str, source_type: str) -> str:
+    """Ключ для дедупликации: shortcode Instagram или нормализованный URL."""
+    if source_type == "instagram":
+        from ..parser import InstagramParser
+
+        shortcode = InstagramParser._extract_shortcode(url)
+        if shortcode:
+            return f"ig:{shortcode}"
+    return url.strip().lower().rstrip("/")
+
 
 async def _handle_url(
     message: Message,
@@ -465,88 +557,116 @@ async def _handle_url(
     logger.info("🔍 Начинаю обработку URL: %s", url)
 
     src_parser = bot.parser.get_parser(url)
-    status_text = "🔍 Читаю страницу..."
-    if src_parser is not None and getattr(src_parser, "source_type", "") == "instagram":
-        status_text = "📸 Обрабатываю Instagram Reel, это может занять до 1-2 минут..."
+    source_type = getattr(src_parser, "source_type", "") if src_parser else ""
+    job_key = _url_processing_key(url, source_type)
 
-    status: Message = await message.reply_text(status_text)
-
-    # 1) Парсинг
-    try:
-        parsed = await bot.parser.parse(url)
-        raw_text = parsed.text
-    except Exception as exc:  # noqa: BLE001 — логируем любую причину
-        logger.error("❌ Ошибка обработки URL: %s", exc)
-        await _safe_edit(status, f"❌ Не удалось прочитать страницу:\n<code>{_html_escape(str(exc))}</code>")
-        return
-
-    if not raw_text or not raw_text.strip():
-        logger.warning("⚠️  Пустой текст после парсинга: %s", url)
-        await _safe_edit(status, "❌ Со страницы не удалось извлечь текст")
-        return
-
-    from ..parser import attach_recipe_image
-
-    recipe_data: dict[str, Any] = {"raw_text": raw_text}
-    if parsed.image_url and os.path.isfile(str(parsed.image_url)):
-        await attach_recipe_image(recipe_data, str(parsed.image_url), bot.storage)
-    elif parsed.image_url:
-        recipe_data["image_url"] = parsed.image_url
-
-    if src_parser is not None:
-        await src_parser.generate_image_if_needed(
-            recipe_data,
-            hf_api_key=bot.config.hf_api_key,
-            storage=bot.storage,
+    if bot.processing_urls.get(user_id) == job_key:
+        await message.reply_text(
+            "⏳ Эта ссылка уже обрабатывается. Подожди — скоро пришлю результат.",
         )
+        return
 
-    # 2) Нормализация
-    await _safe_edit(status, "🤖 Анализирую рецепт...")
+    bot.processing_urls[user_id] = job_key
+
+    status: Message = await message.reply_text("⏳ Запускаю обработку…")
+    progress = RecipeProgress(status, instagram=(source_type == "instagram"))
+    await progress.start()
+
+    is_instagram = source_type == "instagram"
+
+    async def _on_parser_progress(stage: str, detail: str = "") -> None:
+        step_id = _IG_PARSER_STAGE_TO_STEP.get(stage, stage)
+        if stage == "apify_fallback":
+            await progress.set_stage(step_id, detail or "запасной путь")
+        elif detail:
+            await progress.set_stage(step_id, detail)
+        else:
+            await progress.set_stage(step_id)
 
     try:
-        recipe = await bot.normalizer.normalize(
-            recipe_data["raw_text"],
-            image_url=recipe_data.get("image_url"),
+        # 1) Парсинг
+        try:
+            parsed = await bot.parser.parse(
+                url,
+                on_progress=_on_parser_progress if is_instagram else None,
+            )
+            raw_text = parsed.text
+        except Exception as exc:  # noqa: BLE001 — логируем любую причину
+            logger.error("❌ Ошибка обработки URL: %s", exc)
+            await _safe_edit(status, f"❌ Не удалось прочитать страницу:\n<code>{_html_escape(str(exc))}</code>")
+            return
+
+        if not raw_text or not raw_text.strip():
+            logger.warning("⚠️  Пустой текст после парсинга: %s", url)
+            await _safe_edit(status, "❌ Со страницы не удалось извлечь текст")
+            return
+
+        from ..parser import attach_recipe_image
+
+        recipe_data: dict[str, Any] = {"raw_text": raw_text}
+        if parsed.image_url and os.path.isfile(str(parsed.image_url)):
+            await attach_recipe_image(recipe_data, str(parsed.image_url), bot.storage)
+        elif parsed.image_url:
+            recipe_data["image_url"] = parsed.image_url
+
+        if src_parser is not None:
+            await src_parser.generate_image_if_needed(
+                recipe_data,
+                hf_api_key=bot.config.hf_api_key,
+                storage=bot.storage,
+            )
+
+        # 2) Нормализация
+        await progress.set_stage("normalize")
+
+        try:
+            recipe = await bot.normalizer.normalize(
+                recipe_data["raw_text"],
+                image_url=recipe_data.get("image_url"),
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.error("❌ Ошибка нормализации: %s", exc)
+            await _safe_edit(status, f"❌ Не удалось обработать рецепт:\n<code>{_html_escape(str(exc))}</code>")
+            return
+
+        # 3) Валидация: нужны хотя бы title + ingredients
+        title_ok = bool((recipe.get("title") or "").strip())
+        ingredients_ok = bool(recipe.get("ingredients"))
+        if not (title_ok and ingredients_ok):
+            logger.warning(
+                "⚠️  Рецепт не прошёл валидацию (title=%s, ingredients=%s)",
+                title_ok,
+                ingredients_ok,
+            )
+            await _safe_edit(
+                status,
+                "❌ Не удалось распознать рецепт на этой странице.\n"
+                "Попробуй другую ссылку.",
+            )
+            return
+
+        # 4) Сохраняем во временный кэш и показываем пользователю
+        recipe["source_url"] = url
+        if recipe_data.get("image_path"):
+            recipe["image_path"] = recipe_data["image_path"]
+        img_pub = recipe_data.get("image_url")
+        if img_pub and str(img_pub).startswith(("http://", "https://")):
+            recipe["image_url"] = str(img_pub).strip()
+
+        bot.temp_recipes[user_id] = {"recipe": recipe, "timestamp": time.time()}
+        bot.cleanup_expired_temp_recipes()
+
+        logger.info(
+            "✅ Рецепт обработан: «%s», meal_type=%s",
+            recipe.get("title"),
+            recipe.get("meal_type"),
         )
-    except Exception as exc:  # noqa: BLE001
-        logger.error("❌ Ошибка нормализации: %s", exc)
-        await _safe_edit(status, f"❌ Не удалось обработать рецепт:\n<code>{_html_escape(str(exc))}</code>")
-        return
 
-    # 3) Валидация: нужны хотя бы title + ingredients
-    title_ok = bool((recipe.get("title") or "").strip())
-    ingredients_ok = bool(recipe.get("ingredients"))
-    if not (title_ok and ingredients_ok):
-        logger.warning(
-            "⚠️  Рецепт не прошёл валидацию (title=%s, ingredients=%s)",
-            title_ok,
-            ingredients_ok,
-        )
-        await _safe_edit(
-            status,
-            "❌ Не удалось распознать рецепт на этой странице.\n"
-            "Попробуй другую ссылку.",
-        )
-        return
-
-    # 4) Сохраняем во временный кэш и показываем пользователю
-    recipe["source_url"] = url
-    if recipe_data.get("image_path"):
-        recipe["image_path"] = recipe_data["image_path"]
-    img_pub = recipe_data.get("image_url")
-    if img_pub and str(img_pub).startswith(("http://", "https://")):
-        recipe["image_url"] = str(img_pub).strip()
-
-    bot.temp_recipes[user_id] = {"recipe": recipe, "timestamp": time.time()}
-    bot.cleanup_expired_temp_recipes()
-
-    logger.info(
-        "✅ Рецепт обработан: «%s», meal_type=%s",
-        recipe.get("title"),
-        recipe.get("meal_type"),
-    )
-
-    await _present_recipe_with_optional_photo(message, status, recipe, bot)
+        await progress.set_stage("present")
+        await _present_recipe_with_optional_photo(message, status, recipe, bot)
+    finally:
+        if bot.processing_urls.get(user_id) == job_key:
+            bot.processing_urls.pop(user_id, None)
 
 
 # --------------------------------------------------------------------------- #
@@ -911,6 +1031,18 @@ if __name__ == "__main__":
     import asyncio
     import tempfile
     from unittest.mock import AsyncMock, MagicMock
+
+    _mock_status_msg = MagicMock()
+    _prog = RecipeProgress(_mock_status_msg, instagram=True)
+    _prog._current = "transcribe"
+    _prog._completed.add("download")
+    _prog._detail = "42 с"
+    _progress_text = _prog._render_text()
+    assert "📸" in _progress_text and "1/4" in _progress_text
+    assert "✅ 1/4 Скачиваю аудио" in _progress_text
+    assert "🔄 2/4 Распознаю речь — 42 с" in _progress_text
+    assert "⏳ 3/4 Анализирую рецепт" in _progress_text
+    print("✅ RecipeProgress чеклист (Instagram)")
 
     _tmp_img = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
     _tmp_img.write(b"\xff\xd8\xff\xd9")

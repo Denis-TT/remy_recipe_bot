@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import html as html_lib
 import json
 import logging
@@ -20,13 +21,14 @@ import os
 import re
 import shutil
 import tempfile
+import time
 import urllib.error
 import urllib.request
 import uuid
 import xml.etree.ElementTree as ET
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, List, Optional
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, List, Optional
 from urllib.parse import urljoin
 
 if TYPE_CHECKING:
@@ -45,6 +47,10 @@ except Exception:  # noqa: BLE001
 
 
 logger = logging.getLogger(__name__)
+
+# Колбэк прогресса парсинга: (stage_id, detail). Используется InstagramParser
+# для обновления статусного сообщения в Telegram.
+ProgressCallback = Callable[[str, str], Awaitable[None]]
 
 
 # --------------------------------------------------------------------------- #
@@ -1392,9 +1398,9 @@ class InstagramParser(BaseParser):
 
     Основной путь — автономный и бесплатный:
       1. ``yt-dlp`` скачивает аудиодорожку Reels во временный ``.mp3``;
-      2. ``openai-whisper`` (модель ``base``) распознаёт речь офлайн.
+      2. ``faster-whisper`` (модель ``small``, int8 на CPU) распознаёт речь офлайн.
 
-    Если локальная обработка не удалась (ошибка скачивания, пустой текст,
+    Если локальная обработка не удалась (ошибка скачивания, таймаут, пустой текст,
     отсутствуют зависимости), парсер прозрачно переключается на платный
     Apify Actor ``apple_yang~instagram-transcripts-scraper`` — он же даёт
     превью-картинку (поле ``img``).
@@ -1408,10 +1414,12 @@ class InstagramParser(BaseParser):
     TIMEOUT_SECONDS: float = 30.0
     HEADERS: dict = WebParser.HEADERS
 
-    # Локальное распознавание (yt-dlp + Whisper).
+    # Локальное распознавание (yt-dlp + faster-whisper).
     AUDIO_OUTTMPL: str = "/tmp/reels_audio_%(id)s.%(ext)s"
     COOKIE_FILE_PATH: str = "/tmp/instagram_cookies.txt"
-    WHISPER_MODEL_NAME: str = "base"
+    WHISPER_MODEL_NAME: str = "small"
+    WHISPER_COMPUTE_TYPE: str = "int8"
+    TRANSCRIBE_TIMEOUT_SECONDS: float = 120.0
 
     # Стандартные пути бинарников после `apt install ffmpeg` (Railway / Debian).
     FFMPEG_FALLBACK_PATH: str = "/usr/bin/ffmpeg"
@@ -1474,9 +1482,18 @@ class InstagramParser(BaseParser):
             )
         )
 
-    async def parse(self, url: str) -> ParseResult:
+    async def parse(
+        self,
+        url: str,
+        *,
+        on_progress: Optional[ProgressCallback] = None,
+    ) -> ParseResult:
         if not self.can_parse(url):
             raise ValueError(f"InstagramParser не поддерживает URL: {url!r}")
+
+        async def _notify(stage: str, detail: str = "") -> None:
+            if on_progress is not None:
+                await on_progress(stage, detail)
 
         # --- 1. Основной путь: локальное скачивание + Whisper -------------- #
         audio_path = ""
@@ -1484,7 +1501,9 @@ class InstagramParser(BaseParser):
             logger.info(
                 "ℹ️ Локальное распознавание отключено (нет ffmpeg) — использую Apify",
             )
+            await _notify("apify_fallback", "нет ffmpeg")
         else:
+            await _notify("downloading_audio")
             try:
                 audio_path = await self._download_audio(url)
             except Exception as exc:  # noqa: BLE001
@@ -1495,9 +1514,20 @@ class InstagramParser(BaseParser):
                 audio_path = ""
 
         if audio_path:
+            await _notify("transcribing")
             # _transcribe_audio сам не выбрасывает исключений и сам удаляет
             # временный аудиофайл — нам остаётся проверить результат.
-            transcript = await self._transcribe_audio(audio_path)
+            try:
+                transcript = await asyncio.wait_for(
+                    self._transcribe_audio(audio_path, on_progress=on_progress),
+                    timeout=self.TRANSCRIBE_TIMEOUT_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "⚠️ Распознавание Whisper превысило %.0f с — переключаюсь на Apify",
+                    self.TRANSCRIBE_TIMEOUT_SECONDS,
+                )
+                transcript = ""
             if transcript.strip():
                 logger.info("✅ Локальное распознавание успешно")
                 text = transcript.strip()
@@ -1509,6 +1539,7 @@ class InstagramParser(BaseParser):
             )
 
         # --- 2. Fallback: старый путь через Apify -------------------------- #
+        await _notify("apify_fallback")
         text, img_url = await asyncio.to_thread(self._parse_sync, url)
         image_path = await self._download_instagram_image(img_url)
         return ParseResult(text=text, image_url=image_path)
@@ -1632,28 +1663,45 @@ class InstagramParser(BaseParser):
             return f"/tmp/reels_audio_{video_id}.mp3"
         return ""
 
-    async def _transcribe_audio(self, audio_path: str) -> str:
-        """Распознать речь из ``audio_path`` через Whisper (модель ``base``).
+    async def _transcribe_audio(
+        self,
+        audio_path: str,
+        *,
+        on_progress: Optional[ProgressCallback] = None,
+    ) -> str:
+        """Распознать речь через faster-whisper (модель ``small``, int8).
 
         Не выбрасывает исключений (возвращает пустую строку при сбое), чтобы
         не ломать fallback на Apify. Всегда удаляет временный аудиофайл.
         """
+        heartbeat_task: Optional[asyncio.Task[None]] = None
+        if on_progress is not None:
+            async def _heartbeat() -> None:
+                start = time.monotonic()
+                while True:
+                    await asyncio.sleep(12)
+                    elapsed = int(time.monotonic() - start)
+                    await on_progress("transcribing", f"{elapsed} с")
+
+            heartbeat_task = asyncio.create_task(_heartbeat())
+
         try:
             model = await self._ensure_whisper_model()
-            logger.info("🎙️ Распознаю речь через Whisper (модель base)...")
-            result = await asyncio.to_thread(
-                model.transcribe,
-                audio_path,
-                language="ru",
-                fp16=False,
+            logger.info(
+                "🎙️ Распознаю речь через faster-whisper (модель %s, int8)...",
+                self.WHISPER_MODEL_NAME,
             )
-            text = str((result or {}).get("text") or "").strip()
+            text = await asyncio.to_thread(self._transcribe_sync, model, audio_path)
             logger.info("✅ Распознано %d символов", len(text))
             return text
         except Exception as exc:  # noqa: BLE001
             logger.warning("⚠️ Ошибка распознавания Whisper: %s", exc)
             return ""
         finally:
+            if heartbeat_task is not None:
+                heartbeat_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await heartbeat_task
             if audio_path and os.path.isfile(audio_path):
                 try:
                     os.remove(audio_path)
@@ -1661,16 +1709,43 @@ class InstagramParser(BaseParser):
                 except OSError as exc:
                     logger.debug("Не удалось удалить аудиофайл %s: %s", audio_path, exc)
 
-    async def _ensure_whisper_model(self) -> Any:
-        """Лениво загрузить и закэшировать модель Whisper ``base``."""
-        if self._whisper_model is None:
-            import whisper  # type: ignore[import-untyped]
+    @staticmethod
+    def _transcribe_sync(model: Any, audio_path: str) -> str:
+        """Синхронная транскрипция (вызывается из ``asyncio.to_thread``)."""
+        segments, _info = model.transcribe(
+            audio_path,
+            language="ru",
+            beam_size=1,
+            vad_filter=True,
+            condition_on_previous_text=False,
+        )
+        parts = [seg.text.strip() for seg in segments if seg.text and seg.text.strip()]
+        return " ".join(parts)
 
-            logger.info("⏳ Загружаю модель Whisper '%s' (~74 МБ)...", self.WHISPER_MODEL_NAME)
+    async def _ensure_whisper_model(self) -> Any:
+        """Лениво загрузить и закэшировать модель faster-whisper."""
+        if self._whisper_model is None:
+            from faster_whisper import WhisperModel  # type: ignore[import-untyped]
+
+            logger.info(
+                "⏳ Загружаю модель faster-whisper '%s' (%s)...",
+                self.WHISPER_MODEL_NAME,
+                self.WHISPER_COMPUTE_TYPE,
+            )
             self._whisper_model = await asyncio.to_thread(
-                whisper.load_model, self.WHISPER_MODEL_NAME
+                WhisperModel,
+                self.WHISPER_MODEL_NAME,
+                device="cpu",
+                compute_type=self.WHISPER_COMPUTE_TYPE,
             )
         return self._whisper_model
+
+    async def preload_whisper_model(self) -> None:
+        """Предзагрузить модель Whisper при старте бота (если локальный режим доступен)."""
+        if not self._local_enabled:
+            return
+        await self._ensure_whisper_model()
+        logger.info("✅ Модель faster-whisper '%s' предзагружена", self.WHISPER_MODEL_NAME)
 
     async def _download_instagram_image(self, img_url: str) -> Optional[str]:
         """Скачать ``img`` из Instagram Actor в ``IMAGES_DIR`` и вернуть локальный путь."""
@@ -1818,11 +1893,18 @@ class ParserRegistry:
                 logger.warning("⚠️  %s.can_parse упал на %r: %s", type(parser).__name__, url, exc)
         return None
 
-    async def parse(self, url: str) -> ParseResult:
+    async def parse(
+        self,
+        url: str,
+        *,
+        on_progress: Optional[ProgressCallback] = None,
+    ) -> ParseResult:
         parser = self.get_parser(url)
         if parser is None:
             raise ValueError(f"Не удалось найти парсер для URL: {url}")
         logger.info("🔍 Парсинг через %s: %s", parser.source_type, url[:80])
+        if isinstance(parser, InstagramParser):
+            return await parser.parse(url, on_progress=on_progress)
         return await parser.parse(url)
 
     @property
@@ -2299,7 +2381,8 @@ if __name__ == "__main__":
                 "https://www.instagram.com/reel/local123abc/",
             )
         mock_dl.assert_awaited_once()
-        mock_tr.assert_awaited_once_with("/tmp/reels_audio_localtest.mp3")
+        assert mock_tr.await_args is not None
+        assert mock_tr.await_args.args[0] == "/tmp/reels_audio_localtest.mp3"
         mock_apify_unused.assert_not_called()
         assert "Whisper" in local_out.text and "муку" in local_out.text
         assert local_out.image_url is None
@@ -2329,6 +2412,34 @@ if __name__ == "__main__":
         mock_apify_used.assert_called_once()
         assert "Apify T" in empty_out.text and "Apify Tr" in empty_out.text
         print("✅ Instagram fallback на Apify при пустом транскрипте")
+
+        # --- Таймаут распознавания → fallback на Apify -------------------- #
+        async def _slow_transcribe(_path: str, **kwargs: Any) -> str:
+            await asyncio.sleep(5)
+            return "late"
+
+        with patch.object(
+            InstagramParser,
+            "_download_audio",
+            new_callable=AsyncMock,
+            return_value="/tmp/reels_audio_slow.mp3",
+        ), patch.object(
+            InstagramParser,
+            "_transcribe_audio",
+            side_effect=_slow_transcribe,
+        ), patch.object(InstagramParser, "TRANSCRIBE_TIMEOUT_SECONDS", 0.05), patch.object(
+            InstagramParser,
+            "_fetch_via_apify",
+            return_value=("Timeout T", "", "Timeout Tr", ""),
+        ) as mock_apify_timeout:
+            ig_timeout = InstagramParser(apify_api_token="dummy")
+            ig_timeout._local_enabled = True
+            timeout_out = await ig_timeout.parse(
+                "https://www.instagram.com/reel/timeout123abc/",
+            )
+        mock_apify_timeout.assert_called_once()
+        assert "Timeout T" in timeout_out.text
+        print("✅ Instagram fallback на Apify при таймауте Whisper")
 
         # --- _create_cookie_file: Netscape-формат с sessionid ------------- #
         td_cookie = tempfile.mkdtemp()
