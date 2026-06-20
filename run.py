@@ -52,6 +52,9 @@ LOG_BACKUP_COUNT: int = 3
 HEALTHCHECK_HOST: str = "0.0.0.0"
 HEALTHCHECK_PORT: int = 8081
 
+# Флаг «бот поднял polling» — выставляется из RemyBot.run().
+_bot_polling_ready: bool = False
+
 # Формат логов: "2026-04-24 12:00:00 | INFO | module | message".
 LOG_FORMAT: str = "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
 LOG_DATEFMT: str = "%Y-%m-%d %H:%M:%S"
@@ -269,6 +272,47 @@ def _release_lock() -> None:
 # Healthcheck
 # --------------------------------------------------------------------------- #
 
+
+def mark_bot_polling_ready() -> None:
+    """Вызывается из RemyBot при старте polling."""
+    global _bot_polling_ready
+    _bot_polling_ready = True
+
+
+def _check_supabase_sync() -> bool:
+    """Лёгкий ping Supabase REST (синхронно, для /ready)."""
+    import urllib.error
+    import urllib.request
+
+    base = (config.supabase_url or "").rstrip("/")
+    key = (config.supabase_key or "").strip()
+    if not base or not key:
+        return False
+    url = f"{base}/rest/v1/recipes?select=id&limit=1"
+    req = urllib.request.Request(
+        url,
+        headers={
+            "apikey": key,
+            "Authorization": f"Bearer {key}",
+            "Accept": "application/json",
+        },
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return resp.status < 400
+    except (urllib.error.URLError, TimeoutError, OSError, ValueError):
+        return False
+
+
+def _readiness_status() -> tuple[bool, dict[str, bool]]:
+    checks = {
+        "bot": _bot_polling_ready,
+        "supabase": _check_supabase_sync(),
+    }
+    return all(checks.values()), checks
+
+
 class _HealthcheckHandler(BaseHTTPRequestHandler):
     """Минимальный HTTP-обработчик healthcheck.
 
@@ -280,6 +324,18 @@ class _HealthcheckHandler(BaseHTTPRequestHandler):
         if self.path == "/health":
             body = json.dumps({"status": "ok"}).encode("utf-8")
             self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
+        if self.path == "/ready":
+            ok, detail = _readiness_status()
+            payload = {"status": "ready" if ok else "degraded", "checks": detail}
+            body = json.dumps(payload).encode("utf-8")
+            code = 200 if ok else 503
+            self.send_response(code)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()

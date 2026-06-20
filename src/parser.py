@@ -172,6 +172,8 @@ async def attach_recipe_image(
     public_url = await storage.upload_image(path)
     if public_url:
         recipe_data["image_url"] = public_url
+        with contextlib.suppress(OSError):
+            os.unlink(path)
     else:
         recipe_data["image_url"] = path
 
@@ -786,6 +788,13 @@ def _apify_http_json(
     timeout_sec: float = 180.0,
 ) -> Any:
     """Синхронный JSON-запрос к Apify API. При ошибке возвращает None (ошибка залогирована)."""
+    if method.upper() == "POST" and "/runs" in url:
+        from .apify_guard import get_apify_guard
+
+        guard = get_apify_guard()
+        if guard is not None and not guard.try_acquire():
+            return None
+
     token = (token or "").strip()
     if not token:
         logger.error("Apify: токен пустой — заголовок Authorization не сформирован")

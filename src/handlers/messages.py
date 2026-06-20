@@ -466,77 +466,102 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     logger.info("📷 Получено изображение от user %s", user.id)
+    bot = _get_bot(context)
+    user_id = user.id
+
+    if user_id in bot.processing_urls:
+        await message.reply_text(
+            "⏳ Уже обрабатываю предыдущий запрос. Подожди — скоро пришлю результат.",
+        )
+        return
+
+    from ..rate_limit import format_wait_label
+
+    allowed, wait_sec = bot.photo_rate_limiter.check(user_id)
+    if not allowed:
+        limit_sec = bot.config.photo_rate_limit_seconds
+        await message.reply_text(
+            f"⏳ Слишком часто. Подожди {wait_sec} сек. перед следующим фото "
+            f"(лимит: 1 раз в {format_wait_label(limit_sec)}).",
+        )
+        return
+
+    bot.processing_urls[user_id] = "photo"
+    bot.photo_rate_limiter.record(user_id)
 
     photo = message.photo[-1]
     status: Message = await message.reply_text("🔍 Анализирую изображение...")
-    bot = _get_bot(context)
 
     try:
-        file = await context.bot.get_file(photo.file_id)
-        raw = bytes(await file.download_as_bytearray())
-    except Exception as exc:  # noqa: BLE001
-        logger.error("❌ Не удалось скачать изображение: %s", exc)
-        await _safe_edit(
-            status,
-            f"❌ Не удалось загрузить фото:\n<code>{_html_escape(str(exc))}</code>",
-        )
-        return
-
-    if len(raw) > MAX_IMAGE_BYTES:
-        logger.error("❌ Изображение слишком большое (%s байт)", len(raw))
-        await _safe_edit(status, "❌ Изображение слишком большое. Отправьте файл поменьше.")
-        return
-
-    b64 = base64.standard_b64encode(raw).decode("ascii")
-    mime = _guess_image_mime(raw[:32])
-
-    logger.info("🤖 Анализ изображения через AI...")
-    try:
-        result = await bot.normalizer.analyze_image(b64, mime_type=mime)
-    except ValueError as exc:
-        logger.error("❌ Ошибка анализа изображения: %s", exc)
-        await _safe_edit(
-            status,
-            f"❌ Не удалось обработать изображение:\n<code>{_html_escape(str(exc))}</code>",
-        )
-        return
-
-    if result.get("is_recipe") is False:
-        if result.get("error"):
-            logger.error("❌ Ошибка API при анализе изображения: %s", result.get("reason"))
+        try:
+            file = await context.bot.get_file(photo.file_id)
+            raw = bytes(await file.download_as_bytearray())
+        except Exception as exc:  # noqa: BLE001
+            logger.error("❌ Не удалось скачать изображение: %s", exc)
             await _safe_edit(
                 status,
-                "❌ Не удалось проанализировать изображение. Попробуйте позже.",
+                f"❌ Не удалось загрузить фото:\n<code>{_html_escape(str(exc))}</code>",
             )
-        else:
-            logger.info("ℹ️ Изображение не содержит рецепт")
+            return
+
+        if len(raw) > MAX_IMAGE_BYTES:
+            logger.error("❌ Изображение слишком большое (%s байт)", len(raw))
+            await _safe_edit(status, "❌ Изображение слишком большое. Отправьте файл поменьше.")
+            return
+
+        b64 = base64.standard_b64encode(raw).decode("ascii")
+        mime = _guess_image_mime(raw[:32])
+
+        logger.info("🤖 Анализ изображения через AI...")
+        try:
+            result = await bot.normalizer.analyze_image(b64, mime_type=mime)
+        except ValueError as exc:
+            logger.error("❌ Ошибка анализа изображения: %s", exc)
+            await _safe_edit(
+                status,
+                f"❌ Не удалось обработать изображение:\n<code>{_html_escape(str(exc))}</code>",
+            )
+            return
+
+        if result.get("is_recipe") is False:
+            if result.get("error"):
+                logger.error("❌ Ошибка API при анализе изображения: %s", result.get("reason"))
+                await _safe_edit(
+                    status,
+                    "❌ Не удалось проанализировать изображение. Попробуйте позже.",
+                )
+            else:
+                logger.info("ℹ️ Изображение не содержит рецепт")
+                await _safe_edit(status, "❌ На этом изображении не удалось найти рецепт.")
+            return
+
+        title_ok = bool((result.get("title") or "").strip())
+        ingredients_ok = bool(result.get("ingredients"))
+        if not (title_ok and ingredients_ok):
+            logger.info("ℹ️ Изображение не содержит рецепт (валидация)")
             await _safe_edit(status, "❌ На этом изображении не удалось найти рецепт.")
-        return
+            return
 
-    title_ok = bool((result.get("title") or "").strip())
-    ingredients_ok = bool(result.get("ingredients"))
-    if not (title_ok and ingredients_ok):
-        logger.info("ℹ️ Изображение не содержит рецепт (валидация)")
-        await _safe_edit(status, "❌ На этом изображении не удалось найти рецепт.")
-        return
+        result["source_url"] = ""
+        if not result.get("image_url") and not result.get("image_path"):
+            from ..parser import _generate_and_save_image, attach_recipe_image
 
-    result["source_url"] = ""
-    if not result.get("image_url") and not result.get("image_path"):
-        from ..parser import _generate_and_save_image, attach_recipe_image
+            gen_path = await _generate_and_save_image(
+                str(result.get("title") or "блюдо")[:400],
+                hf_api_key=bot.config.hf_api_key,
+            )
+            if gen_path:
+                await attach_recipe_image(result, gen_path, bot.storage)
 
-        gen_path = await _generate_and_save_image(
-            str(result.get("title") or "блюдо")[:400],
-            hf_api_key=bot.config.hf_api_key,
-        )
-        if gen_path:
-            await attach_recipe_image(result, gen_path, bot.storage)
+        bot.temp_recipes[user.id] = {"recipe": result, "timestamp": time.time()}
+        bot.cleanup_expired_temp_recipes()
 
-    bot.temp_recipes[user.id] = {"recipe": result, "timestamp": time.time()}
-    bot.cleanup_expired_temp_recipes()
+        logger.info("✅ Рецепт извлечён из изображения")
 
-    logger.info("✅ Рецепт извлечён из изображения")
-
-    await _present_recipe_with_optional_photo(message, status, result, bot)
+        await _present_recipe_with_optional_photo(message, status, result, bot)
+    finally:
+        if bot.processing_urls.get(user_id) == "photo":
+            bot.processing_urls.pop(user_id, None)
 
 
 # --------------------------------------------------------------------------- #
@@ -690,7 +715,19 @@ async def _handle_text_recipe(
         )
         return
 
+    from ..rate_limit import format_wait_label
+
+    allowed, wait_sec = bot.text_rate_limiter.check(user_id)
+    if not allowed:
+        limit_sec = bot.config.text_rate_limit_seconds
+        await message.reply_text(
+            f"⏳ Слишком часто. Подожди {wait_sec} сек. перед следующим текстом "
+            f"(лимит: 1 раз в {format_wait_label(limit_sec)}).",
+        )
+        return
+
     bot.processing_urls[user_id] = job_key
+    bot.text_rate_limiter.record(user_id)
 
     status: Message = await message.reply_text("⏳ Запускаю обработку…")
     progress = RecipeProgress(status, source_type="text")
@@ -773,20 +810,6 @@ async def _handle_url(
 
     logger.info("🔍 Начинаю обработку URL: %s", url)
 
-    if not skip_rate_limit:
-        allowed, wait_sec = bot.url_rate_limiter.check(user_id)
-        if not allowed:
-            limit_sec = bot.config.url_rate_limit_seconds
-            if limit_sec % 60 == 0:
-                limit_label = f"{limit_sec // 60} мин"
-            else:
-                limit_label = f"{limit_sec} сек"
-            await message.reply_text(
-                f"⏳ Слишком часто. Подожди {wait_sec} сек. перед следующей ссылкой "
-                f"(лимит: 1 ссылка раз в {limit_label}).",
-            )
-            return
-
     if user_id in bot.processing_urls:
         await message.reply_text(
             "⏳ Уже обрабатываю предыдущий запрос. Подожди — скоро пришлю результат.",
@@ -798,17 +821,31 @@ async def _handle_url(
     cache_key = bot.recipe_vault.cache_key_for(url, source_type)
     job_key = cache_key
 
-    bot.processing_urls[user_id] = job_key
-    if not skip_rate_limit:
-        bot.url_rate_limiter.record(user_id)
-
-    vault_lookup = await bot.recipe_vault.lookup(cache_key)
-    if isinstance(vault_lookup, VaultFailureHit):
-        await message.reply_text(f"❌ {_html_escape(vault_lookup.reason)}")
-        bot.processing_urls.pop(user_id, None)
-        return
+    vault_lookup = None
+    if bot.recipe_vault.enabled:
+        vault_lookup = await bot.recipe_vault.lookup(cache_key)
+        if isinstance(vault_lookup, VaultFailureHit):
+            await message.reply_text(f"❌ {_html_escape(vault_lookup.reason)}")
+            return
 
     from_vault = isinstance(vault_lookup, VaultRecipeHit)
+
+    if not skip_rate_limit and not from_vault:
+        from ..rate_limit import format_wait_label
+
+        allowed, wait_sec = bot.url_rate_limiter.check(user_id)
+        if not allowed:
+            limit_sec = bot.config.url_rate_limit_seconds
+            await message.reply_text(
+                f"⏳ Слишком часто. Подожди {wait_sec} сек. перед следующей ссылкой "
+                f"(лимит: 1 ссылка раз в {format_wait_label(limit_sec)}).",
+            )
+            return
+
+    bot.processing_urls[user_id] = job_key
+    if not skip_rate_limit and not from_vault:
+        bot.url_rate_limiter.record(user_id)
+
     if from_vault:
         status: Message = await message.reply_text("⚡ Рецепт из базы Remy…")
     else:

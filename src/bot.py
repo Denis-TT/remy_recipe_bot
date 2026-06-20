@@ -39,6 +39,8 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
+from telegram import Update
+from telegram.error import BadRequest
 
 from config import Config, config as default_config
 
@@ -46,6 +48,7 @@ from .handlers import callbacks, commands, messages
 from .localization import Localization
 from .normalizer import RecipeNormalizer
 from .parser import InstagramParser, ParserRegistry, create_parser_registry, ensure_images_dir
+from .apify_guard import ApifyDailyGuard, configure_apify_guard
 from .rate_limit import UserRateLimiter
 from .recipe_vault import RecipeVault, VaultFailureError, VaultPipelineResult
 from .ytdlp_mixin import YtdlpWhisperMixin
@@ -100,10 +103,11 @@ class RemyBot:
         )
         self.recipe_vault: RecipeVault = RecipeVault(self.storage, self.config)
         self.temp_recipes: Dict[int, Dict[str, Any]] = {}
-        # user_id → ключ обрабатываемой ссылки (shortcode Instagram или URL),
-        # чтобы не запускать два тяжёлых Whisper-процесса на один Reels.
         self.processing_urls: Dict[int, str] = {}
         self.url_rate_limiter = UserRateLimiter(self.config.url_rate_limit_seconds)
+        self.photo_rate_limiter = UserRateLimiter(self.config.photo_rate_limit_seconds)
+        self.text_rate_limiter = UserRateLimiter(self.config.text_rate_limit_seconds)
+        configure_apify_guard(ApifyDailyGuard(self.config.apify_max_runs_per_day))
         self.heavy_job_semaphore = asyncio.Semaphore(self.config.max_concurrent_video_jobs)
         for parser in self.parser.parsers:
             if isinstance(parser, YtdlpWhisperMixin):
@@ -213,6 +217,13 @@ class RemyBot:
         logger.info("🚀 Бот Remy запущен (polling)...")
 
         try:
+            from run import mark_bot_polling_ready
+
+            mark_bot_polling_ready()
+        except ImportError:
+            pass
+
+        try:
             # stop_signals=None: сигналы обрабатываются `run.py`.
             # drop_pending_updates=True: при перезапуске на Railway
             # мы не хотим обрабатывать накопленные апдейты.
@@ -252,6 +263,26 @@ class RemyBot:
     ) -> None:
         """Глобальный обработчик необработанных исключений в хендлерах."""
         logger.exception("❌ Исключение в хендлере: %s", context.error)
+
+        if not isinstance(update, Update):
+            return
+
+        user_text = (
+            "❌ Что-то пошло не так. Попробуй через минуту или нажми /start."
+        )
+        message = update.effective_message
+        if message is not None:
+            try:
+                await message.reply_text(user_text)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("Не удалось отправить сообщение об ошибке: %s", exc)
+
+        query = update.callback_query
+        if query is not None:
+            try:
+                await query.answer("Ошибка. Попробуй позже.", show_alert=True)
+            except BadRequest:
+                pass
 
 
 # --------------------------------------------------------------------------- #

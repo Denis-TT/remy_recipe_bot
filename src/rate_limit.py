@@ -44,6 +44,14 @@ class UserRateLimiter:
         self._last_at[int(user_id)] = time.monotonic()
 
 
+def format_wait_label(interval_seconds: int) -> str:
+    """Человекочитаемый интервал для сообщения пользователю."""
+    sec = int(interval_seconds)
+    if sec % 60 == 0 and sec >= 60:
+        return f"{sec // 60} мин"
+    return f"{sec} сек"
+
+
 if __name__ == "__main__":
     limiter = UserRateLimiter(180)
     ok, wait = limiter.check(42)

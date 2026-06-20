@@ -65,9 +65,14 @@ class Config:
     # Макс. длина видео для скачивания аудио и Whisper (сек); длиннее — только описание/субтитры.
     max_video_duration_seconds: int = 120
     # Одновременных тяжёлых видео-задач (yt-dlp + Whisper) на весь бот.
-    max_concurrent_video_jobs: int = 3
+    max_concurrent_video_jobs: int = 2
     # Эталонная ссылка для кнопки «Протестировать пример» в /start.
-    example_test_url: str = "https://www.youtube.com/watch?v=8h0b_bQc9Vg"
+    example_test_url: str = "https://www.instagram.com/reel/DZw5dtOtmxO/"
+    # Лимиты на фото и текст (GitHub Models), сек.
+    photo_rate_limit_seconds: int = 120
+    text_rate_limit_seconds: int = 120
+    # Apify Actor runs в сутки (0 = без лимита).
+    apify_max_runs_per_day: int = 80
     # Recipe Vault: глобальная база URL → рецепт.
     vault_enabled: bool = True
     vault_draft_ttl_days: int = 90
@@ -175,15 +180,31 @@ class Config:
             name="MAX_VIDEO_DURATION_SECONDS",
         )
         max_concurrent_video_jobs = cls._parse_positive_int(
-            os.getenv("MAX_CONCURRENT_VIDEO_JOBS", "3"),
-            default=3,
+            os.getenv("MAX_CONCURRENT_VIDEO_JOBS", "2"),
+            default=2,
             name="MAX_CONCURRENT_VIDEO_JOBS",
         )
 
         example_test_url = os.getenv(
             "EXAMPLE_TEST_URL",
-            "https://www.youtube.com/watch?v=8h0b_bQc9Vg",
+            "https://www.instagram.com/reel/DZw5dtOtmxO/",
         ).strip()
+
+        photo_rate_limit_seconds = cls._parse_positive_int(
+            os.getenv("PHOTO_RATE_LIMIT_SECONDS", "120"),
+            default=120,
+            name="PHOTO_RATE_LIMIT_SECONDS",
+        )
+        text_rate_limit_seconds = cls._parse_positive_int(
+            os.getenv("TEXT_RATE_LIMIT_SECONDS", "120"),
+            default=120,
+            name="TEXT_RATE_LIMIT_SECONDS",
+        )
+        apify_max_runs_per_day = cls._parse_non_negative_int(
+            os.getenv("APIFY_MAX_RUNS_PER_DAY", "80"),
+            default=80,
+            name="APIFY_MAX_RUNS_PER_DAY",
+        )
 
         vault_enabled = os.getenv("VAULT_ENABLED", "true").strip().lower() in {
             "1",
@@ -237,6 +258,9 @@ class Config:
             max_video_duration_seconds=max_video_duration_seconds,
             max_concurrent_video_jobs=max_concurrent_video_jobs,
             example_test_url=example_test_url,
+            photo_rate_limit_seconds=photo_rate_limit_seconds,
+            text_rate_limit_seconds=text_rate_limit_seconds,
+            apify_max_runs_per_day=apify_max_runs_per_day,
             vault_enabled=vault_enabled,
             vault_draft_ttl_days=vault_draft_ttl_days,
             vault_promote_hits=vault_promote_hits,
@@ -258,6 +282,26 @@ class Config:
         if value <= 0:
             print(
                 f"⚠️  {name} должно быть > 0, получено {value}; используем {default}.",
+                file=sys.stderr,
+            )
+            return default
+        return value
+
+    @staticmethod
+    def _parse_non_negative_int(raw: str, *, default: int, name: str) -> int:
+        """Распарсить целое >= 0 из env (0 = «без лимита» для Apify)."""
+        text = (raw or "").strip()
+        try:
+            value = int(text)
+        except ValueError:
+            print(
+                f"⚠️  Некорректный {name}='{text}', используем {default}.",
+                file=sys.stderr,
+            )
+            return default
+        if value < 0:
+            print(
+                f"⚠️  {name} должно быть >= 0, получено {value}; используем {default}.",
                 file=sys.stderr,
             )
             return default
