@@ -19,10 +19,11 @@ from typing import TYPE_CHECKING
 from telegram import Update
 from telegram.ext import ContextTypes
 
-from ..keyboards import main_menu_keyboard, menu_keyboard
+from ..keyboards import main_menu_keyboard, menu_keyboard, welcome_start_keyboard
 
 if TYPE_CHECKING:
     from ..bot import RemyBot
+    from config import Config
 
 
 logger = logging.getLogger("remy.handlers.commands")
@@ -33,16 +34,48 @@ logger = logging.getLogger("remy.handlers.commands")
 # --------------------------------------------------------------------------- #
 
 WELCOME_TEXT: str = (
-    "👨\u200d🍳 Привет! Я Remy — твой кулинарный помощник.\n"
+    "👋 Привет! Я Реми — твой персональный ИИ-шеф.\n"
+    "Я умею превращать хаотичные кулинарные видео из YouTube Shorts, "
+    "Instagram Reels, TikTok и VK в идеальные пошаговые рецепты.\n"
     "\n"
-    "Отправь мне ссылку на рецепт или текст рецепта, и я:\n"
-    "• Извлеку ингредиенты и шаги\n"
-    "• Определю тип блюда и кухню\n"
-    "• Рассчитаю КБЖУ\n"
-    "• Сохраню в твою книгу рецептов\n"
-    "\n"
-    "Используй кнопку 📋 Меню для навигации!"
+    "✨ Что я умею:\n"
+    "• Извлекать скрытые тексты авторов и слушать их голос\n"
+    "• Форматировать шаги в чёткую технологическую карту\n"
+    "• Вытаскивать секреты и лайфхаки шеф-поваров\n"
+    "• Честно оценивать КБЖУ блюда"
 )
+
+
+def format_tutorial_text(cfg: "Config") -> str:
+    """Текст инструкции с актуальными лимитами из конфига."""
+    max_sec = int(getattr(cfg, "max_video_duration_seconds", 120) or 120)
+    rate_sec = int(getattr(cfg, "url_rate_limit_seconds", 180) or 180)
+
+    if max_sec % 60 == 0:
+        max_label = f"{max_sec // 60} мин"
+    else:
+        max_label = f"{max_sec} сек"
+
+    if rate_sec % 60 == 0:
+        rate_label = f"{rate_sec // 60} мин"
+    else:
+        rate_label = f"{rate_sec} сек"
+
+    return (
+        "📖 Как пользоваться Реми\n"
+        "\n"
+        "1️⃣ Открой YouTube Shorts, Instagram Reels, TikTok или VK Клипы\n"
+        "2️⃣ Нажми «Поделиться» → «Копировать ссылку»\n"
+        "3️⃣ Вставь ссылку в этот чат\n"
+        "\n"
+        "⚠️ Лимиты:\n"
+        f"• Видео до {max_label} — полный разбор (голос + описание)\n"
+        "• Длиннее — только если в описании или субтитрах достаточно текста\n"
+        f"• Не чаще 1 ссылки раз в {rate_label}\n"
+        "\n"
+        "Нажми «🔥 Протестировать пример», чтобы увидеть Реми в деле!"
+    )
+
 
 MENU_TEXT: str = "📋 Меню. Выбери действие:"
 
@@ -98,6 +131,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if message is None:
         return
 
+    from .messages import try_handle_pending_share
+
     user = update.effective_user
     if user is not None and await try_handle_pending_share(message, context, user.id):
         return
@@ -115,6 +150,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     await message.reply_text(
         WELCOME_TEXT,
+        reply_markup=welcome_start_keyboard(),
+    )
+    await message.reply_text(
+        "👇",
         reply_markup=main_menu_keyboard(),
     )
 

@@ -269,3 +269,18 @@ def back_to_menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("◀️ Назад в меню", callback_data="back_to_menu")],
     ])
+
+
+def welcome_start_keyboard() -> InlineKeyboardMarkup:
+    """Кнопки приветствия /start: пример и инструкция."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔥 Протестировать пример", callback_data="run_example_test")],
+        [InlineKeyboardButton("📖 Инструкция и лимиты", callback_data="show_tutorial_info")],
+    ])
+
+
+def tutorial_back_keyboard() -> InlineKeyboardMarkup:
+    """Кнопка «Назад» с экрана инструкции к приветствию."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("⬅️ Назад", callback_data="go_to_start")],
+    ])

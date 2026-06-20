@@ -788,24 +788,27 @@ async def _handle_url(
     context: ContextTypes.DEFAULT_TYPE,
     user_id: int,
     url: str,
+    *,
+    skip_rate_limit: bool = False,
 ) -> None:
     """Распарсить URL, нормализовать рецепт и отправить результат."""
     bot = _get_bot(context)
 
     logger.info("🔍 Начинаю обработку URL: %s", url)
 
-    allowed, wait_sec = bot.url_rate_limiter.check(user_id)
-    if not allowed:
-        limit_sec = bot.config.url_rate_limit_seconds
-        if limit_sec % 60 == 0:
-            limit_label = f"{limit_sec // 60} мин"
-        else:
-            limit_label = f"{limit_sec} сек"
-        await message.reply_text(
-            f"⏳ Слишком часто. Подожди {wait_sec} сек. перед следующей ссылкой "
-            f"(лимит: 1 ссылка раз в {limit_label}).",
-        )
-        return
+    if not skip_rate_limit:
+        allowed, wait_sec = bot.url_rate_limiter.check(user_id)
+        if not allowed:
+            limit_sec = bot.config.url_rate_limit_seconds
+            if limit_sec % 60 == 0:
+                limit_label = f"{limit_sec // 60} мин"
+            else:
+                limit_label = f"{limit_sec} сек"
+            await message.reply_text(
+                f"⏳ Слишком часто. Подожди {wait_sec} сек. перед следующей ссылкой "
+                f"(лимит: 1 ссылка раз в {limit_label}).",
+            )
+            return
 
     if user_id in bot.processing_urls:
         await message.reply_text(
@@ -818,7 +821,8 @@ async def _handle_url(
     job_key = _url_processing_key(url, source_type)
 
     bot.processing_urls[user_id] = job_key
-    bot.url_rate_limiter.record(user_id)
+    if not skip_rate_limit:
+        bot.url_rate_limiter.record(user_id)
 
     status: Message = await message.reply_text("⏳ Запускаю обработку…")
     is_video = source_type in _VIDEO_SOURCE_TYPES

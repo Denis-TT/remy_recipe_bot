@@ -66,6 +66,8 @@ class Config:
     max_video_duration_seconds: int = 120
     # Одновременных тяжёлых видео-задач (yt-dlp + Whisper) на весь бот.
     max_concurrent_video_jobs: int = 3
+    # Эталонная ссылка для кнопки «Протестировать пример» в /start.
+    example_test_url: str = "https://www.youtube.com/watch?v=8h0b_bQc9Vg"
 
     @property
     def is_development(self) -> bool:
@@ -173,6 +175,11 @@ class Config:
             name="MAX_CONCURRENT_VIDEO_JOBS",
         )
 
+        example_test_url = os.getenv(
+            "EXAMPLE_TEST_URL",
+            "https://www.youtube.com/watch?v=8h0b_bQc9Vg",
+        ).strip()
+
         environment = os.getenv("ENVIRONMENT", "production").strip().lower() or "production"
         if environment not in _ALLOWED_ENVIRONMENTS:
             print(
@@ -202,6 +209,7 @@ class Config:
             url_rate_limit_seconds=url_rate_limit_seconds,
             max_video_duration_seconds=max_video_duration_seconds,
             max_concurrent_video_jobs=max_concurrent_video_jobs,
+            example_test_url=example_test_url,
         )
 
     @staticmethod

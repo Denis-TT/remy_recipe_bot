@@ -9,6 +9,9 @@
     dont_save           — скрыть кнопки под распарсенным рецептом
     show_categories     — показать список типов блюд пользователя
     show_help           — показать текст помощи
+    run_example_test    — запустить эталонный пример рецепта из /start
+    show_tutorial_info  — инструкция и лимиты (онбординг)
+    go_to_start         — вернуться к приветствию /start
     feedback            — быстрая форма обратной связи
     dishtype_{dish_type} — показать основные ингредиенты внутри типа блюда
     ingredient_{dish_type}_{main_ingredient} — показать рецепты по паре ключей
@@ -44,6 +47,8 @@ from ..keyboards import (
     menu_keyboard,
     recipe_detail_keyboard,
     recipes_list_keyboard,
+    tutorial_back_keyboard,
+    welcome_start_keyboard,
 )
 from . import commands
 
@@ -69,19 +74,41 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if query is None:
         return
 
-    # Сначала отвечаем Telegram'у — иначе пользователь увидит «часики»
-    # на кнопке. Если выкинется BadRequest (старый callback), молча
-    # идём дальше.
-    try:
-        await query.answer()
-    except BadRequest as exc:
-        logger.debug("answer() для старого callback не сработал: %s", exc)
-
     data = (query.data or "").strip()
+
+    # Сначала отвечаем Telegram'у — иначе пользователь увидит «часики»
+    # на кнопке. Для run_example_test ответ — в своём хендлере (с текстом).
+    if data != "run_example_test":
+        try:
+            await query.answer()
+        except BadRequest as exc:
+            logger.debug("answer() для старого callback не сработал: %s", exc)
+
     user_id = query.from_user.id if query.from_user else 0
     logger.info("🔥 CALLBACK: %s от user %s", data, user_id)
 
     bot = _get_bot(context)
+
+    # --- Онбординг /start ------------------------------------------------- #
+    if data == "show_tutorial_info":
+        await _safe_edit(
+            query,
+            commands.format_tutorial_text(bot.config),
+            reply_markup=tutorial_back_keyboard(),
+        )
+        return
+
+    if data == "go_to_start":
+        await _safe_edit(
+            query,
+            commands.WELCOME_TEXT,
+            reply_markup=welcome_start_keyboard(),
+        )
+        return
+
+    if data == "run_example_test":
+        await _callback_run_example_test(query, context, bot, user_id)
+        return
 
     # --- Сохранение распарсенного рецепта --------------------------------- #
     if data == "save":
@@ -177,6 +204,40 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     logger.warning("❓ Неизвестный callback_data: %r", data)
+
+
+# --------------------------------------------------------------------------- #
+# Онбординг /start
+# --------------------------------------------------------------------------- #
+
+async def _callback_run_example_test(
+    query: CallbackQuery,
+    context: ContextTypes.DEFAULT_TYPE,
+    bot: "RemyBot",
+    user_id: int,
+) -> None:
+    """Запустить эталонный пример рецепта (как будто пользователь прислал ссылку)."""
+    url = str(bot.config.example_test_url or "").strip()
+    if not url.startswith(("http://", "https://")):
+        try:
+            await query.answer("Пример не настроен (EXAMPLE_TEST_URL)", show_alert=True)
+        except BadRequest:
+            pass
+        return
+
+    message = query.message
+    if message is None:
+        return
+
+    try:
+        await query.answer("Запускаю пример…")
+    except BadRequest:
+        pass
+
+    logger.info("🔥 run_example_test: user %s, url %s", user_id, url)
+    from .messages import _handle_url
+
+    await _handle_url(message, context, user_id, url, skip_rate_limit=True)
 
 
 # --------------------------------------------------------------------------- #
