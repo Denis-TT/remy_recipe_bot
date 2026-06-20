@@ -35,26 +35,68 @@ Telegram Mini App.
 2. Регион — ближайший к Railway (у Railway дефолт `us-west` / `us-east`).
 3. Подождать ~2 минуты, пока поднимется Postgres.
 
-### 1.2. Накатить схему
+### 1.2. Накатить схему и миграции
 
-1. **SQL Editor → New query**.
-2. Вставить содержимое `sql/create_tables.sql`.
-3. **Run**. Скрипт идемпотентный — повторный запуск ничего не сломает.
+В **SQL Editor → New query** выполнить **по порядку** (каждый файл — Run):
 
-После этого в **Table Editor** должна появиться таблица `recipes` с
-полями из [`docs/architecture.md`](architecture.md#5-хранение-данных).
+| # | Файл | Зачем |
+|---|------|-------|
+| 1 | `sql/create_tables.sql` | Таблица `recipes`, Storage, базовый RLS |
+| 2 | `sql/migration_pending_shares.sql` | Шаринг из Mini App |
+| 3 | `sql/migration_recipe_vault.sql` | Глобальный кэш URL |
+| 4 | `sql/migration_rls_user_isolation.sql` | **RLS по Telegram user_id** |
+| 5 | `sql/migration_rls_hardening.sql` | Vault только для service role |
+
+Опционально (если БД старая и колонок ещё нет):  
+`migration_nutrition_note.sql`, `migration_nutrition_estimated.sql`, `migration_dish_categorization.sql`.
+
+> ⚠️ **Порядок важен:** сначала задеплой Edge Function (п. 1.5), **потом**
+> п. 4–5, **потом** обнови Mini App (п. 3). Иначе «Книга рецептов» перестанет
+> грузить данные до выката JWT-авторизации.
+
+После п. 1 в **Table Editor** должна появиться таблица `recipes`.
 
 ### 1.3. Забрать ключи
 
 **Project Settings → API**:
 
-- `Project URL` → в переменные как `SUPABASE_URL`.
-- `Project API keys → anon / public` → `SUPABASE_KEY`.
+| Ключ | Куда |
+|------|------|
+| `Project URL` | `SUPABASE_URL` (Railway + Mini App) |
+| **`service_role`** (secret) | `SUPABASE_KEY` на **Railway** (бот) |
+| **`anon` / publishable** | `__SUPABASE_ANON_KEY__` в **Mini App** |
 
-> ⚠️ `service_role` ключ **не берём** — он полнодоступный и не должен
-> попасть в Mini App. Всё MVP работает на `anon`-ключе.
+> ⚠️ **service_role** — только на Railway, никогда в Mini App или git.  
+> Mini App использует **anon** + JWT от Edge Function `telegram-auth`.
 
-### 1.4. Проверка
+### 1.4. Edge Function `telegram-auth` (обязательно для RLS)
+
+Mini App не ходит в БД напрямую с anon-ключом — сначала получает JWT.
+
+1. Установи [Supabase CLI](https://supabase.com/docs/guides/cli) и залогинься.
+2. В корне репозитория:
+
+```bash
+supabase link --project-ref <YOUR_PROJECT_REF>
+supabase secrets set TELEGRAM_BOT_TOKEN=<токен_из_BotFather>
+# опционально для dev в браузере:
+supabase secrets set REMY_DEV_AUTH_SECRET=<случайная_строка>
+supabase functions deploy telegram-auth --no-verify-jwt
+```
+
+3. Проверка:
+
+```bash
+curl -s -X POST "https://<project>.supabase.co/functions/v1/telegram-auth" \
+  -H "apikey: <anon_key>" \
+  -H "Authorization: Bearer <anon_key>" \
+  -H "Content-Type: application/json" \
+  -d '{"dev_user_id":12345,"dev_secret":"<REMY_DEV_AUTH_SECRET>"}'
+```
+
+Ответ: `{"access_token":"eyJ...","user_id":12345,...}`.
+
+### 1.5. Проверка БД
 
 В Supabase Studio **SQL Editor**:
 
@@ -77,7 +119,8 @@ DELETE FROM recipes WHERE title='test';
    GitHub repo** → выбрать `remy_recipe_bot`.
 2. Railway сам увидит `railway.toml` и применит:
    - `builder = "NIXPACKS"` + `pythonVersion = "3.11"`;
-   - `startCommand = "pkill -9 -f 'python.*run.py' 2>/dev/null; sleep 2; python run.py"`;
+   - `startCommand = "python run.py"`;
+   - `healthcheckPath = "/health"`;
    - `numReplicas = 1` — **критично**, два экземпляра будут драться за
      Telegram getUpdates и ловить конфликты;
    - `restartPolicyType = "ON_FAILURE"`.
@@ -91,7 +134,7 @@ DELETE FROM recipes WHERE title='test';
 | `TELEGRAM_BOT_TOKEN` | токен из @BotFather |
 | `GITHUB_TOKEN` | PAT с `models:read` |
 | `SUPABASE_URL` | из п. 1.3 |
-| `SUPABASE_KEY` | `anon` ключ из п. 1.3 |
+| `SUPABASE_KEY` | **service_role** ключ из п. 1.3 |
 | `LOG_LEVEL` | `INFO` (на первых порах можно `DEBUG`) |
 | `ENVIRONMENT` | `production` |
 | `WEBAPP_URL` | пока оставить пустым — заполним в п. 3 |
@@ -124,23 +167,23 @@ Mini App — это **статический** одностраничный `min
 
 ```js
 const DEFAULT_SUPABASE_URL = "__SUPABASE_URL__";
-const DEFAULT_SUPABASE_KEY = "__SUPABASE_KEY__";
+const DEFAULT_SUPABASE_KEY = "__SUPABASE_ANON_KEY__";
 ```
 
-Их нужно **заменить на реальные значения** из п. 1.3 перед деплоем.
+Их нужно **заменить на реальные значения** из п. 1.3 (**anon/publishable**, не service_role) перед деплоем.
 Можно руками, можно одной командой:
 
 ```bash
 # macOS / BSD sed
 sed -i '' \
   -e "s#__SUPABASE_URL__#https://xxx.supabase.co#g" \
-  -e "s#__SUPABASE_KEY__#eyJhbGciOi...anon-key#g" \
+  -e "s#__SUPABASE_ANON_KEY__#eyJhbGciOi...anon-key#g" \
   mini_app/index.html
 
 # Linux / GNU sed
 sed -i \
   -e "s#__SUPABASE_URL__#https://xxx.supabase.co#g" \
-  -e "s#__SUPABASE_KEY__#eyJhbGciOi...anon-key#g" \
+  -e "s#__SUPABASE_ANON_KEY__#eyJhbGciOi...anon-key#g" \
   mini_app/index.html
 ```
 
@@ -252,7 +295,9 @@ Railway перезапустит сервис; `RemyBot` автоматичес�
 | Бот молчит на `/start`, в логах `Conflict: terminated by other getUpdates` | Запущено два экземпляра. Проверь `numReplicas = 1`, остановки процессов в `startCommand`, и что нет локального `python run.py`. |
 | `❌ Ошибка нормализации` на нормальной ссылке | Проверь `GITHUB_TOKEN` и лимит GitHub Models. В логах будет `RecipeNormalizer: … status=401/429`. |
 | `⚠️ Не удалось сохранить рецепт` | В логах `SupabaseStorage.save_recipe … status=…` — чаще всего не накачен DDL (404) или не тот `SUPABASE_KEY`. |
-| Mini App показывает `USER_ID = 0` и пустые категории | Открыт **не через Telegram WebApp** (а напрямую в браузере). Для отладки подставь `?user_id=<твой>` в URL. |
+| Mini App: «Авторизация не удалась» / HTTP 401 | Edge Function `telegram-auth` не задеплоена или неверный `TELEGRAM_BOT_TOKEN` в secrets. |
+| Mini App: пустые категории после RLS | Миграция `migration_rls_user_isolation.sql` накатана, но Mini App старый (без JWT) или нет `access_token`. |
+| Mini App: `USER_ID = 0` | Открыт не через Telegram. Dev: `?user_id=123&dev_secret=<REMY_DEV_AUTH_SECRET>`. |
 | В `/menu` нет кнопки Mini App | `WEBAPP_URL` пуст **или** не начинается с `https://` (ключевая проверка в `keyboards.py → _is_valid_webapp_url`). |
 | «message is not modified» в логах | Безвредно — PTB не даёт редактировать сообщение на то же содержимое, мы просто логируем и идём дальше. |
 
@@ -260,8 +305,9 @@ Railway перезапустит сервис; `RemyBot` автоматичес�
 
 ## 7. Чеклист перед релизом
 
-- [ ] `sql/create_tables.sql` накачен, `recipes` существует, RLS
-      включён.
+- [ ] Все миграции из §1.2 накатаны (особенно `migration_rls_user_isolation.sql`).
+- [ ] Edge Function `telegram-auth` задеплоена, secrets заданы.
+- [ ] Railway: `SUPABASE_KEY` = **service_role**; Mini App: **anon** key.
 - [ ] `.env.example` ↔ фактические Variables в Railway — имена совпадают.
 - [ ] `requirements.txt` не содержит лишнего и собран на Railway без
       ошибок.

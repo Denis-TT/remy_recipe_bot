@@ -105,23 +105,59 @@ CREATE TRIGGER trg_recipes_set_updated_at
 -- --------------------------------------------------------------------
 -- Row Level Security
 -- --------------------------------------------------------------------
--- На этом этапе бот аутентифицируется Supabase anon-ключом, а проверка
--- принадлежности рецепта пользователю (`user_id`) делается в коде
--- (см. `delete_recipe`, фильтр `user_id=eq.X` во всех GET-запросах).
--- Политики ниже просто включают RLS и разрешают операции из
--- клиентского слоя; при переходе на auth.uid() их нужно будет сузить.
+-- Mini App получает JWT через Edge Function ``telegram-auth`` (Telegram
+-- initData → claim ``telegram_user_id``). Бот на Railway — service role,
+-- RLS не применяется. См. sql/migration_rls_user_isolation.sql и
+-- supabase/functions/telegram-auth/index.ts
 -- --------------------------------------------------------------------
+
+CREATE OR REPLACE FUNCTION public.remy_telegram_user_id()
+RETURNS BIGINT
+LANGUAGE sql
+STABLE
+SET search_path = public
+AS $$
+  SELECT NULLIF(
+    trim(
+      coalesce(
+        auth.jwt() ->> 'telegram_user_id',
+        auth.jwt() ->> 'sub'
+      )
+    ),
+    ''
+  )::bigint;
+$$;
+
 ALTER TABLE recipes ENABLE ROW LEVEL SECURITY;
 
 DROP POLICY IF EXISTS "Users can view own recipes"    ON recipes;
 DROP POLICY IF EXISTS "Users can insert own recipes"  ON recipes;
 DROP POLICY IF EXISTS "Users can update own recipes"  ON recipes;
 DROP POLICY IF EXISTS "Users can delete own recipes"  ON recipes;
+DROP POLICY IF EXISTS "Telegram users select own recipes" ON recipes;
+DROP POLICY IF EXISTS "Telegram users insert own recipes" ON recipes;
+DROP POLICY IF EXISTS "Telegram users update own recipes" ON recipes;
+DROP POLICY IF EXISTS "Telegram users delete own recipes" ON recipes;
 
-CREATE POLICY "Users can view own recipes"   ON recipes FOR SELECT USING (TRUE);
-CREATE POLICY "Users can insert own recipes" ON recipes FOR INSERT WITH CHECK (TRUE);
-CREATE POLICY "Users can update own recipes" ON recipes FOR UPDATE USING (TRUE);
-CREATE POLICY "Users can delete own recipes" ON recipes FOR DELETE USING (TRUE);
+CREATE POLICY "Telegram users select own recipes"
+    ON recipes FOR SELECT TO authenticated
+    USING (user_id = remy_telegram_user_id());
+
+CREATE POLICY "Telegram users insert own recipes"
+    ON recipes FOR INSERT TO authenticated
+    WITH CHECK (user_id = remy_telegram_user_id());
+
+CREATE POLICY "Telegram users update own recipes"
+    ON recipes FOR UPDATE TO authenticated
+    USING (user_id = remy_telegram_user_id())
+    WITH CHECK (user_id = remy_telegram_user_id());
+
+CREATE POLICY "Telegram users delete own recipes"
+    ON recipes FOR DELETE TO authenticated
+    USING (user_id = remy_telegram_user_id());
+
+REVOKE ALL ON recipes FROM anon;
+GRANT SELECT, INSERT, UPDATE, DELETE ON recipes TO authenticated;
 
 
 -- --------------------------------------------------------------------
@@ -146,15 +182,4 @@ CREATE POLICY "Public can read recipe images"
 ON storage.objects FOR SELECT
 USING (bucket_id = 'recipe-images');
 
-CREATE POLICY "Clients can upload recipe images"
-ON storage.objects FOR INSERT
-WITH CHECK (bucket_id = 'recipe-images');
-
-CREATE POLICY "Clients can update recipe images"
-ON storage.objects FOR UPDATE
-USING (bucket_id = 'recipe-images')
-WITH CHECK (bucket_id = 'recipe-images');
-
-CREATE POLICY "Clients can delete recipe images"
-ON storage.objects FOR DELETE
-USING (bucket_id = 'recipe-images');
+-- Запись в Storage — только service role (бот). Mini App читает по public URL.
