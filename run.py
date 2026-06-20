@@ -49,8 +49,8 @@ LOG_MAX_BYTES: int = 5 * 1024 * 1024  # 5 МБ
 LOG_BACKUP_COUNT: int = 3
 
 # Healthcheck HTTP-сервер.
+# Railway задаёт PORT — приложение обязано слушать его, иначе healthcheck не достучится.
 HEALTHCHECK_HOST: str = "0.0.0.0"
-HEALTHCHECK_PORT: int = 8081
 
 # Флаг «бот поднял polling» — выставляется из RemyBot.run().
 _bot_polling_ready: bool = False
@@ -61,6 +61,20 @@ LOG_DATEFMT: str = "%Y-%m-%d %H:%M:%S"
 
 
 logger = logging.getLogger("remy")
+
+
+def _resolve_healthcheck_port() -> int:
+    """Порт healthcheck: Railway `PORT`, иначе `HEALTHCHECK_PORT`, иначе 8081."""
+    raw = (os.getenv("PORT") or os.getenv("HEALTHCHECK_PORT") or "8081").strip()
+    try:
+        port = int(raw)
+    except ValueError:
+        logger.warning("⚠️ Некорректный PORT/HEALTHCHECK_PORT=%r, используем 8081", raw)
+        return 8081
+    if port <= 0 or port > 65535:
+        logger.warning("⚠️ PORT вне диапазона (%s), используем 8081", port)
+        return 8081
+    return port
 
 # Глобальные ссылки на освобождаемые ресурсы.
 _lock_file_handle: Optional[object] = None
@@ -335,6 +349,8 @@ class _HealthcheckHandler(BaseHTTPRequestHandler):
             payload = {"status": "ready" if ok else "degraded", "checks": detail}
             body = json.dumps(payload).encode("utf-8")
             code = 200 if ok else 503
+            if not ok:
+                logger.info("Healthcheck /ready degraded: %s", detail)
             self.send_response(code)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
@@ -359,12 +375,14 @@ def start_healthcheck_server() -> None:
     """
     global _healthcheck_server
 
+    port = _resolve_healthcheck_port()
+
     try:
-        server = HTTPServer((HEALTHCHECK_HOST, HEALTHCHECK_PORT), _HealthcheckHandler)
+        server = HTTPServer((HEALTHCHECK_HOST, port), _HealthcheckHandler)
     except OSError as exc:
         logger.warning(
             "⚠️  Не удалось запустить healthcheck на порту %d: %s",
-            HEALTHCHECK_PORT,
+            port,
             exc,
         )
         return
@@ -378,7 +396,10 @@ def start_healthcheck_server() -> None:
     )
     thread.start()
 
-    logger.info("🌐 Healthcheck запущен на порту %d", HEALTHCHECK_PORT)
+    logger.info(
+        "🌐 Healthcheck на 0.0.0.0:%d (/health — liveness, /ready — bot+Supabase)",
+        port,
+    )
 
 
 def stop_healthcheck_server() -> None:
