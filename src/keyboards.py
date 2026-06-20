@@ -272,10 +272,11 @@ def back_to_menu_keyboard() -> InlineKeyboardMarkup:
 
 
 def welcome_start_keyboard() -> InlineKeyboardMarkup:
-    """Кнопки приветствия /start: пример и инструкция."""
+    """Кнопки приветствия /start: пример, инструкция, своя ссылка."""
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🔥 Протестировать пример", callback_data="run_example_test")],
         [InlineKeyboardButton("📖 Инструкция и лимиты", callback_data="show_tutorial_info")],
+        [InlineKeyboardButton("🔗 Отправить свою ссылку", callback_data="prompt_own_link")],
     ])
 
 

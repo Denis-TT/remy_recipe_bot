@@ -11,6 +11,7 @@
     show_help           — показать текст помощи
     run_example_test    — запустить эталонный пример рецепта из /start
     show_tutorial_info  — инструкция и лимиты (онбординг)
+    prompt_own_link     — подсказка: вставить свою ссылку в чат
     go_to_start         — вернуться к приветствию /start
     feedback            — быстрая форма обратной связи
     dishtype_{dish_type} — показать основные ингредиенты внутри типа блюда
@@ -103,6 +104,14 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             query,
             commands.WELCOME_TEXT,
             reply_markup=welcome_start_keyboard(),
+        )
+        return
+
+    if data == "prompt_own_link":
+        await _safe_edit(
+            query,
+            commands.OWN_LINK_PROMPT_TEXT,
+            reply_markup=tutorial_back_keyboard(),
         )
         return
 
@@ -235,6 +244,13 @@ async def _callback_run_example_test(
         pass
 
     logger.info("🔥 run_example_test: user %s, url %s", user_id, url)
+
+    await message.reply_text(
+        commands.format_example_simulation_text(url),
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=False,
+    )
+
     from .messages import _handle_url
 
     await _handle_url(message, context, user_id, url, skip_rate_limit=True)
