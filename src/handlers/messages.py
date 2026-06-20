@@ -42,6 +42,8 @@ from ..keyboards import (
 )
 from ..normalizer import MAX_IMAGE_BYTES
 from ..localization import Localization
+from ..recipe_vault import VaultFailureError, VaultPipelineResult
+from ..recipe_vault.models import VaultFailureHit, VaultRecipeHit
 from ..ytdlp_mixin import VideoPolicyError
 from . import callbacks, commands
 
@@ -758,31 +760,6 @@ async def _handle_text_recipe(
 # URL-пайплайн
 # --------------------------------------------------------------------------- #
 
-def _url_processing_key(url: str, source_type: str) -> str:
-    """Ключ для дедупликации: shortcode Instagram или нормализованный URL."""
-    if source_type == "instagram":
-        from ..parser import InstagramParser
-
-        shortcode = InstagramParser._extract_shortcode(url)
-        if shortcode:
-            return f"ig:{shortcode}"
-    if source_type in ("youtube", "tiktok", "vk"):
-        from ..parser import TikTokParser, VkVideoParser, YouTubeParser
-
-        if source_type == "youtube":
-            vid = YouTubeParser._extract_youtube_video_id(url)
-            if vid:
-                return f"yt:{vid}"
-        elif source_type == "vk":
-            vid = VkVideoParser._extract_video_id(url)
-            if vid:
-                return f"vk:{vid}"
-        else:
-            normalized = url.strip().lower().rstrip("/")
-            return f"tt:{normalized}"
-    return url.strip().lower().rstrip("/")
-
-
 async def _handle_url(
     message: Message,
     context: ContextTypes.DEFAULT_TYPE,
@@ -818,16 +795,29 @@ async def _handle_url(
 
     src_parser = bot.parser.get_parser(url)
     source_type = getattr(src_parser, "source_type", "") if src_parser else ""
-    job_key = _url_processing_key(url, source_type)
+    cache_key = bot.recipe_vault.cache_key_for(url, source_type)
+    job_key = cache_key
 
     bot.processing_urls[user_id] = job_key
     if not skip_rate_limit:
         bot.url_rate_limiter.record(user_id)
 
-    status: Message = await message.reply_text("⏳ Запускаю обработку…")
+    vault_lookup = await bot.recipe_vault.lookup(cache_key)
+    if isinstance(vault_lookup, VaultFailureHit):
+        await message.reply_text(f"❌ {_html_escape(vault_lookup.reason)}")
+        bot.processing_urls.pop(user_id, None)
+        return
+
+    from_vault = isinstance(vault_lookup, VaultRecipeHit)
+    if from_vault:
+        status: Message = await message.reply_text("⚡ Рецепт из базы Remy…")
+    else:
+        status = await message.reply_text("⏳ Запускаю обработку…")
+
     is_video = source_type in _VIDEO_SOURCE_TYPES
     progress = RecipeProgress(status, video=is_video, source_type=source_type)
-    await progress.start()
+    if not from_vault:
+        await progress.start()
 
     async def _on_parser_progress(stage: str, detail: str = "") -> None:
         step_id = _VIDEO_PARSER_STAGE_TO_STEP.get(stage, stage)
@@ -838,8 +828,7 @@ async def _handle_url(
         else:
             await progress.set_stage(step_id)
 
-    try:
-        # 1) Парсинг
+    async def _run_pipeline() -> VaultPipelineResult:
         try:
             if is_video:
                 await progress.set_stage("metadata")
@@ -852,17 +841,20 @@ async def _handle_url(
             raw_text = parsed.text
         except VideoPolicyError as exc:
             logger.info("ℹ️ Ограничение по видео: %s", exc)
-            await _safe_edit(status, f"❌ {_html_escape(str(exc))}")
-            return
-        except Exception as exc:  # noqa: BLE001 — логируем любую причину
+            raise VaultFailureError(str(exc), reason=str(exc)) from exc
+        except Exception as exc:  # noqa: BLE001
             logger.error("❌ Ошибка обработки URL: %s", exc)
-            await _safe_edit(status, f"❌ Не удалось прочитать страницу:\n<code>{_html_escape(str(exc))}</code>")
-            return
+            raise VaultFailureError(
+                f"Не удалось прочитать страницу: {exc}",
+                reason=str(exc),
+            ) from exc
 
         if not raw_text or not raw_text.strip():
             logger.warning("⚠️  Пустой текст после парсинга: %s", url)
-            await _safe_edit(status, "❌ Со страницы не удалось извлечь текст")
-            return
+            raise VaultFailureError(
+                "Со страницы не удалось извлечь текст",
+                reason="empty_parse",
+            )
 
         from ..parser import attach_recipe_image
 
@@ -879,9 +871,7 @@ async def _handle_url(
                 storage=bot.storage,
             )
 
-        # 2) Нормализация
         await progress.set_stage("normalize")
-
         try:
             recipe = await bot.normalizer.normalize(
                 recipe_data["raw_text"],
@@ -889,10 +879,11 @@ async def _handle_url(
             )
         except Exception as exc:  # noqa: BLE001
             logger.error("❌ Ошибка нормализации: %s", exc)
-            await _safe_edit(status, f"❌ Не удалось обработать рецепт:\n<code>{_html_escape(str(exc))}</code>")
-            return
+            raise VaultFailureError(
+                f"Не удалось обработать рецепт: {exc}",
+                reason=str(exc),
+            ) from exc
 
-        # 3) Валидация: нужны хотя бы title + ingredients
         title_ok = bool((recipe.get("title") or "").strip())
         ingredients_ok = bool(recipe.get("ingredients"))
         if not (title_ok and ingredients_ok):
@@ -901,31 +892,60 @@ async def _handle_url(
                 title_ok,
                 ingredients_ok,
             )
-            await _safe_edit(
-                status,
-                "❌ Не удалось распознать рецепт на этой странице.\n"
-                "Попробуй другую ссылку.",
+            raise VaultFailureError(
+                "Не удалось распознать рецепт на этой странице.\nПопробуй другую ссылку.",
+                reason="validation_failed",
             )
-            return
 
-        # 4) Сохраняем во временный кэш и показываем пользователю
+        img_pub = str(recipe_data.get("image_url") or "").strip()
+        if img_pub.startswith(("http://", "https://")):
+            recipe["image_url"] = img_pub
+
+        recipe.pop("image_path", None)
+        return VaultPipelineResult(
+            recipe=recipe,
+            raw_text=raw_text.strip(),
+            image_url=img_pub,
+            source_type=source_type,
+        )
+
+    try:
+        if from_vault and vault_lookup is not None:
+            assert isinstance(vault_lookup, VaultRecipeHit)
+            recipe = dict(vault_lookup.recipe)
+        else:
+            try:
+                pipeline = await bot.recipe_vault.coalesce(
+                    cache_key,
+                    source_url=url,
+                    source_type=source_type,
+                    factory=_run_pipeline,
+                )
+            except VaultFailureError as exc:
+                await _safe_edit(
+                    status,
+                    f"❌ {_html_escape(exc.user_message)}",
+                )
+                return
+            recipe = dict(pipeline.recipe)
+
         recipe["source_url"] = url
-        if recipe_data.get("image_path"):
-            recipe["image_path"] = recipe_data["image_path"]
-        img_pub = recipe_data.get("image_url")
-        if img_pub and str(img_pub).startswith(("http://", "https://")):
-            recipe["image_url"] = str(img_pub).strip()
+        img_vault = str(recipe.get("image_url") or "").strip()
+        if img_vault.startswith(("http://", "https://")):
+            recipe["image_url"] = img_vault
 
         bot.temp_recipes[user_id] = {"recipe": recipe, "timestamp": time.time()}
         bot.cleanup_expired_temp_recipes()
 
         logger.info(
-            "✅ Рецепт обработан: «%s», meal_type=%s",
+            "✅ Рецепт обработан%s: «%s», meal_type=%s",
+            " (Recipe Vault)" if from_vault else "",
             recipe.get("title"),
             recipe.get("meal_type"),
         )
 
-        await progress.set_stage("present")
+        if not from_vault:
+            await progress.set_stage("present")
         await _present_recipe_with_optional_photo(message, status, recipe, bot)
     finally:
         if bot.processing_urls.get(user_id) == job_key:

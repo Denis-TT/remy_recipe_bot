@@ -47,6 +47,7 @@ from .localization import Localization
 from .normalizer import RecipeNormalizer
 from .parser import InstagramParser, ParserRegistry, create_parser_registry, ensure_images_dir
 from .rate_limit import UserRateLimiter
+from .recipe_vault import RecipeVault, VaultFailureError, VaultPipelineResult
 from .ytdlp_mixin import YtdlpWhisperMixin
 from .storage import SupabaseStorage
 
@@ -97,6 +98,7 @@ class RemyBot:
             self.config.supabase_url,
             self.config.supabase_key,
         )
+        self.recipe_vault: RecipeVault = RecipeVault(self.storage, self.config)
         self.temp_recipes: Dict[int, Dict[str, Any]] = {}
         # user_id → ключ обрабатываемой ссылки (shortcode Instagram или URL),
         # чтобы не запускать два тяжёлых Whisper-процесса на один Reels.

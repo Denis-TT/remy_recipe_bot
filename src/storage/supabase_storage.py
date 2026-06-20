@@ -18,6 +18,7 @@ import json
 import logging
 import os
 import uuid
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 import aiohttp
@@ -500,6 +501,83 @@ class SupabaseStorage(BaseStorage):
         except aiohttp.ClientError as exc:
             logger.error("Ошибка загрузки изображения в Storage: %s", exc)
             return None
+
+    # ------------------------------------------------------------------ #
+    # Recipe Vault (глобальный кэш URL → рецепт)
+    # ------------------------------------------------------------------ #
+
+    async def vault_get(self, cache_key: str) -> Optional[Dict[str, Any]]:
+        """Получить запись Vault по ``cache_key`` или ``None``."""
+        key = (cache_key or "").strip()
+        if not key:
+            return None
+        try:
+            _, body = await self._request(
+                "GET",
+                "/recipe_vault",
+                params={
+                    "cache_key": f"eq.{key}",
+                    "select": "*",
+                    "limit": "1",
+                },
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("⚠️ recipe_vault GET: %s", exc)
+            return None
+
+        rows = self._parse_json_body(body)
+        if not isinstance(rows, list) or not rows:
+            return None
+        row = rows[0]
+        return row if isinstance(row, dict) else None
+
+    async def vault_upsert(self, payload: Mapping[str, Any]) -> None:
+        """INSERT или UPDATE записи Vault (merge по ``cache_key``)."""
+        await self._request(
+            "POST",
+            "/recipe_vault",
+            json_body=dict(payload),
+            extra_headers={
+                "Prefer": "resolution=merge-duplicates,return=minimal",
+            },
+        )
+
+    async def vault_bump_hit(
+        self,
+        cache_key: str,
+        *,
+        promote_at: int,
+    ) -> Optional[Dict[str, Any]]:
+        """Увеличить ``hit_count``; при достижении порога — tier ``golden`` навсегда."""
+        row = await self.vault_get(cache_key)
+        if row is None:
+            return None
+
+        new_hits = int(row.get("hit_count") or 0) + 1
+        patch: Dict[str, Any] = {
+            "hit_count": new_hits,
+            "last_hit_at": datetime.now(timezone.utc).isoformat(),
+        }
+        if new_hits >= max(1, int(promote_at)):
+            patch["tier"] = "golden"
+            patch["expires_at"] = None
+
+        try:
+            _, body = await self._request(
+                "PATCH",
+                "/recipe_vault",
+                params={"cache_key": f"eq.{cache_key}"},
+                json_body=patch,
+                extra_headers={"Prefer": "return=representation"},
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("⚠️ recipe_vault bump_hit: %s", exc)
+            return row
+
+        rows = self._parse_json_body(body)
+        if isinstance(rows, list) and rows and isinstance(rows[0], dict):
+            return rows[0]
+        return {**row, **patch}
 
     # ------------------------------------------------------------------ #
     # Внутренности: HTTP

@@ -68,6 +68,11 @@ class Config:
     max_concurrent_video_jobs: int = 3
     # Эталонная ссылка для кнопки «Протестировать пример» в /start.
     example_test_url: str = "https://www.youtube.com/watch?v=8h0b_bQc9Vg"
+    # Recipe Vault: глобальная база URL → рецепт.
+    vault_enabled: bool = True
+    vault_draft_ttl_days: int = 90
+    vault_promote_hits: int = 2
+    vault_failure_ttl_hours: int = 12
 
     @property
     def is_development(self) -> bool:
@@ -180,6 +185,28 @@ class Config:
             "https://www.youtube.com/watch?v=8h0b_bQc9Vg",
         ).strip()
 
+        vault_enabled = os.getenv("VAULT_ENABLED", "true").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        vault_draft_ttl_days = cls._parse_positive_int(
+            os.getenv("VAULT_DRAFT_TTL_DAYS", "90"),
+            default=90,
+            name="VAULT_DRAFT_TTL_DAYS",
+        )
+        vault_promote_hits = cls._parse_positive_int(
+            os.getenv("VAULT_PROMOTE_HITS", "2"),
+            default=2,
+            name="VAULT_PROMOTE_HITS",
+        )
+        vault_failure_ttl_hours = cls._parse_positive_int(
+            os.getenv("VAULT_FAILURE_TTL_HOURS", "12"),
+            default=12,
+            name="VAULT_FAILURE_TTL_HOURS",
+        )
+
         environment = os.getenv("ENVIRONMENT", "production").strip().lower() or "production"
         if environment not in _ALLOWED_ENVIRONMENTS:
             print(
@@ -210,6 +237,10 @@ class Config:
             max_video_duration_seconds=max_video_duration_seconds,
             max_concurrent_video_jobs=max_concurrent_video_jobs,
             example_test_url=example_test_url,
+            vault_enabled=vault_enabled,
+            vault_draft_ttl_days=vault_draft_ttl_days,
+            vault_promote_hits=vault_promote_hits,
+            vault_failure_ttl_hours=vault_failure_ttl_hours,
         )
 
     @staticmethod
