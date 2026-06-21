@@ -49,13 +49,17 @@
             --shadow-md: 0 1px 3px rgba(0, 0, 0, 0.06),
                          0 1px 2px rgba(0, 0, 0, 0.04);
 
-            --safe-top: env(safe-area-inset-top, 0px);
-            --safe-bottom: env(safe-area-inset-bottom, 0px);
-            /* Telegram WebApp: сумма content + device safe area (задаётся из JS). */
+            /* Telegram WebApp: safeArea + contentSafeArea (только JS, без дубля env). */
             --tg-inset-top: 0px;
             --tg-inset-bottom: 0px;
-            --app-pad-top: calc(12px + var(--tg-inset-top) + var(--safe-top));
-            --app-pad-bottom: calc(24px + var(--tg-inset-bottom) + var(--safe-bottom));
+            --app-pad-top: calc(8px + var(--tg-inset-top));
+            --app-pad-bottom: calc(20px + var(--tg-inset-bottom));
+        }
+
+        /* Браузер без Telegram SDK — только env(safe-area). */
+        html:not([data-tg-app]) #app {
+            --app-pad-top: calc(8px + env(safe-area-inset-top, 0px));
+            --app-pad-bottom: calc(20px + env(safe-area-inset-bottom, 0px));
         }
 
         [data-theme="dark"] {
@@ -1072,34 +1076,30 @@
             }
         }
 
-        /** Сумма safeAreaInset + contentSafeAreaInset (документация Telegram Bot API 8.0+). */
+        /** Сумма safeAreaInset + contentSafeAreaInset (Telegram Bot API 8.0+). */
         function applyTelegramInsets() {
             var insetTop = 0;
             var insetBottom = 0;
 
             if (tg) {
+                document.documentElement.setAttribute("data-tg-app", "1");
                 var c = tg.contentSafeAreaInset || {};
                 var s = tg.safeAreaInset || {};
                 insetTop = (Number(c.top) || 0) + (Number(s.top) || 0);
                 insetBottom = (Number(c.bottom) || 0) + (Number(s.bottom) || 0);
-            }
 
-            // CSS-переменные, которые Telegram инжектит в html (fallback / дубль JS).
-            insetTop = Math.max(
-                insetTop,
-                readCssPx("--tg-content-safe-area-inset-top") + readCssPx("--tg-safe-area-inset-top")
-            );
-            insetBottom = Math.max(
-                insetBottom,
-                readCssPx("--tg-content-safe-area-inset-bottom") + readCssPx("--tg-safe-area-inset-bottom")
-            );
+                insetTop = Math.max(
+                    insetTop,
+                    readCssPx("--tg-content-safe-area-inset-top") + readCssPx("--tg-safe-area-inset-top")
+                );
+                insetBottom = Math.max(
+                    insetBottom,
+                    readCssPx("--tg-content-safe-area-inset-bottom") + readCssPx("--tg-safe-area-inset-bottom")
+                );
 
-            // Мобильный fullscreen: плавающая шапка TG (Close / Back) — insets иногда занижены.
-            if (tg) {
-                var platform = String(tg.platform || "").toLowerCase();
-                var minTop = platform === "ios" ? 100 : platform === "android" ? 84 : 76;
-                if (tg.isFullscreen || tg.isExpanded !== false) {
-                    insetTop = Math.max(insetTop, minTop);
+                // Fallback только если API вернул 0 (иначе на 14 Pro получается двойной отступ).
+                if (insetTop < 40) {
+                    insetTop = 52;
                 }
             }
 
