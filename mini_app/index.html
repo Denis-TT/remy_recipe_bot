@@ -1630,12 +1630,43 @@
         }
 
         function formatTime(mins) {
-            const m = Number(mins) || 0;
+            const m = Math.max(0, Number(mins) || 0);
             if (!m) return null;
             if (m < 60) return m + " мин";
-            const h = Math.floor(m / 60);
-            const rem = m % 60;
-            return rem ? h + " ч " + rem + " мин" : h + " ч";
+            const days = Math.floor(m / 1440);
+            let rem = m % 1440;
+            const h = Math.floor(rem / 60);
+            const mm = rem % 60;
+            const parts = [];
+            if (days) parts.push(days + " сут");
+            if (h) parts.push(h + " ч");
+            if (mm && (!days || mm > 0)) parts.push(mm + " мин");
+            return parts.join(" ") || null;
+        }
+
+        function formatRecipeTimes(recipe) {
+            const prep = Number(recipe.prep_time) || 0;
+            const cook = Number(recipe.cook_time) || 0;
+            const totalRaw = Number(recipe.total_time) || 0;
+            const active = prep + cook;
+            const total = totalRaw > 0 ? totalRaw : active;
+            if (!total) return [];
+            const totalLabel = formatTime(total);
+            const activeLabel = formatTime(active);
+            if (total > active && active > 0) {
+                return [
+                    { icon: "⏱", label: "Общее: " + totalLabel },
+                    { icon: "👨‍🍳", label: "У плиты: " + activeLabel }
+                ];
+            }
+            return [{ icon: "⏱", label: totalLabel }];
+        }
+
+        function isGenericNutritionNote(note, estimated) {
+            if (!note || !estimated) return false;
+            const low = note.toLowerCase();
+            return low.indexOf("калорийност") >= 0 && low.indexOf("бжу") >= 0 && low.indexOf("оцен") >= 0
+                || (low.indexOf("типичн") >= 0 && low.indexOf("ингредиент") >= 0);
         }
 
         function nutritionPerServing(recipe) {
@@ -1829,8 +1860,10 @@
                 const nut = nutritionPerServing(r);
                 const cal = nut && (Number(nut.calories) || 0);
                 const metaParts = [];
-                const totalLabel = formatTime(total);
-                if (totalLabel) metaParts.push(el("span", {}, ["⏱ " + totalLabel]));
+                const cardTimeLabel = formatTime(total);
+                if (cardTimeLabel) {
+                    metaParts.push(el("span", {}, ["⏱ " + cardTimeLabel]));
+                }
                 if (cal) metaParts.push(el("span", {}, ["🔥 " + cal + " ккал"]));
                 if (r.difficulty) {
                     metaParts.push(el("span", {}, [diffEmoji(r.difficulty) + " " + diffName(r.difficulty)]));
@@ -2003,9 +2036,9 @@
                     [diffEmoji(r.difficulty) + " " + diffName(r.difficulty)]));
             }
             const totalLabel = formatTime(r.total_time);
-            if (totalLabel) {
-                badges.appendChild(el("div", { class: "badge" }, ["⏱ " + totalLabel]));
-            }
+            formatRecipeTimes(r).forEach(function (tb) {
+                badges.appendChild(el("div", { class: "badge" }, [tb.icon + " " + tb.label]));
+            });
             const servings = Number(r.servings) || 0;
             if (servings) {
                 badges.appendChild(el("div", { class: "badge" },
@@ -2014,8 +2047,10 @@
             if (badges.childNodes.length) screen.appendChild(badges);
 
             // 4. КБЖУ на порцию — компактная сетка 4 колонки или пояснение.
-            const nutritionNote = String(r.nutrition_note || "").trim();
+            const nutritionNoteRaw = String(r.nutrition_note || "").trim();
             const nutritionEstimated = !!r.nutrition_estimated;
+            const nutritionNote = isGenericNutritionNote(nutritionNoteRaw, nutritionEstimated)
+                ? "" : nutritionNoteRaw;
             const nut = nutritionPerServing(r) || {};
             const hasNutrition = ["calories", "protein", "fat", "carbs"]
                 .some(function (k) { return Number(nut[k]) > 0; });
@@ -2030,10 +2065,6 @@
                 screen.appendChild(noteBlock);
             } else if (hasNutrition) {
                 const grid = el("div", { class: "nutrition" });
-                if (nutritionEstimated) {
-                    const est = el("p", { class: "nutrition-est-hint" }, ["Примерный расчёт (~)"]);
-                    grid.appendChild(est);
-                }
                 [
                     { v: nut.calories, l: "ккал",     e: "🔥" },
                     { v: nut.protein,  l: "белки, г", e: "💪" },

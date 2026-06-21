@@ -40,6 +40,11 @@ from typing import Any, Dict, List, Optional
 import aiohttp
 
 from .localization import Localization
+from .recipe_metrics import (
+    normalize_recipe_times,
+    refine_servings,
+    strip_redundant_nutrition_note,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -70,9 +75,23 @@ SYSTEM_PROMPT = """\
 - Если граммовки частичные, «на глаз» или неполные — дайте обоснованную ОЦЕНКУ КБЖУ: \
 nutrition_estimated=true, nutrition_calculable=false, заполните nutrition_* оценочными значениями. \
 - Если оценить нельзя (нет состава) — нули, nutrition_estimated=false, nutrition_calculable=false.
-4. ФИЛЬТРАЦИЯ РЕЧЕВЫХ АРТЕФАКТОВ: Игнорируйте звуки-паразиты, шутки автора; исправляйте \
+- nutrition_note заполняйте ТОЛЬКО если КБЖУ посчитать невозможно вовсе; для оценочных \
+цифр nutrition_note оставляйте пустым (достаточно nutrition_estimated=true).
+4. ВРЕМЯ (все поля — в МИНУТАХ):
+- prep_time: активная подготовка (нарезка, замес, смешивание, формовка) — БЕЗ пассивного \
+ожидания (расстойка, маринад, охлаждение в холодильнике).
+- cook_time: активная готовка с контролем — у плиты, в духовке, на пару (варка, жарка, выпечка).
+- total_time: полное календарное время от начала до подачи, ВКЛЮЧАЯ все пассивные паузы \
+(расстойка 72 ч = 4320 мин, маринование, охлаждение) плюс активные этапы.
+- total_time >= prep_time + cook_time. Пример хлеба: prep 40, cook 45, total 4365 (72 ч расстой + 85 мин).
+5. ПОРЦИИ (servings):
+- Если в источнике указано число порций — используйте его.
+- Иначе оцените по суммарному весу ингредиентов и типу блюда (ориентир USDA RACC: \
+суп ~245 г/порция, основное ~250 г, гарнир/салат ~120–140 г, закуска ~85 г, \
+десерт/выпечка ~75–120 г, напиток ~250 мл). Округляйте до разумного целого (1–12).
+6. ФИЛЬТРАЦИЯ РЕЧЕВЫХ АРТЕФАКТОВ: Игнорируйте звуки-паразиты, шутки автора; исправляйте \
 ошибки распознавания аудио (например, «столёная соль» → «соль»).
-5. СЕКРЕТЫ ШЕФА: Обязательно выносите в шаги важные технологические предупреждения автора \
+7. СЕКРЕТЫ ШЕФА: Обязательно выносите в шаги важные технологические предупреждения автора \
 («мешать только деревянной лопаткой», «насухо вытереть ягоды», «срезать специи с корочки»).
 
 ФОРМАТ ВЫВОДА:
@@ -667,20 +686,14 @@ class RecipeNormalizer:
         data["description"] = str(data.get("description") or "").strip()
 
         # ---- времена ----
-        prep_time = self._to_int(data.get("prep_time"), default=0)
-        cook_time = self._to_int(data.get("cook_time"), default=0)
-        total_time = self._to_int(data.get("total_time"), default=0)
-        if total_time <= 0:
-            total_time = prep_time + cook_time
-        data["prep_time"] = max(prep_time, 0)
-        data["cook_time"] = max(cook_time, 0)
-        data["total_time"] = max(total_time, 0)
-
-        # ---- порции ----
-        servings = self._to_int(data.get("servings"), default=0)
-        if servings <= 0:
-            servings = 4
-        data["servings"] = servings
+        prep_time, cook_time, total_time = normalize_recipe_times(
+            self._to_int(data.get("prep_time"), default=0),
+            self._to_int(data.get("cook_time"), default=0),
+            self._to_int(data.get("total_time"), default=0),
+        )
+        data["prep_time"] = prep_time
+        data["cook_time"] = cook_time
+        data["total_time"] = total_time
 
         # ---- ingredients ----
         ingredients = data.get("ingredients")
@@ -699,12 +712,24 @@ class RecipeNormalizer:
         data["steps"] = [self._normalize_step(s, i) for i, s in enumerate(steps, 1)]
         self._replace_steps_if_not_actionable(data)
 
+        # ---- порции (после нормализации ингредиентов) ----
+        data["servings"] = refine_servings(
+            data.get("ingredients") or [],
+            dish_type=str(data.get("dish_type") or "main"),
+            meal_type=str(data.get("meal_type") or "other"),
+            raw_text=raw_text,
+            ai_servings=self._to_int(data.get("servings"), default=0),
+        )
+
         # ---- nutrition ----
         data["nutrition_per_serving"] = self._normalize_nutrition(
             data.get("nutrition_per_serving")
         )
         data["nutrition"] = self._normalize_nutrition(data.get("nutrition"))
-        data["nutrition_note"] = str(data.get("nutrition_note") or "").strip()
+        data["nutrition_note"] = strip_redundant_nutrition_note(
+            str(data.get("nutrition_note") or "").strip(),
+            estimated=bool(data.get("nutrition_estimated")),
+        )
         data["nutrition_estimated"] = bool(data.get("nutrition_estimated", False))
         self._apply_nutrition_policy(data)
         data.pop("nutrition_calculable", None)
@@ -839,13 +864,13 @@ class RecipeNormalizer:
         if calculable is False or estimated:
             data["nutrition_estimated"] = True
             data["nutrition_calculable"] = False
-            if not note:
-                data["nutrition_note"] = ""
+            data["nutrition_note"] = strip_redundant_nutrition_note(note, estimated=True)
         elif calculable is True and has_numbers:
             data["nutrition_estimated"] = False
             data["nutrition_note"] = ""
         elif has_numbers:
             data["nutrition_estimated"] = estimated
+            data["nutrition_note"] = strip_redundant_nutrition_note(note, estimated=estimated)
         else:
             data["nutrition_estimated"] = False
             data["nutrition_note"] = ""

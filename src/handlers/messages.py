@@ -989,9 +989,7 @@ async def _handle_url(
             bot.processing_urls.pop(user_id, None)
 
 
-# --------------------------------------------------------------------------- #
-# Форматирование рецепта
-# --------------------------------------------------------------------------- #
+from ..recipe_metrics import format_duration_minutes, format_recipe_time_lines, strip_redundant_nutrition_note
 
 def _nutrition_num(value: Any, *, estimated: bool) -> str:
     n = _int(value)
@@ -1040,18 +1038,20 @@ def format_recipe(recipe: Mapping[str, Any], bot: "RemyBot") -> str:
     prep = _int(recipe.get("prep_time"))
     cook = _int(recipe.get("cook_time"))
     total = _int(recipe.get("total_time"))
-    if prep or cook or total:
-        lines.extend([
-            "",
-            f"⏰ Время: подготовка {prep} мин, готовка {cook} мин, всего {total} мин",
-        ])
+    time_lines = format_recipe_time_lines(prep, cook, total)
+    if time_lines:
+        lines.append("")
+        lines.extend(time_lines)
 
     servings = _int(recipe.get("servings"))
     if servings:
         lines.append(f"👥 Порций: {servings}")
 
     # --- КБЖУ ---------------------------------------------------------------
-    nutrition_note = str(recipe.get("nutrition_note") or "").strip()
+    nutrition_note = strip_redundant_nutrition_note(
+        str(recipe.get("nutrition_note") or "").strip(),
+        estimated=bool(recipe.get("nutrition_estimated")),
+    )
     nutrition_estimated = bool(recipe.get("nutrition_estimated"))
     nutrition = recipe.get("nutrition_per_serving") or {}
     if nutrition_note and not (
@@ -1065,10 +1065,9 @@ def format_recipe(recipe: Mapping[str, Any], bot: "RemyBot") -> str:
         fat = _int(nutrition.get("fat"))
         carbs = _int(nutrition.get("carbs"))
         if cal or protein or fat or carbs:
-            est_label = " (примерно)" if nutrition_estimated else ""
             lines.extend([
                 "",
-                f"📊 КБЖУ на порцию{est_label}:",
+                "📊 КБЖУ на порцию:",
                 (
                     f"🔥 {_nutrition_num(cal, estimated=nutrition_estimated)} ккал | "
                     f"💪 {_nutrition_num(protein, estimated=nutrition_estimated)} г | "
@@ -1076,7 +1075,7 @@ def format_recipe(recipe: Mapping[str, Any], bot: "RemyBot") -> str:
                     f"🍚 {_nutrition_num(carbs, estimated=nutrition_estimated)} г"
                 ),
             ])
-            if nutrition_note:
+            if nutrition_note and not nutrition_estimated:
                 lines.append(_html_escape(nutrition_note))
 
     # --- Ингредиенты --------------------------------------------------------
@@ -1190,9 +1189,11 @@ def _public_image_url(recipe: Mapping[str, Any]) -> str:
 def _shared_meta_line(recipe: Mapping[str, Any], loc: Localization) -> str:
     cuisine = loc.get_cuisine_name(recipe.get("cuisine") or "other")
     dish = loc.get_dish_type_display(recipe.get("dish_type") or "main")
-    total = _int(recipe.get("total_time"))
     nutrition = recipe.get("nutrition_per_serving") or {}
-    nutrition_note = str(recipe.get("nutrition_note") or "").strip()
+    nutrition_note = strip_redundant_nutrition_note(
+        str(recipe.get("nutrition_note") or "").strip(),
+        estimated=bool(recipe.get("nutrition_estimated")),
+    )
     calories = _int(nutrition.get("calories")) if isinstance(nutrition, Mapping) else 0
 
     parts: List[str] = []
@@ -1200,12 +1201,14 @@ def _shared_meta_line(recipe: Mapping[str, Any], loc: Localization) -> str:
         parts.append(f"🍽 {cuisine}")
     if dish:
         parts.append(f"📋 {dish}")
-    if total:
-        parts.append(f"⏱ {total} мин")
+    total_label = format_duration_minutes(_int(recipe.get("total_time")))
+    if total_label:
+        parts.append(f"⏱ {total_label}")
     if nutrition_note:
         parts.append("📊 КБЖУ: см. карточку")
     elif calories:
-        parts.append(f"🔥 {calories} ккал/порция")
+        est = "~" if recipe.get("nutrition_estimated") else ""
+        parts.append(f"🔥 {est}{calories} ккал/порция")
     return " | ".join(parts)
 
 
