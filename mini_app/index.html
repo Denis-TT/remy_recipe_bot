@@ -1076,30 +1076,40 @@
             }
         }
 
-        /** Сумма safeAreaInset + contentSafeAreaInset (Telegram Bot API 8.0+). */
+        /** Отступы под режим Telegram: fullscreen vs fullsize (expanded с шапкой TG). */
         function applyTelegramInsets() {
             var insetTop = 0;
             var insetBottom = 0;
 
             if (tg) {
                 document.documentElement.setAttribute("data-tg-app", "1");
+                var isFullscreen = tg.isFullscreen === true;
+                document.documentElement.setAttribute(
+                    "data-tg-mode",
+                    isFullscreen ? "fullscreen" : "fullsize"
+                );
+
                 var c = tg.contentSafeAreaInset || {};
                 var s = tg.safeAreaInset || {};
-                insetTop = (Number(c.top) || 0) + (Number(s.top) || 0);
-                insetBottom = (Number(c.bottom) || 0) + (Number(s.bottom) || 0);
+                var contentTop = Number(c.top) || 0;
+                var contentBottom = Number(c.bottom) || 0;
+                var safeTop = Number(s.top) || 0;
+                var safeBottom = Number(s.bottom) || 0;
 
-                insetTop = Math.max(
-                    insetTop,
-                    readCssPx("--tg-content-safe-area-inset-top") + readCssPx("--tg-safe-area-inset-top")
-                );
-                insetBottom = Math.max(
-                    insetBottom,
-                    readCssPx("--tg-content-safe-area-inset-bottom") + readCssPx("--tg-safe-area-inset-bottom")
-                );
+                contentTop = Math.max(contentTop, readCssPx("--tg-content-safe-area-inset-top"));
+                contentBottom = Math.max(contentBottom, readCssPx("--tg-content-safe-area-inset-bottom"));
+                safeTop = Math.max(safeTop, readCssPx("--tg-safe-area-inset-top"));
+                safeBottom = Math.max(safeBottom, readCssPx("--tg-safe-area-inset-bottom"));
 
-                // Fallback только если API вернул 0 (иначе на 14 Pro получается двойной отступ).
-                if (insetTop < 40) {
-                    insetTop = 52;
+                if (isFullscreen) {
+                    // Плавающие Close/Back — нужны оба inset.
+                    insetTop = contentTop + safeTop;
+                    insetBottom = contentBottom + safeBottom;
+                    if (insetTop < 40) insetTop = 52;
+                } else {
+                    // Fullsize: шапка TG уже над webview, safe area не дублируем.
+                    insetTop = 0;
+                    insetBottom = 0;
                 }
             }
 
