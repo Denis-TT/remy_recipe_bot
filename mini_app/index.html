@@ -22,6 +22,24 @@
             --accent-hover: #1f9cd9;
             --border: #e0e0e0;
             --danger: #ff3b30;
+            --on-accent: #ffffff;
+
+            --btn-secondary-bg: #e8e8ed;
+            --btn-secondary-text: #3a3a3c;
+            --btn-secondary-bg-active: #dcdce0;
+            --hero-gradient: linear-gradient(135deg, #f5f7fa 0%, #e8ecf3 100%);
+            --hero-photo-bg: #e8ecf3;
+            --skeleton-bg: #e8ecf3;
+            --tips-bg: #fffbe6;
+            --tips-border: #ffd633;
+            --tips-text: #6b5b00;
+            --storage-bg: #f0f7ff;
+            --storage-text: #1f4d6b;
+            --card-meta: #444444;
+            --link-muted: #0a6a8d;
+            --overlay-bg: rgba(0, 0, 0, 0.45);
+            --switch-track-off: #e0e0e0;
+            --switch-track-on: var(--accent);
 
             --radius-lg: 16px;
             --radius-md: 12px;
@@ -33,6 +51,36 @@
 
             --safe-top: env(safe-area-inset-top, 0px);
             --safe-bottom: env(safe-area-inset-bottom, 0px);
+            --app-pad-top: calc(16px + var(--safe-top));
+            --app-pad-bottom: calc(32px + var(--safe-bottom));
+        }
+
+        [data-theme="dark"] {
+            color-scheme: dark;
+            --bg: #0f0f0f;
+            --card-bg: #1c1c1e;
+            --text-primary: #f5f5f7;
+            --text-secondary: #98989d;
+            --accent: #2AABEE;
+            --accent-hover: #1f9cd9;
+            --border: #3a3a3c;
+            --btn-secondary-bg: #3a3a3c;
+            --btn-secondary-text: #f5f5f7;
+            --btn-secondary-bg-active: #48484a;
+            --hero-gradient: linear-gradient(135deg, #2c2c2e 0%, #1c1c1e 100%);
+            --hero-photo-bg: #2c2c2e;
+            --skeleton-bg: #3a3a3c;
+            --tips-bg: #2c2610;
+            --tips-border: #ffd633;
+            --tips-text: #e8d48b;
+            --storage-bg: #122231;
+            --storage-text: #8ecae6;
+            --card-meta: #98989d;
+            --link-muted: #5ac8fa;
+            --overlay-bg: rgba(0, 0, 0, 0.62);
+            --switch-track-off: #48484a;
+            --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.35);
+            --shadow-md: 0 2px 8px rgba(0, 0, 0, 0.38);
         }
 
         * {
@@ -58,8 +106,7 @@
         #app {
             max-width: 720px;
             margin: 0 auto;
-            padding: calc(16px + var(--safe-top)) 16px
-                     calc(32px + var(--safe-bottom));
+            padding: var(--app-pad-top) 16px var(--app-pad-bottom);
             min-height: 100vh;
         }
 
@@ -73,9 +120,71 @@
             margin-bottom: 12px;
             min-height: 32px;
         }
+        .top-header {
+            flex-wrap: wrap;
+            align-items: flex-start;
+            justify-content: space-between;
+            row-gap: 10px;
+        }
+        .top-header .title {
+            flex: 1 1 auto;
+            min-width: 0;
+        }
+        .theme-toggle-row {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            flex-shrink: 0;
+            margin-left: auto;
+        }
+        .theme-toggle-text {
+            font-size: 13px;
+            color: var(--text-secondary);
+            white-space: nowrap;
+            user-select: none;
+        }
+        .theme-switch {
+            position: relative;
+            width: 46px;
+            height: 28px;
+            flex-shrink: 0;
+        }
+        .theme-switch input {
+            position: absolute;
+            opacity: 0;
+            width: 0;
+            height: 0;
+        }
+        .theme-switch-track {
+            display: block;
+            width: 100%;
+            height: 100%;
+            border-radius: 999px;
+            background: var(--switch-track-off);
+            transition: background 0.2s ease;
+            cursor: pointer;
+        }
+        .theme-switch-thumb {
+            position: absolute;
+            top: 3px;
+            left: 3px;
+            width: 22px;
+            height: 22px;
+            border-radius: 50%;
+            background: var(--card-bg);
+            box-shadow: 0 1px 3px rgba(0, 0, 0, 0.2);
+            transition: transform 0.2s ease;
+            pointer-events: none;
+        }
+        .theme-switch input:checked + .theme-switch-track {
+            background: var(--switch-track-on);
+        }
+        .theme-switch input:checked + .theme-switch-track .theme-switch-thumb {
+            transform: translateX(18px);
+        }
         .home-hint {
             text-align: center;
-            color: #8e8e93;
+            color: var(--text-secondary);
             font-size: 14px;
             font-style: italic;
             line-height: 1.4;
@@ -181,7 +290,7 @@
             width: 100%;
             margin: 24px 0 0;
             background: var(--accent);
-            color: #fff;
+            color: var(--on-accent);
             border: 0;
             border-radius: var(--radius-md);
             padding: 14px 16px;
@@ -262,7 +371,7 @@
             padding: 20px 16px;
             max-height: 100dvh;
             box-sizing: border-box;
-            background: rgba(0, 0, 0, 0.45);
+            background: var(--overlay-bg);
             -webkit-tap-highlight-color: transparent;
             animation: deleteOverlayFade 0.22s ease forwards;
         }
@@ -323,11 +432,11 @@
             filter: brightness(0.92);
         }
         .delete-confirm-btn--cancel {
-            background: #e8e8ed;
-            color: #3a3a3c;
+            background: var(--btn-secondary-bg);
+            color: var(--btn-secondary-text);
         }
         .delete-confirm-btn--cancel:not(:disabled):active {
-            background: #dcdce0;
+            background: var(--btn-secondary-bg-active);
         }
 
         /* ============================================================= *
@@ -392,13 +501,13 @@
             padding: 3px 8px;
             border-radius: 999px;
             background: rgba(42, 171, 238, 0.12);
-            color: #0a6a8d;
+            color: var(--link-muted);
             border: 1px solid rgba(42, 171, 238, 0.25);
         }
         /* Приём пищи (meal_type) — отдельно от навигации dish_type / main_ingredient */
         .recipe-card-badges .mini-badge--meal {
             background: rgba(0, 0, 0, 0.05);
-            color: #444;
+            color: var(--card-meta);
             border-color: rgba(0, 0, 0, 0.1);
         }
 
@@ -524,12 +633,12 @@
         }
 
         .tips {
-            background: #fffbe6;
-            border-left: 3px solid #ffd633;
+            background: var(--tips-bg);
+            border-left: 3px solid var(--tips-border);
         }
         .tips li {
             padding: 4px 0;
-            color: #6b5b00;
+            color: var(--tips-text);
         }
 
         /* ============================================================= *
@@ -542,7 +651,7 @@
         /* Hero-плашка вместо фото — пока изображений нет */
         .recipe-hero {
             height: 220px;
-            background: linear-gradient(135deg, #f5f7fa 0%, #e8ecf3 100%);
+            background: var(--hero-gradient);
             border-radius: var(--radius-lg);
             display: flex;
             flex-direction: column;
@@ -567,7 +676,7 @@
         .detail .recipe-hero.recipe-hero-photo {
             padding: 0;
             overflow: hidden;
-            background: #e8ecf3;
+            background: var(--hero-photo-bg);
         }
         .detail .recipe-hero .hero-img {
             width: 100%;
@@ -694,7 +803,7 @@
         }
 
         /* Блок «Советы» — мягкий жёлтый акцент */
-        .detail .tips h3 { color: #6b5b00; }
+        .detail .tips h3 { color: var(--tips-text); }
         .detail .tips ul {
             list-style: none;
             display: flex;
@@ -702,7 +811,7 @@
             gap: 8px;
         }
         .detail .tips ul li {
-            color: #6b5b00;
+            color: var(--tips-text);
             line-height: 1.55;
             padding: 0;
             border: 0;
@@ -710,12 +819,12 @@
 
         /* Блок «Хранение» — холодный синий акцент */
         .detail .storage {
-            background: #f0f7ff;
+            background: var(--storage-bg);
             border-left: 3px solid var(--accent);
         }
-        .detail .storage h3 { color: #1f4d6b; }
+        .detail .storage h3 { color: var(--storage-text); }
         .detail .storage p {
-            color: #1f4d6b;
+            color: var(--storage-text);
             line-height: 1.55;
             word-break: break-word;
         }
@@ -813,7 +922,7 @@
         .debug-block pre.debug-info {
             margin-top: 10px;
             padding: 10px;
-            background: #fafafa;
+            background: var(--bg);
             border-radius: var(--radius-sm);
             font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
             font-size: 11.5px;
@@ -918,12 +1027,99 @@
         let ACCESS_TOKEN = null;
 
         const tg = window.Telegram && window.Telegram.WebApp ? window.Telegram.WebApp : null;
+        const REMY_THEME_KEY = "remy_theme";
+        const REMY_VIEWED_KEY = "remy_viewed_recipes";
+
+        /** Просмотренные рецепты — в памяти + Supabase (синхрон между устройствами). */
+        var viewedRecipeSet = new Set();
+        var viewedTrackingReady = false;
+
+        function getTheme() {
+            try {
+                var saved = localStorage.getItem(REMY_THEME_KEY);
+                if (saved === "dark" || saved === "light") return saved;
+            } catch (_) { /* noop */ }
+            return "light";
+        }
+
+        function applyTheme(theme) {
+            var t = theme === "dark" ? "dark" : "light";
+            document.documentElement.setAttribute("data-theme", t);
+            try { localStorage.setItem(REMY_THEME_KEY, t); } catch (_) { /* noop */ }
+            var meta = document.querySelector('meta[name="theme-color"]');
+            if (meta) meta.setAttribute("content", t === "dark" ? "#1c1c1e" : "#f5f5f7");
+            if (tg) {
+                try {
+                    if (typeof tg.setHeaderColor === "function") {
+                        tg.setHeaderColor(t === "dark" ? "#1c1c1e" : "#f5f5f7");
+                    }
+                    if (typeof tg.setBackgroundColor === "function") {
+                        tg.setBackgroundColor(t === "dark" ? "#0f0f0f" : "#f0f0f0");
+                    }
+                } catch (_) { /* noop */ }
+            }
+        }
+
+        function applyTelegramInsets() {
+            var baseTop = 16;
+            var baseBottom = 32;
+            var insetTop = 0;
+            var insetBottom = 0;
+            if (tg) {
+                var c = tg.contentSafeAreaInset || {};
+                var s = tg.safeAreaInset || {};
+                insetTop = Math.max(Number(c.top) || 0, Number(s.top) || 0);
+                insetBottom = Math.max(Number(c.bottom) || 0, Number(s.bottom) || 0);
+                // Fullscreen: шапка Telegram (кнопка закрытия) — fallback, если inset = 0.
+                if (insetTop < 44 && (tg.isFullscreen || tg.isExpanded)) {
+                    insetTop = Math.max(insetTop, 56);
+                }
+            }
+            document.documentElement.style.setProperty(
+                "--app-pad-top", (baseTop + insetTop) + "px"
+            );
+            document.documentElement.style.setProperty(
+                "--app-pad-bottom", (baseBottom + insetBottom) + "px"
+            );
+        }
+
+        function buildThemeToggle() {
+            var row = el("div", { class: "theme-toggle-row" });
+            row.appendChild(el("span", { class: "theme-toggle-text" }, ["Тёмный режим"]));
+            var label = el("label", { class: "theme-switch" });
+            var input = el("input", { type: "checkbox" });
+            input.checked = getTheme() === "dark";
+            input.addEventListener("change", function () {
+                applyTheme(input.checked ? "dark" : "light");
+            });
+            var track = el("span", { class: "theme-switch-track" });
+            track.appendChild(el("span", { class: "theme-switch-thumb" }));
+            label.appendChild(input);
+            label.appendChild(track);
+            row.appendChild(label);
+            return row;
+        }
+
+        function buildHomeHeader() {
+            return el("div", { class: "header top-header" }, [
+                el("h1", { class: "title" }, ["📖 Книга рецептов"]),
+                buildThemeToggle()
+            ]);
+        }
+
         if (tg) {
-            // tg.ready() обязательно ДО чтения initData: на некоторых
-            // сборках Telegram Desktop до ready() объект инициализируется
-            // асинхронно, и initDataUnsafe может оказаться пустым.
             try { tg.ready(); } catch (_) { /* noop */ }
             try { tg.expand(); } catch (_) { /* noop */ }
+        }
+        applyTheme(getTheme());
+        applyTelegramInsets();
+
+        if (tg) {
+            try {
+                tg.onEvent("contentSafeAreaChanged", applyTelegramInsets);
+                tg.onEvent("safeAreaChanged", applyTelegramInsets);
+                tg.onEvent("viewportChanged", applyTelegramInsets);
+            } catch (_) { /* noop */ }
         }
 
         // ================================================================ //
@@ -1276,77 +1472,123 @@
         }
 
         // ================================================================ //
-        //  Просмотренные рецепты (localStorage, ключ remy_viewed_recipes)
-        //  Формат: JSON-массив id. Без localStorage / при ошибке — пустой Set.
+        //  Просмотренные рецепты — Supabase recipe_views + localStorage fallback
         // ================================================================ //
 
-        var REMY_VIEWED_KEY = "remy_viewed_recipes";
-
-        /**
-         * Состояние «просмотренных»: tracking=false, если ключа в storage ещё нет
-         * (как в версии до фичи — без бейджей). После первой записи — tracking=true.
-         */
-        function getViewedState() {
+        function readLocalViewedSet() {
             var empty = new Set();
             try {
-                if (typeof localStorage === "undefined" || !localStorage) {
-                    return { tracking: false, set: empty };
-                }
+                if (typeof localStorage === "undefined" || !localStorage) return empty;
                 var raw = localStorage.getItem(REMY_VIEWED_KEY);
-                if (raw === null) {
-                    // ключ никогда не задавали — визуально как раньше, без бейджей
-                    return { tracking: false, set: empty };
-                }
+                if (raw === null) return empty;
                 var p = JSON.parse(raw);
                 if (Array.isArray(p)) {
-                    return { tracking: true, set: new Set(p.map(function (x) { return String(x); })) };
+                    return new Set(p.map(function (x) { return String(x); }));
                 }
                 if (p && typeof p === "object") {
-                    return { tracking: true, set: new Set(Object.keys(p).map(String)) };
+                    return new Set(Object.keys(p).map(String));
                 }
-            } catch (e) { /* приватный режим, квота, невалидный JSON */ }
-            return { tracking: false, set: empty };
+            } catch (e) { /* noop */ }
+            return empty;
+        }
+
+        function persistLocalViewedSet() {
+            try {
+                if (typeof localStorage === "undefined" || !localStorage) return;
+                localStorage.setItem(
+                    REMY_VIEWED_KEY,
+                    JSON.stringify(Array.from(viewedRecipeSet))
+                );
+            } catch (e) { /* noop */ }
+        }
+
+        function getViewedState() {
+            return { tracking: viewedTrackingReady, set: viewedRecipeSet };
         }
 
         function getViewedRecipeSet() {
-            return getViewedState().set;
+            return viewedRecipeSet;
+        }
+
+        async function pushViewedToServer(recipeId) {
+            if (IS_DEMO || !USER_ID || !recipeId) return;
+            try {
+                await apiUpsert(
+                    "recipe_views",
+                    { user_id: Number(USER_ID), recipe_id: String(recipeId) },
+                    "user_id,recipe_id"
+                );
+            } catch (e) {
+                console.warn("recipe_views upsert:", e);
+            }
+        }
+
+        async function initViewedState() {
+            var localSet = readLocalViewedSet();
+            viewedRecipeSet = new Set(localSet);
+            viewedTrackingReady = localSet.size > 0;
+
+            if (IS_DEMO || !USER_ID) return;
+
+            try {
+                var rows = await apiGet(
+                    "recipe_views?user_id=eq." + encodeURIComponent(USER_ID) +
+                    "&select=recipe_id"
+                );
+                if (Array.isArray(rows)) {
+                    rows.forEach(function (row) {
+                        if (row && row.recipe_id) {
+                            viewedRecipeSet.add(String(row.recipe_id));
+                        }
+                    });
+                }
+                viewedTrackingReady = true;
+                persistLocalViewedSet();
+
+                var pending = [];
+                localSet.forEach(function (rid) {
+                    var found = false;
+                    if (Array.isArray(rows)) {
+                        for (var i = 0; i < rows.length; i++) {
+                            if (rows[i] && String(rows[i].recipe_id) === rid) {
+                                found = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (!found) pending.push(pushViewedToServer(rid));
+                });
+                if (pending.length) await Promise.all(pending);
+            } catch (e) {
+                console.warn("recipe_views sync:", e);
+                if (localSet.size) viewedTrackingReady = true;
+            }
         }
 
         function markRecipeViewedInStorage(rid) {
             if (!rid) return;
-            try {
-                if (typeof localStorage === "undefined" || !localStorage) return;
-                var st = getViewedState();
-                st.set.add(String(rid));
-                localStorage.setItem(REMY_VIEWED_KEY, JSON.stringify(Array.from(st.set)));
-            } catch (e) { /* ignore */ }
+            viewedRecipeSet.add(String(rid));
+            viewedTrackingReady = true;
+            persistLocalViewedSet();
+            pushViewedToServer(rid);
         }
 
-        /** Убрать id из просмотренных (после удаления рецепта). */
         function removeRecipeViewedInStorage(rid) {
             if (!rid) return;
-            try {
-                if (typeof localStorage === "undefined" || !localStorage) return;
-                var st = getViewedState();
-                if (!st.tracking) return;
-                st.set.delete(String(rid));
-                var arr = Array.from(st.set);
-                if (arr.length === 0) {
-                    try {
-                        localStorage.removeItem(REMY_VIEWED_KEY);
-                    } catch (e) {
-                        localStorage.setItem(REMY_VIEWED_KEY, "[]");
-                    }
-                } else {
-                    localStorage.setItem(REMY_VIEWED_KEY, JSON.stringify(arr));
-                }
-            } catch (e) { /* ignore */ }
+            if (!viewedTrackingReady) return;
+            viewedRecipeSet.delete(String(rid));
+            persistLocalViewedSet();
+            if (!IS_DEMO && USER_ID) {
+                apiDelete(
+                    "recipe_views?user_id=eq." + encodeURIComponent(USER_ID) +
+                    "&recipe_id=eq." + encodeURIComponent(String(rid))
+                ).catch(function (e) { console.warn("recipe_views delete:", e); });
+            }
         }
 
         function isRecipeUnviewedInStorage(rid) {
-            var st = getViewedState();
-            if (!st.tracking) return false;
-            return !st.set.has(String(rid));
+            if (!viewedTrackingReady) return false;
+            return !viewedRecipeSet.has(String(rid));
         }
 
         function countUnviewedInIds(ids) {
@@ -1683,9 +1925,7 @@
             const root = clearApp();
             const screen = el("div", { class: "screen" });
 
-            screen.appendChild(el("div", { class: "header" }, [
-                el("h1", { class: "title" }, ["📖 Книга рецептов"])
-            ]));
+            screen.appendChild(buildHomeHeader());
 
             if (state.loading) {
                 screen.appendChild(homeMotivationLine());
@@ -2646,21 +2886,12 @@
                     }
                     if (state.error) return;
                 }
+                await initViewedState();
                 loadDishTree();
             })();
         });
 
-        // Telegram умеет менять тему по ходу сеанса — подхватим изменение
-        // (на случай, если пользователь переключит dark mode в клиенте).
-        if (tg) {
-            try {
-                tg.onEvent("themeChanged", function () {
-                    // Мы сознательно не переключаемся в dark: светлая схема —
-                    // это часть дизайна (референс @BotFather). Но tg меняет
-                    // цвет шапки клиента — это уже его задача.
-                });
-            } catch (_) { /* noop */ }
-        }
+        // Telegram: safe area и viewport — см. applyTelegramInsets() выше.
 
         // Экспортируем минимум для ручного тестирования из DevTools.
         window.__remy = {
