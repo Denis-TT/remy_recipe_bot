@@ -51,8 +51,11 @@
 
             --safe-top: env(safe-area-inset-top, 0px);
             --safe-bottom: env(safe-area-inset-bottom, 0px);
-            --app-pad-top: calc(16px + var(--safe-top));
-            --app-pad-bottom: calc(32px + var(--safe-bottom));
+            /* Telegram WebApp: сумма content + device safe area (задаётся из JS). */
+            --tg-inset-top: 0px;
+            --tg-inset-bottom: 0px;
+            --app-pad-top: calc(12px + var(--tg-inset-top) + var(--safe-top));
+            --app-pad-bottom: calc(24px + var(--tg-inset-bottom) + var(--safe-bottom));
         }
 
         [data-theme="dark"] {
@@ -1060,27 +1063,55 @@
             }
         }
 
+        function readCssPx(varName) {
+            try {
+                var raw = getComputedStyle(document.documentElement).getPropertyValue(varName);
+                return parseFloat(raw) || 0;
+            } catch (_) {
+                return 0;
+            }
+        }
+
+        /** Сумма safeAreaInset + contentSafeAreaInset (документация Telegram Bot API 8.0+). */
         function applyTelegramInsets() {
-            var baseTop = 16;
-            var baseBottom = 32;
             var insetTop = 0;
             var insetBottom = 0;
+
             if (tg) {
                 var c = tg.contentSafeAreaInset || {};
                 var s = tg.safeAreaInset || {};
-                insetTop = Math.max(Number(c.top) || 0, Number(s.top) || 0);
-                insetBottom = Math.max(Number(c.bottom) || 0, Number(s.bottom) || 0);
-                // Fullscreen: шапка Telegram (кнопка закрытия) — fallback, если inset = 0.
-                if (insetTop < 44 && (tg.isFullscreen || tg.isExpanded)) {
-                    insetTop = Math.max(insetTop, 56);
+                insetTop = (Number(c.top) || 0) + (Number(s.top) || 0);
+                insetBottom = (Number(c.bottom) || 0) + (Number(s.bottom) || 0);
+            }
+
+            // CSS-переменные, которые Telegram инжектит в html (fallback / дубль JS).
+            insetTop = Math.max(
+                insetTop,
+                readCssPx("--tg-content-safe-area-inset-top") + readCssPx("--tg-safe-area-inset-top")
+            );
+            insetBottom = Math.max(
+                insetBottom,
+                readCssPx("--tg-content-safe-area-inset-bottom") + readCssPx("--tg-safe-area-inset-bottom")
+            );
+
+            // Мобильный fullscreen: плавающая шапка TG (Close / Back) — insets иногда занижены.
+            if (tg) {
+                var platform = String(tg.platform || "").toLowerCase();
+                var minTop = platform === "ios" ? 100 : platform === "android" ? 84 : 76;
+                if (tg.isFullscreen || tg.isExpanded !== false) {
+                    insetTop = Math.max(insetTop, minTop);
                 }
             }
-            document.documentElement.style.setProperty(
-                "--app-pad-top", (baseTop + insetTop) + "px"
-            );
-            document.documentElement.style.setProperty(
-                "--app-pad-bottom", (baseBottom + insetBottom) + "px"
-            );
+
+            document.documentElement.style.setProperty("--tg-inset-top", insetTop + "px");
+            document.documentElement.style.setProperty("--tg-inset-bottom", insetBottom + "px");
+        }
+
+        function scheduleInsetUpdates() {
+            applyTelegramInsets();
+            [50, 150, 400, 1000].forEach(function (ms) {
+                setTimeout(applyTelegramInsets, ms);
+            });
         }
 
         function buildThemeToggle() {
@@ -1112,13 +1143,14 @@
             try { tg.expand(); } catch (_) { /* noop */ }
         }
         applyTheme(getTheme());
-        applyTelegramInsets();
+        scheduleInsetUpdates();
 
         if (tg) {
             try {
                 tg.onEvent("contentSafeAreaChanged", applyTelegramInsets);
                 tg.onEvent("safeAreaChanged", applyTelegramInsets);
                 tg.onEvent("viewportChanged", applyTelegramInsets);
+                tg.onEvent("fullscreenChanged", applyTelegramInsets);
             } catch (_) { /* noop */ }
         }
 
