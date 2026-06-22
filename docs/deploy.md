@@ -47,6 +47,7 @@ Telegram Mini App.
 | 4 | `sql/migration_rls_user_isolation.sql` | **RLS по Telegram user_id** |
 | 5 | `sql/migration_rls_hardening.sql` | Vault только для service role |
 | 6 | `sql/migration_recipe_views.sql` | Просмотренные рецепты Mini App (между устройствами) |
+| 7 | `sql/migration_pending_chef.sql` | «Спросить у шефа» из Mini App без `/start` |
 
 Опционально (если БД старая и колонок ещё нет):  
 `migration_nutrition_note.sql`, `migration_nutrition_estimated.sql`, `migration_dish_categorization.sql`.
@@ -96,6 +97,24 @@ curl -s -X POST "https://<project>.supabase.co/functions/v1/telegram-auth" \
 ```
 
 Ответ: `{"access_token":"eyJ...","user_id":12345,...}`.
+
+### 1.4.1. Edge Function `chef-notify` (кнопка «Спросить у шефа» в Mini App)
+
+Menu Button **не поддерживает** `WebApp.sendData`. Функция ставит рецепт в
+`pending_chef` и **сама шлёт приглашение** в чат с ботом — без `/start`.
+
+> ⚠️ Секреты с префиксом `SUPABASE_` (**URL**, **service_role**, **anon**) Edge
+> Functions получают **автоматически** — через `supabase secrets set` их задать
+> нельзя (CLI: «Env name cannot start with SUPABASE_»). Вручную нужен только
+> `TELEGRAM_BOT_TOKEN` (тот же, что для `telegram-auth`).
+
+```bash
+cd /path/to/remy_recipe_bot
+supabase secrets list          # должен быть TELEGRAM_BOT_TOKEN
+supabase functions deploy chef-notify --no-verify-jwt
+```
+
+Таблица `pending_chef` — миграция `sql/migration_pending_chef.sql` (п. 1.2).
 
 ### 1.5. Проверка БД
 

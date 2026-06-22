@@ -3174,24 +3174,46 @@
             }
         }
 
-        function askChefRemy(recipeId) {
+        var REMY_BOT_CHAT_URL = "https://t.me/remy_recipe_bot";
+
+        async function askChefRemy(recipeId) {
             if (IS_DEMO) return;
             const id = String(recipeId || "").trim();
             if (!id) return;
-            // sendData — без /start в чате; deep link — запасной вариант.
-            if (tg && typeof tg.sendData === "function") {
-                try {
-                    tg.sendData(JSON.stringify({ action: "ask_chef", recipe_id: id }));
-                    return;
-                } catch (e) {
-                    console.warn("askChefRemy sendData:", e);
+
+            // Menu Button не поддерживает sendData — chef-notify + чат без /start.
+            try {
+                if (!ACCESS_TOKEN) {
+                    await authenticateTelegram();
                 }
-            }
-            const deepLink = "https://t.me/remy_recipe_bot?start=chef_" + encodeURIComponent(id);
-            if (tg && typeof tg.openTelegramLink === "function") {
-                tg.openTelegramLink(deepLink);
-            } else {
-                window.open(deepLink, "_blank");
+                const notifyUrl = SUPABASE_URL + "/functions/v1/chef-notify";
+                const res = await fetch(notifyUrl, {
+                    method: "POST",
+                    headers: apiAuthHeaders({ "Content-Type": "application/json" }),
+                    body: JSON.stringify({ recipe_id: id })
+                });
+                if (!res.ok) {
+                    const errBody = await res.text().catch(function () { return ""; });
+                    throw new Error("HTTP " + res.status + ": " + (errBody || res.statusText));
+                }
+                if (tg && typeof tg.openTelegramLink === "function") {
+                    tg.openTelegramLink(REMY_BOT_CHAT_URL);
+                }
+                if (tg && typeof tg.close === "function") {
+                    tg.close();
+                }
+            } catch (e) {
+                console.error("askChefRemy:", e);
+                var msg = "Не удалось открыть чат с шефом. Попробуйте кнопку в боте у рецепта.";
+                try {
+                    if (tg && typeof tg.showAlert === "function") {
+                        tg.showAlert(msg);
+                    } else {
+                        window.alert(msg);
+                    }
+                } catch (_) {
+                    window.alert(msg);
+                }
             }
         }
 

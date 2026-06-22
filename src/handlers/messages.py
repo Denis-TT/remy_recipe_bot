@@ -392,6 +392,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if await try_handle_pending_share(message, context, user.id):
         return
 
+    await try_bootstrap_chef_from_pending(message, context, user.id)
+
     if await try_handle_chef_question(message, context, user.id):
         return
 
@@ -1220,6 +1222,39 @@ def _touch_chef_session(bot: "RemyBot", user_id: int) -> None:
 def end_chef_session(bot: "RemyBot", user_id: int) -> bool:
     """Завершить сессию шефа. Returns: была ли активна."""
     return bot.chef_sessions.pop(int(user_id), None) is not None
+
+
+async def try_bootstrap_chef_from_pending(
+    message: Message,
+    context: ContextTypes.DEFAULT_TYPE,
+    user_id: int,
+) -> None:
+    """Поднять сессию шефа из очереди Mini App (без повторного приглашения)."""
+    bot = _get_bot(context)
+    if _get_chef_session(bot, user_id) is not None:
+        return
+
+    try:
+        recipe_id = await bot.storage.consume_pending_chef(user_id)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("⚠️ pending_chef: %s", exc)
+        return
+
+    if not recipe_id:
+        return
+
+    try:
+        recipe = await bot.storage.get_recipe(recipe_id)
+    except Exception as exc:  # noqa: BLE001
+        logger.error("❌ pending_chef: загрузка %s: %s", recipe_id, exc)
+        return
+
+    if recipe is None or not _recipe_belongs_to_user(recipe, user_id):
+        logger.warning("⚠️ pending_chef: рецепт %s не найден для user %s", recipe_id, user_id)
+        return
+
+    _set_chef_session(bot, user_id, recipe)
+    logger.info("👨‍🍳 Сессия шефа из pending_chef: user %s, recipe %s", user_id, recipe_id)
 
 
 async def start_chef_session(

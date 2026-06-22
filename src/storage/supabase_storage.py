@@ -201,6 +201,36 @@ class SupabaseStorage(BaseStorage):
         logger.info("📤 pending_shares: user %s → recipe %s", uid, recipe_id)
         return recipe_id
 
+    async def consume_pending_chef(self, user_id: int) -> Optional[str]:
+        """Забрать recipe_id из очереди Mini App «Спросить у шефа»."""
+        uid = int(user_id)
+        params = {"user_id": f"eq.{uid}", "limit": "1", "select": "recipe_id"}
+        try:
+            _, body = await self._request("GET", "/pending_chef", params=params)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("⚠️ pending_chef GET: %s", exc)
+            return None
+
+        rows = self._parse_json_body(body)
+        if not isinstance(rows, list) or not rows:
+            return None
+
+        recipe_id = str(rows[0].get("recipe_id") or "").strip()
+        if not recipe_id:
+            return None
+
+        try:
+            await self._request(
+                "DELETE",
+                "/pending_chef",
+                params={"user_id": f"eq.{uid}"},
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("⚠️ pending_chef DELETE: %s", exc)
+
+        logger.info("👨‍🍳 pending_chef: user %s → recipe %s", uid, recipe_id)
+        return recipe_id
+
     async def get_user_recipes(
         self,
         user_id: int,
