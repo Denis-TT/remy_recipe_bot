@@ -46,12 +46,13 @@ Telegram Mini App.
 | 3 | `sql/migration_recipe_vault.sql` | Глобальный кэш URL |
 | 4 | `sql/migration_rls_user_isolation.sql` | **RLS по Telegram user_id** |
 | 5 | `sql/migration_rls_hardening.sql` | Vault только для service role |
+| 6 | `sql/migration_recipe_views.sql` | Просмотренные рецепты Mini App (между устройствами) |
 
 Опционально (если БД старая и колонок ещё нет):  
 `migration_nutrition_note.sql`, `migration_nutrition_estimated.sql`, `migration_dish_categorization.sql`.
 
-> ⚠️ **Порядок важен:** сначала задеплой Edge Function (п. 1.5), **потом**
-> п. 4–5, **потом** обнови Mini App (п. 3). Иначе «Книга рецептов» перестанет
+> ⚠️ **Порядок важен:** сначала задеплой Edge Function (п. 1.4), **потом**
+> п. 4–6, **потом** обнови Mini App (п. 3). Иначе «Книга рецептов» перестанет
 > грузить данные до выката JWT-авторизации.
 
 После п. 1 в **Table Editor** должна появиться таблица `recipes`.
@@ -134,7 +135,9 @@ DELETE FROM recipes WHERE title='test';
 | `TELEGRAM_BOT_TOKEN` | токен из @BotFather |
 | `GITHUB_TOKEN` | PAT с `models:read` |
 | `SUPABASE_URL` | из п. 1.3 |
-| `SUPABASE_KEY` | **service_role** ключ из п. 1.3 |
+| `SUPABASE_KEY` | **service_role** ключ из п. 1.3 (не anon) |
+| `YOUTUBE_API_KEY` | для YouTube Shorts (опционально, но рекомендуется) |
+| `APIFY_API_TOKEN` | для субтитров Instagram / YouTube / VK (опционально) |
 | `LOG_LEVEL` | `INFO` (на первых порах можно `DEBUG`) |
 | `ENVIRONMENT` | `production` |
 | `WEBAPP_URL` | пока оставить пустым — заполним в п. 3 |
@@ -253,13 +256,14 @@ Railway перезапустит сервис; `RemyBot` автоматичес�
 | `/start` | Приветствие + клавиатура. |
 | `/help` | Инструкция. |
 | `/menu` | Inline-меню с 4 кнопками. |
-| Отправить ссылку на любой рецепт (например [eda.ru](https://eda.ru/)) | «🔍 Читаю страницу...» → «🤖 Анализирую рецепт...» → карточка с бейджами, КБЖУ, «Ингредиенты», «Приготовление» и кнопками `✅ Сохранить` / `❌ Не сохранять`. |
+| Отправить ссылку на рецепт (сайт или [Instagram Reels](https://www.instagram.com/reel/DZw5dtOtmxO/)) | «🔍 Читаю…» → «🤖 Анализирую…» → карточка с бейджами, КБЖУ, ингредиентами, шагами и кнопками `✅ Сохранить` / `❌ Не сохранять`. |
 | Нажать `✅ Сохранить` | «✅ Сохранено: «<название>»». В Supabase в таблице `recipes` появилась строка. |
 | «📚 Сохранённые рецепты» | Сетка категорий с количеством. |
 | Выбор категории → рецепт | Полный рецепт с кнопкой `🗑 Удалить`. |
 | `🗑 Удалить` → подтверждение | «✅ Рецепт удалён». Строки в Supabase больше нет. |
-| Нажать «📖 Книга рецептов» | Открывается Mini App, показывает те же категории. |
-| В Mini App: категория → рецепт → кнопка «Назад» | Стек экранов работает, Telegram BackButton тоже. |
+| Нажать «📖 Книга рецептов» | Открывается Mini App, категории загружаются (JWT + RLS). |
+| В Mini App: тёмная тема, навигация «Назад» | Переключатель темы работает; BackButton и стек экранов согласованы. |
+| В Mini App: категория → рецепт → «Назад» | Просмотр помечается в `recipe_views` (синхронизация между устройствами). |
 
 Если какой-то шаг не проходит — первым делом смотрим:
 
@@ -299,13 +303,15 @@ Railway перезапустит сервис; `RemyBot` автоматичес�
 | Mini App: пустые категории после RLS | Миграция `migration_rls_user_isolation.sql` накатана, но Mini App старый (без JWT) или нет `access_token`. |
 | Mini App: `USER_ID = 0` | Открыт не через Telegram. Dev: `?user_id=123&dev_secret=<REMY_DEV_AUTH_SECRET>`. |
 | В `/menu` нет кнопки Mini App | `WEBAPP_URL` пуст **или** не начинается с `https://` (ключевая проверка в `keyboards.py → _is_valid_webapp_url`). |
-| «message is not modified» в логах | Безвредно — PTB не даёт редактировать сообщение на то же содержимое, мы просто логируем и идём дальше. |
+| Mini App: отступ сверху слишком большой / малый | Режим fullscreen vs fullsize: `applyTelegramInsets()` в `mini_app/index.html`. Обнови Mini App после правок. |
+| Отправить Instagram Reels (пример из `/start`) | Парсинг видео: нужны `APIFY_API_TOKEN` и/или Whisper; смотри логи Railway. |
+| «message is not modified» в логах | Безвредно — PTB не даёт редактировать сообщение на то же содержимое. |
 
 ---
 
 ## 7. Чеклист перед релизом
 
-- [ ] Все миграции из §1.2 накатаны (особенно `migration_rls_user_isolation.sql`).
+- [ ] Все миграции из §1.2 накатаны (включая `migration_recipe_views.sql`).
 - [ ] Edge Function `telegram-auth` задеплоена, secrets заданы.
 - [ ] Railway: `SUPABASE_KEY` = **service_role**; Mini App: **anon** key.
 - [ ] `.env.example` ↔ фактические Variables в Railway — имена совпадают.
