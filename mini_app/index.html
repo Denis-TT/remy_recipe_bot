@@ -40,6 +40,9 @@
             --overlay-bg: rgba(0, 0, 0, 0.45);
             --switch-track-off: #e0e0e0;
             --switch-track-on: var(--accent);
+            --theme-slider-track-bg: #e4e7ee;
+            --theme-slider-thumb-bg: #ffffff;
+            --theme-slider-icon: #9ca3af;
 
             --radius-lg: 16px;
             --radius-md: 12px;
@@ -86,6 +89,9 @@
             --link-muted: #5ac8fa;
             --overlay-bg: rgba(0, 0, 0, 0.62);
             --switch-track-off: #48484a;
+            --theme-slider-track-bg: #1c1c1f;
+            --theme-slider-thumb-bg: #3a3a3e;
+            --theme-slider-icon: #9aa8c4;
             --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.35);
             --shadow-md: 0 2px 8px rgba(0, 0, 0, 0.38);
         }
@@ -138,74 +144,95 @@
             flex: 1 1 auto;
             min-width: 0;
         }
-        .theme-icon-btn {
-            appearance: none;
+        .theme-slider {
+            position: relative;
+            width: 58px;
+            height: 32px;
             flex-shrink: 0;
-            width: 40px;
-            height: 40px;
-            border: 0;
-            border-radius: 50%;
-            background: var(--btn-secondary-bg);
-            font-size: 20px;
-            line-height: 1;
-            display: inline-flex;
-            align-items: center;
-            justify-content: center;
+            display: inline-block;
+        }
+        .theme-slider input {
+            position: absolute;
+            inset: 0;
+            width: 100%;
+            height: 100%;
+            margin: 0;
+            opacity: 0;
+            z-index: 3;
             cursor: pointer;
-            transition: transform 0.12s ease, opacity 0.12s ease;
             -webkit-tap-highlight-color: transparent;
         }
-        .theme-icon-btn:active {
-            transform: scale(0.92);
-            opacity: 0.85;
-        }
-        .theme-toggle-row {
-            display: none;
-        }
-        .theme-toggle-text {
-            font-size: 13px;
-            color: var(--text-secondary);
-            white-space: nowrap;
-            user-select: none;
-        }
-        .theme-switch {
+        .theme-slider-track {
             position: relative;
-            width: 46px;
-            height: 28px;
-            flex-shrink: 0;
-        }
-        .theme-switch input {
-            position: absolute;
-            opacity: 0;
-            width: 0;
-            height: 0;
-        }
-        .theme-switch-track {
             display: block;
             width: 100%;
             height: 100%;
             border-radius: 999px;
-            background: var(--switch-track-off);
-            transition: background 0.2s ease;
-            cursor: pointer;
+            background: var(--theme-slider-track-bg);
+            box-shadow:
+                inset 0 2px 4px rgba(0, 0, 0, 0.08),
+                inset 0 -1px 1px rgba(255, 255, 255, 0.65);
+            transition: background 0.28s ease, box-shadow 0.28s ease;
         }
-        .theme-switch-thumb {
+        [data-theme="dark"] .theme-slider-track {
+            box-shadow:
+                inset 0 2px 5px rgba(0, 0, 0, 0.45),
+                inset 0 -1px 1px rgba(255, 255, 255, 0.06);
+        }
+        .theme-slider-thumb {
             position: absolute;
             top: 3px;
             left: 3px;
-            width: 22px;
-            height: 22px;
+            width: 26px;
+            height: 26px;
             border-radius: 50%;
-            background: var(--card-bg);
-            box-shadow: 0 1px 3px rgba(0, 0, 0, 0.2);
-            transition: transform 0.2s ease;
+            background: var(--theme-slider-thumb-bg);
+            box-shadow:
+                0 2px 5px rgba(0, 0, 0, 0.14),
+                0 1px 2px rgba(0, 0, 0, 0.08);
+            transition: transform 0.28s cubic-bezier(0.4, 0, 0.2, 1),
+                        background 0.28s ease,
+                        box-shadow 0.28s ease;
+            z-index: 2;
             pointer-events: none;
         }
-        .theme-switch input:checked + .theme-switch-track {
-            background: var(--switch-track-on);
+        [data-theme="dark"] .theme-slider-thumb {
+            box-shadow:
+                0 2px 6px rgba(0, 0, 0, 0.35),
+                0 1px 2px rgba(0, 0, 0, 0.2);
         }
-        .theme-switch input:checked + .theme-switch-track .theme-switch-thumb {
-            transform: translateX(18px);
+        .theme-slider input:checked + .theme-slider-track .theme-slider-thumb {
+            transform: translateX(26px);
+        }
+        .theme-slider-icon {
+            position: absolute;
+            top: 50%;
+            transform: translateY(-50%);
+            color: var(--theme-slider-icon);
+            pointer-events: none;
+            z-index: 1;
+            line-height: 0;
+            transition: color 0.28s ease, opacity 0.28s ease;
+        }
+        .theme-slider-icon svg {
+            display: block;
+        }
+        .theme-slider-icon--moon {
+            left: 8px;
+        }
+        .theme-slider-icon--sun {
+            right: 8px;
+        }
+        .theme-slider input:not(:checked) + .theme-slider-track .theme-slider-icon--moon {
+            opacity: 0.45;
+        }
+        .theme-slider input:checked + .theme-slider-track .theme-slider-icon--sun {
+            opacity: 0.35;
+        }
+        .theme-toggle-row,
+        .theme-icon-btn,
+        .theme-switch {
+            display: none;
         }
         .home-hint {
             text-align: center;
@@ -1225,23 +1252,43 @@
             });
         }
 
+        var THEME_MOON_SVG =
+            '<svg viewBox="0 0 24 24" width="15" height="15" aria-hidden="true">' +
+            '<path fill="currentColor" d="M15.2 4.2a5.8 5.8 0 1 0 5.5 7.9 4.4 4.4 0 0 1-5.5-7.9z"/>' +
+            '<circle fill="currentColor" cx="6.2" cy="6.5" r="0.75"/>' +
+            '<circle fill="currentColor" cx="4.4" cy="10.2" r="0.55"/>' +
+            '<circle fill="currentColor" cx="7.1" cy="12.8" r="0.45"/>' +
+            '<circle fill="currentColor" cx="5.2" cy="14.6" r="0.4"/>' +
+            '</svg>';
+        var THEME_SUN_SVG =
+            '<svg viewBox="0 0 24 24" width="15" height="15" aria-hidden="true">' +
+            '<circle fill="currentColor" cx="12" cy="12" r="3.6"/>' +
+            '<g stroke="currentColor" stroke-width="1.6" stroke-linecap="round">' +
+            '<path d="M12 3.2V5.6M12 18.4v2.4M3.2 12h2.4M18.4 12h2.4"/>' +
+            '<path d="M5.8 5.8l1.7 1.7M16.5 16.5l1.7 1.7M5.8 18.2l1.7-1.7M16.5 7.5l1.7-1.7"/>' +
+            '</g></svg>';
+
         function buildThemeToggle() {
-            var isDark = getTheme() === "dark";
-            return el("button", {
-                type: "button",
-                class: "theme-icon-btn",
-                "aria-label": isDark ? "Светлая тема" : "Тёмная тема",
-                title: isDark ? "Светлая тема" : "Тёмная тема",
-                onclick: function (ev) {
-                    var btn = ev.currentTarget;
-                    var next = getTheme() === "dark" ? "light" : "dark";
-                    applyTheme(next);
-                    var nowDark = next === "dark";
-                    btn.textContent = nowDark ? "☀️" : "🌙";
-                    btn.setAttribute("aria-label", nowDark ? "Светлая тема" : "Тёмная тема");
-                    btn.title = nowDark ? "Светлая тема" : "Тёмная тема";
-                }
-            }, [isDark ? "☀️" : "🌙"]);
+            var label = el("label", { class: "theme-slider" });
+            var input = el("input", {
+                type: "checkbox",
+                "aria-label": "Тёмная тема"
+            });
+            input.checked = getTheme() === "dark";
+            input.addEventListener("change", function () {
+                applyTheme(input.checked ? "dark" : "light");
+            });
+            var track = el("span", { class: "theme-slider-track" });
+            var moon = el("span", { class: "theme-slider-icon theme-slider-icon--moon" });
+            moon.innerHTML = THEME_MOON_SVG;
+            var sun = el("span", { class: "theme-slider-icon theme-slider-icon--sun" });
+            sun.innerHTML = THEME_SUN_SVG;
+            track.appendChild(moon);
+            track.appendChild(sun);
+            track.appendChild(el("span", { class: "theme-slider-thumb" }));
+            label.appendChild(input);
+            label.appendChild(track);
+            return label;
         }
 
         function buildHomeHeader() {
