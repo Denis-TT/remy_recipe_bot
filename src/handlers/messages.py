@@ -9,7 +9,8 @@
 * URL (http/https) — цепочка «парсинг → нормализация → одно сообщение с кнопками»
   (при наличии картинки — фото с HTML-подписью до 1024 символов и те же кнопки);
 * Текст рецепта (пересланный или вставленный) — нормализация через AI без парсера;
-* Любой другой текст — короткая подсказка отправить ссылку или рецепт.
+* Болтовня и FAQ (привет, спасибо, лимиты) — скриптовые ответы без ИИ;
+* Нераспознанный текст — мягкая подсказка.
 
 Дополнительно: :func:`format_recipe` и псевдоним :func:`format_recipe_for_telegram`
 (одна реализация) — HTML-карточка рецепта для Telegram.
@@ -41,8 +42,10 @@ from ..keyboards import (
     main_menu_keyboard,
     parse_result_keyboard,
 )
-from ..normalizer import MAX_IMAGE_BYTES
+from ..chitchat import reply_for_intent
+from ..intent_router import TextIntent, classify_user_text, is_recipe_text
 from ..localization import Localization
+from ..normalizer import MAX_IMAGE_BYTES
 from ..recipe_vault import VaultFailureError, VaultPipelineResult
 from ..recipe_vault.models import VaultFailureHit, VaultRecipeHit
 from ..ytdlp_mixin import VideoPolicyError
@@ -77,31 +80,17 @@ _TRUNCATED_NOTICE_HTML: str = "\n…\n<i>(сокращено)</i>"
 # выполняет парсер; лучше ошибиться в сторону «попробовали и узнали».
 _URL_REGEX = re.compile(r"https?://\S+", re.IGNORECASE)
 
-# Подсказка, если пользователь прислал что-то непонятное.
-_NOT_A_URL_HINT: str = (
-    "🤔 Не вижу ссылки и не похоже на рецепт. Отправь:\n"
+# Подсказка, если сообщение не распознано (ни рецепт, ни FAQ).
+_FALLBACK_HINT: str = (
+    "🤔 Пока не понял запрос.\n\n"
+    "Могу помочь, если пришлёшь:\n"
     "• ссылку на рецепт (http:// или https://)\n"
-    "• или текст рецепта (ингредиенты и шаги)\n"
-    "• или нажми 📋 Меню, чтобы увидеть доступные действия."
+    "• текст рецепта — ингредиенты и шаги\n"
+    "• или нажми 📋 Меню"
 )
 
-# Минимальная длина текста, чтобы пробовать распознать рецепт.
-_RECIPE_TEXT_MIN_CHARS: int = 35
-
-# Признаки рецепта в свободном тексте (ингредиенты, шаги, единицы измерения).
-_RECIPE_TEXT_SIGNAL_RE = re.compile(
-    r"(?:"
-    r"ингредиент|состав|понадобится|понадобятся|нужно:|"
-    r"готовк|приготов|нарез|смешай|запек|варить|тушить|"
-    r"рецепт|"
-    r"\d+\s*(?:г|кг|мл|л|шт|ст\.?\s*л\.?|ч\.?\s*л\.?)\b|"
-    r"(?:^|\n)\s*\d+[\.\)]\s"
-    r")",
-    re.IGNORECASE | re.MULTILINE,
-)
-
-# Длинный текст без URL — часто пересланный рецепт из мессенджера.
-_RECIPE_TEXT_LONG_CHARS: int = 120
+# Устаревшее имя — для совместимости тестов/импортов.
+_NOT_A_URL_HINT = _FALLBACK_HINT
 
 # Лимит подписи к фото (Telegram).
 _TG_PHOTO_CAPTION_LIMIT: int = 1024
@@ -430,14 +419,29 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await _handle_url(message, context, user.id, recipe_url)
         return
 
-    # Свободный текст → рецепт без ссылки.
-    if _looks_like_recipe_text(raw_text):
+    # Свободный текст → рецепт или скриптовый ответ (без ИИ).
+    classification = classify_user_text(raw_text)
+    if classification.intent == TextIntent.RECIPE:
         await _handle_text_recipe(message, context, user.id, raw_text)
         return
 
-    # Всё остальное — подсказка.
+    bot = _get_bot(context)
+    chitchat_reply = reply_for_intent(classification.intent, bot.config)
+    if chitchat_reply:
+        use_html = classification.intent in {
+            TextIntent.LIMITS,
+            TextIntent.MINI_APP,
+        }
+        await message.reply_text(
+            chitchat_reply,
+            parse_mode=ParseMode.HTML if use_html else None,
+            reply_markup=main_menu_keyboard(),
+            disable_web_page_preview=True,
+        )
+        return
+
     await message.reply_text(
-        _NOT_A_URL_HINT,
+        _FALLBACK_HINT,
         reply_markup=main_menu_keyboard(),
     )
 
@@ -724,17 +728,8 @@ class RecipeProgress:
 
 
 def _looks_like_recipe_text(text: str) -> bool:
-    """Эвристика: похоже ли сообщение на рецепт, а не на болтовню."""
-    t = (text or "").strip()
-    if len(t) < _RECIPE_TEXT_MIN_CHARS:
-        return False
-    if _RECIPE_TEXT_SIGNAL_RE.search(t):
-        return True
-    if len(t) >= _RECIPE_TEXT_LONG_CHARS:
-        return True
-    lines = [ln.strip() for ln in t.splitlines() if ln.strip()]
-    bullet_lines = sum(1 for ln in lines if re.search(r"^[-•—*]\s", ln))
-    return len(lines) >= 4 and bullet_lines >= 2
+    """Эвристика: похоже ли сообщение на рецепт (делегат в intent_router)."""
+    return is_recipe_text(text)
 
 
 def _text_processing_key(text: str) -> str:
@@ -1643,8 +1638,8 @@ if __name__ == "__main__":
     assert _looks_like_recipe_text(_sample_recipe)
     assert not _looks_like_recipe_text("привет")
     assert not _looks_like_recipe_text("ок")
-    assert _looks_like_recipe_text("а" * 130)
-    print("✅ _looks_like_recipe_text")
+    assert not _looks_like_recipe_text("а" * 130)
+    print("✅ _looks_like_recipe_text / intent_router")
 
     _tmp_img = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
     _tmp_img.write(b"\xff\xd8\xff\xd9")
