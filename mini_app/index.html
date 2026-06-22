@@ -128,21 +128,39 @@
             min-height: 32px;
         }
         .top-header {
-            flex-wrap: wrap;
-            align-items: flex-start;
+            flex-wrap: nowrap;
+            align-items: center;
             justify-content: space-between;
-            row-gap: 10px;
+            gap: 12px;
+            margin-bottom: 8px;
         }
         .top-header .title {
             flex: 1 1 auto;
             min-width: 0;
         }
-        .theme-toggle-row {
+        .theme-icon-btn {
+            appearance: none;
+            flex-shrink: 0;
+            width: 40px;
+            height: 40px;
+            border: 0;
+            border-radius: 50%;
+            background: var(--btn-secondary-bg);
+            font-size: 20px;
+            line-height: 1;
             display: inline-flex;
             align-items: center;
-            gap: 8px;
-            flex-shrink: 0;
-            margin-left: auto;
+            justify-content: center;
+            cursor: pointer;
+            transition: transform 0.12s ease, opacity 0.12s ease;
+            -webkit-tap-highlight-color: transparent;
+        }
+        .theme-icon-btn:active {
+            transform: scale(0.92);
+            opacity: 0.85;
+        }
+        .theme-toggle-row {
+            display: none;
         }
         .theme-toggle-text {
             font-size: 13px;
@@ -195,8 +213,91 @@
             font-size: 14px;
             font-style: italic;
             line-height: 1.4;
-            margin: 8px 0 16px;
+            margin: 4px 0 16px;
             padding: 0 8px;
+        }
+
+        /* ============================================================= *
+         * Поиск — live filter по названию и ингредиентам
+         * ============================================================= */
+        .search-bar {
+            margin-bottom: 14px;
+        }
+        .search-field {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            background: var(--card-bg);
+            border: 1px solid var(--border);
+            border-radius: 999px;
+            padding: 0 12px 0 14px;
+            min-height: 44px;
+            box-shadow: var(--shadow-sm);
+            transition: border-color 0.15s ease, box-shadow 0.15s ease;
+        }
+        .search-field:focus-within {
+            border-color: rgba(42, 171, 238, 0.55);
+            box-shadow: 0 0 0 3px rgba(42, 171, 238, 0.12);
+        }
+        .search-icon {
+            font-size: 16px;
+            line-height: 1;
+            opacity: 0.55;
+            flex-shrink: 0;
+            user-select: none;
+        }
+        .search-input {
+            flex: 1;
+            min-width: 0;
+            border: 0;
+            background: transparent;
+            color: var(--text-primary);
+            font-size: 16px;
+            line-height: 1.35;
+            padding: 10px 0;
+            outline: none;
+            -webkit-appearance: none;
+        }
+        .search-input::placeholder {
+            color: var(--text-secondary);
+            opacity: 0.85;
+        }
+        .search-input::-webkit-search-cancel-button,
+        .search-input::-webkit-search-decoration {
+            -webkit-appearance: none;
+        }
+        .search-clear {
+            appearance: none;
+            flex-shrink: 0;
+            width: 28px;
+            height: 28px;
+            border: 0;
+            border-radius: 50%;
+            background: var(--btn-secondary-bg);
+            color: var(--text-secondary);
+            font-size: 18px;
+            line-height: 1;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            cursor: pointer;
+            padding: 0;
+            -webkit-tap-highlight-color: transparent;
+        }
+        .search-clear:active { opacity: 0.7; }
+        .search-results-meta {
+            font-size: 13px;
+            color: var(--text-secondary);
+            margin: -4px 0 10px 4px;
+        }
+        .search-mark {
+            background: rgba(42, 171, 238, 0.28);
+            color: inherit;
+            border-radius: 3px;
+            padding: 0 2px;
+        }
+        [data-theme="dark"] .search-mark {
+            background: rgba(42, 171, 238, 0.42);
         }
 
         .back-btn {
@@ -1125,20 +1226,22 @@
         }
 
         function buildThemeToggle() {
-            var row = el("div", { class: "theme-toggle-row" });
-            row.appendChild(el("span", { class: "theme-toggle-text" }, ["Тёмный режим"]));
-            var label = el("label", { class: "theme-switch" });
-            var input = el("input", { type: "checkbox" });
-            input.checked = getTheme() === "dark";
-            input.addEventListener("change", function () {
-                applyTheme(input.checked ? "dark" : "light");
-            });
-            var track = el("span", { class: "theme-switch-track" });
-            track.appendChild(el("span", { class: "theme-switch-thumb" }));
-            label.appendChild(input);
-            label.appendChild(track);
-            row.appendChild(label);
-            return row;
+            var isDark = getTheme() === "dark";
+            return el("button", {
+                type: "button",
+                class: "theme-icon-btn",
+                "aria-label": isDark ? "Светлая тема" : "Тёмная тема",
+                title: isDark ? "Светлая тема" : "Тёмная тема",
+                onclick: function (ev) {
+                    var btn = ev.currentTarget;
+                    var next = getTheme() === "dark" ? "light" : "dark";
+                    applyTheme(next);
+                    var nowDark = next === "dark";
+                    btn.textContent = nowDark ? "☀️" : "🌙";
+                    btn.setAttribute("aria-label", nowDark ? "Светлая тема" : "Тёмная тема");
+                    btn.title = nowDark ? "Светлая тема" : "Тёмная тема";
+                }
+            }, [isDark ? "☀️" : "🌙"]);
         }
 
         function buildHomeHeader() {
@@ -1672,11 +1775,13 @@
         // Навигация: dish_type → main_ingredient. Счётчики + дерево id для бейджей «новое».
         async function fetchDishTree(userId) {
             if (IS_DEMO) {
-                return { tree: Object.create(null), idTree: Object.create(null) };
+                return { tree: Object.create(null), idTree: Object.create(null), searchIndex: [] };
             }
             const rows = await apiGet(
                 "recipes?user_id=eq." + encodeURIComponent(userId) +
-                "&select=id,dish_type,main_ingredient"
+                "&select=id,title,dish_type,main_ingredient,prep_time,cook_time,total_time," +
+                "servings,difficulty,meal_type,cuisine,nutrition_per_serving,image_url,ingredients" +
+                "&order=created_at.desc"
             );
             const tree = Object.create(null);
             const idTree = Object.create(null);
@@ -1690,7 +1795,7 @@
                 tree[d][m] = (tree[d][m] || 0) + 1;
                 idTree[d][m].push(rid);
             });
-            return { tree: tree, idTree: idTree };
+            return { tree: tree, idTree: idTree, searchIndex: rows };
         }
 
         async function fetchRecipes(userId, dishType, mainIngredient) {
@@ -1727,6 +1832,9 @@
             dishTree: null,
             // id в разрезе dish_type → main_ingredient (для бейджей «новое»)
             dishIdTree: null,
+            // Лёгкий индекс для live-поиска (загружается вместе с деревом категорий)
+            searchIndex: null,
+            searchQuery: "",
             currentDishType: null,
             currentMainIngredient: null,
             recipes: null,
@@ -1738,6 +1846,193 @@
             deleting: false
         };
 
+        var SEARCH_DEBOUNCE_MS = 160;
+        var searchDebounceTimer = null;
+        var searchFocusRestore = false;
+
+        function normalizeSearchQuery(q) {
+            return String(q || "").trim().toLowerCase().replace(/\s+/g, " ");
+        }
+
+        function isSearchActive() {
+            return normalizeSearchQuery(state.searchQuery).length > 0;
+        }
+
+        function recipeSearchHaystack(r) {
+            var parts = [
+                r.title || "",
+                dishName(r.dish_type || ""),
+                mainIngName(r.main_ingredient || "")
+            ];
+            var ings = r.ingredients;
+            if (Array.isArray(ings)) {
+                ings.forEach(function (ing) {
+                    if (!ing) return;
+                    if (ing.name) parts.push(ing.name);
+                    if (ing.notes) parts.push(ing.notes);
+                });
+            }
+            return parts.join(" ").toLowerCase();
+        }
+
+        function recipeMatchesSearch(query, r) {
+            var q = normalizeSearchQuery(query);
+            if (!q) return false;
+            var tokens = q.split(" ").filter(Boolean);
+            if (!tokens.length) return false;
+            var hay = recipeSearchHaystack(r);
+            return tokens.every(function (t) { return hay.indexOf(t) !== -1; });
+        }
+
+        function recipeSearchScore(query, r) {
+            var q = normalizeSearchQuery(query);
+            var title = (r.title || "").toLowerCase();
+            var score = 0;
+            q.split(" ").filter(Boolean).forEach(function (t) {
+                if (title.startsWith(t)) score += 30;
+                else if (title.indexOf(t) !== -1) score += 20;
+                else score += 5;
+            });
+            return score;
+        }
+
+        function getSearchScopeFilter() {
+            if (state.screen === "dish_types") {
+                return function () { return true; };
+            }
+            if (state.screen === "main_ingredients") {
+                var dk = state.currentDishType || "main";
+                return function (r) { return (r.dish_type || "main") === dk; };
+            }
+            if (state.screen === "recipes") {
+                var dk2 = state.currentDishType || "main";
+                var mk = state.currentMainIngredient || "other";
+                return function (r) {
+                    return (r.dish_type || "main") === dk2 &&
+                        (r.main_ingredient || "other") === mk;
+                };
+            }
+            return function () { return false; };
+        }
+
+        function runRecipeSearch(query) {
+            var idx = state.searchIndex || [];
+            var scope = getSearchScopeFilter();
+            var q = normalizeSearchQuery(query);
+            if (!q) return [];
+            var matched = idx.filter(function (r) {
+                return scope(r) && recipeMatchesSearch(q, r);
+            });
+            matched.sort(function (a, b) {
+                var diff = recipeSearchScore(q, b) - recipeSearchScore(q, a);
+                if (diff !== 0) return diff;
+                return String(a.title || "").localeCompare(String(b.title || ""), "ru");
+            });
+            return matched.slice(0, 50);
+        }
+
+        function escapeHtml(s) {
+            return String(s)
+                .replace(/&/g, "&amp;")
+                .replace(/</g, "&lt;")
+                .replace(/>/g, "&gt;")
+                .replace(/"/g, "&quot;");
+        }
+
+        function highlightSearchTitle(title, query) {
+            var t = title || "Без названия";
+            var tokens = normalizeSearchQuery(query).split(" ").filter(Boolean);
+            if (!tokens.length) return escapeHtml(t);
+            tokens.sort(function (a, b) { return b.length - a.length; });
+            var lower = t.toLowerCase();
+            var i;
+            for (i = 0; i < tokens.length; i++) {
+                var tok = tokens[i];
+                var ix = lower.indexOf(tok);
+                if (ix !== -1) {
+                    return escapeHtml(t.slice(0, ix)) +
+                        "<mark class=\"search-mark\">" +
+                        escapeHtml(t.slice(ix, ix + tok.length)) +
+                        "</mark>" +
+                        escapeHtml(t.slice(ix + tok.length));
+                }
+            }
+            return escapeHtml(t);
+        }
+
+        function buildSearchBar(placeholder) {
+            var wrap = el("div", { class: "search-bar" });
+            var field = el("div", { class: "search-field" });
+            field.appendChild(el("span", { class: "search-icon", "aria-hidden": "true" }, ["🔍"]));
+            var input = el("input", {
+                type: "search",
+                class: "search-input",
+                placeholder: placeholder,
+                autocomplete: "off",
+                autocorrect: "off",
+                spellcheck: "false",
+                "aria-label": placeholder,
+                inputMode: "search",
+                enterKeyHint: "search"
+            });
+            input.value = state.searchQuery || "";
+            input.addEventListener("input", function () {
+                state.searchQuery = input.value;
+                searchFocusRestore = true;
+                clearTimeout(searchDebounceTimer);
+                searchDebounceTimer = setTimeout(function () { render(); }, SEARCH_DEBOUNCE_MS);
+            });
+            input.addEventListener("keydown", function (e) {
+                if (e.key === "Escape") {
+                    state.searchQuery = "";
+                    searchFocusRestore = true;
+                    render();
+                }
+            });
+            field.appendChild(input);
+            if ((state.searchQuery || "").length > 0) {
+                field.appendChild(el("button", {
+                    type: "button",
+                    class: "search-clear",
+                    "aria-label": "Очистить поиск",
+                    onclick: function () {
+                        state.searchQuery = "";
+                        searchFocusRestore = true;
+                        render();
+                    }
+                }, ["×"]));
+            }
+            wrap.appendChild(field);
+            wrap._searchInput = input;
+            return wrap;
+        }
+
+        function restoreSearchFocusIfNeeded(wrap) {
+            if (!searchFocusRestore || !wrap || !wrap._searchInput) return;
+            try {
+                wrap._searchInput.focus();
+                var len = wrap._searchInput.value.length;
+                wrap._searchInput.setSelectionRange(len, len);
+            } catch (_) { /* noop */ }
+            searchFocusRestore = false;
+        }
+
+        function appendSearchResults(screen) {
+            var results = runRecipeSearch(state.searchQuery);
+            if (results.length) {
+                screen.appendChild(el("div", { class: "search-results-meta" }, [
+                    "Найдено: " + results.length
+                ]));
+                appendRecipeList(screen, results, { highlightQuery: state.searchQuery });
+            } else {
+                screen.appendChild(placeholder(
+                    "🔎",
+                    "Ничего не найдено",
+                    "Попробуйте другое название или ингредиент."
+                ));
+            }
+        }
+
         function navigate(next) {
             state.stack.push({
                 screen: state.screen,
@@ -1745,6 +2040,7 @@
                 currentMainIngredient: state.currentMainIngredient,
                 currentRecipeId: state.currentRecipeId
             });
+            state.searchQuery = next.screen === "detail" ? state.searchQuery : "";
             Object.assign(state, next);
             state.error = null;
             render();
@@ -1756,10 +2052,14 @@
                 if (tg) { try { tg.close(); } catch (_) { /* noop */ } }
                 return;
             }
+            var leavingDetail = state.screen === "detail";
             state.screen = prev.screen;
             state.currentDishType = prev.currentDishType;
             state.currentMainIngredient = prev.currentMainIngredient;
             state.currentRecipeId = prev.currentRecipeId;
+            if (!leavingDetail) {
+                state.searchQuery = "";
+            }
             state.error = null;
             render();
             if (state.screen === "recipes" && state.currentDishType && state.currentMainIngredient) {
@@ -1963,24 +2263,98 @@
         //  Рендеры экранов
         // ================================================================ //
 
+        function buildRecipeCard(r, opts) {
+            opts = opts || {};
+            var dk = opts.defaultDishType || r.dish_type || "main";
+            var mk = opts.defaultMainIngredient || r.main_ingredient || "other";
+            var highlightQuery = opts.highlightQuery || "";
+            var total = Number(r.total_time) || (Number(r.prep_time) + Number(r.cook_time)) || 0;
+            var nut = nutritionPerServing(r);
+            var cal = nut && (Number(nut.calories) || 0);
+            var metaParts = [];
+            var cardTimeLabel = formatTime(total);
+            if (cardTimeLabel) {
+                metaParts.push(el("span", {}, ["⏱ " + cardTimeLabel]));
+            }
+            if (cal) metaParts.push(el("span", {}, ["🔥 " + cal + " ккал"]));
+            if (r.difficulty) {
+                metaParts.push(el("span", {}, [diffEmoji(r.difficulty) + " " + diffName(r.difficulty)]));
+            }
+            var bds = el("div", { class: "recipe-card-badges" });
+            bds.appendChild(el("span", { class: "mini-badge" },
+                [dishEmoji(r.dish_type || dk) + " " + dishName(r.dish_type || dk)]));
+            bds.appendChild(el("span", { class: "mini-badge" },
+                [mainIngEmoji(r.main_ingredient || mk) + " " + mainIngName(r.main_ingredient || mk)]));
+            if (r.meal_type) {
+                bds.appendChild(el("span", {
+                    class: "mini-badge mini-badge--meal"
+                }, [mealEmoji(r.meal_type) + " " + mealName(r.meal_type)]));
+            }
+            var unseen = isRecipeUnviewedInStorage(r.id);
+            var cardClass = "recipe-card" + (unseen ? " recipe-card--unseen" : "");
+            var cardChildren = [];
+            if (unseen) {
+                cardChildren.push(el("div", { class: "recipe-new-tag" }, ["Новый"]));
+            }
+            var nameNode;
+            if (highlightQuery) {
+                nameNode = el("div", { class: "name", html: highlightSearchTitle(r.title, highlightQuery) });
+            } else {
+                nameNode = el("div", { class: "name" }, [r.title || "Без названия"]);
+            }
+            cardChildren.push(
+                nameNode,
+                bds,
+                metaParts.length ? el("div", { class: "meta" }, metaParts) : null
+            );
+            return el("div", {
+                class: cardClass,
+                role: "button",
+                tabindex: "0",
+                onclick: function () { openRecipe(r.id); }
+            }, cardChildren);
+        }
+
+        function appendRecipeList(parent, recipes, opts) {
+            var list = el("div", { class: "recipe-list" });
+            (recipes || []).forEach(function (r) {
+                list.appendChild(buildRecipeCard(r, opts));
+            });
+            parent.appendChild(list);
+            return list;
+        }
+
         function renderDishTypesScreen() {
             const root = clearApp();
             const screen = el("div", { class: "screen" });
 
             screen.appendChild(buildHomeHeader());
+            var searchWrap = buildSearchBar("Поиск по названию и ингредиентам…");
+            screen.appendChild(searchWrap);
 
             if (state.loading) {
-                screen.appendChild(homeMotivationLine());
-                const grid = el("div", { class: "categories" });
-                grid.appendChild(skeleton(6, "cat"));
-                screen.appendChild(grid);
+                if (!isSearchActive()) {
+                    screen.appendChild(homeMotivationLine());
+                    const grid = el("div", { class: "categories" });
+                    grid.appendChild(skeleton(6, "cat"));
+                    screen.appendChild(grid);
+                }
                 root.appendChild(screen);
+                restoreSearchFocusIfNeeded(searchWrap);
                 return;
             }
 
             if (state.error) {
                 screen.appendChild(placeholder("😕", "Не удалось загрузить", state.error, loadDishTree));
                 root.appendChild(screen);
+                restoreSearchFocusIfNeeded(searchWrap);
+                return;
+            }
+
+            if (isSearchActive()) {
+                appendSearchResults(screen);
+                root.appendChild(screen);
+                restoreSearchFocusIfNeeded(searchWrap);
                 return;
             }
 
@@ -1999,6 +2373,7 @@
                     screen.appendChild(closeButton());
                 }
                 root.appendChild(screen);
+                restoreSearchFocusIfNeeded(searchWrap);
                 return;
             }
 
@@ -2041,6 +2416,7 @@
             screen.appendChild(grid);
             screen.appendChild(closeButton());
             root.appendChild(screen);
+            restoreSearchFocusIfNeeded(searchWrap);
         }
 
         function renderMainIngredientsScreen() {
@@ -2052,12 +2428,22 @@
                 backBtn(),
                 el("h1", { class: "title" }, [dishEmoji(dk) + " " + dishName(dk)])
             ]));
+            var searchWrap = buildSearchBar("Поиск в «" + dishName(dk) + "»…");
+            screen.appendChild(searchWrap);
+
+            if (isSearchActive()) {
+                appendSearchResults(screen);
+                root.appendChild(screen);
+                restoreSearchFocusIfNeeded(searchWrap);
+                return;
+            }
 
             const sub = (state.dishTree && state.dishTree[dk]) || {};
             const mkeys = Object.keys(sub);
             if (mkeys.length === 0) {
                 screen.appendChild(placeholder("📭", "Нет рецептов"));
                 root.appendChild(screen);
+                restoreSearchFocusIfNeeded(searchWrap);
                 return;
             }
 
@@ -2091,6 +2477,7 @@
             });
             screen.appendChild(grid);
             root.appendChild(screen);
+            restoreSearchFocusIfNeeded(searchWrap);
         }
 
         function closeButton() {
@@ -2113,12 +2500,22 @@
                 backBtn(),
                 el("h1", { class: "title" }, [hdr])
             ]));
+            var searchWrap = buildSearchBar("Поиск в «" + mainIngName(mk) + "»…");
+            screen.appendChild(searchWrap);
+
+            if (isSearchActive()) {
+                appendSearchResults(screen);
+                root.appendChild(screen);
+                restoreSearchFocusIfNeeded(searchWrap);
+                return;
+            }
 
             if (state.loading) {
                 const list = el("div", { class: "recipe-list" });
                 list.appendChild(skeleton(4, "row"));
                 screen.appendChild(list);
                 root.appendChild(screen);
+                restoreSearchFocusIfNeeded(searchWrap);
                 return;
             }
 
@@ -2126,6 +2523,7 @@
                 screen.appendChild(placeholder("😕", "Не удалось загрузить", state.error,
                     function () { loadRecipes(state.currentDishType, state.currentMainIngredient); }));
                 root.appendChild(screen);
+                restoreSearchFocusIfNeeded(searchWrap);
                 return;
             }
 
@@ -2133,57 +2531,16 @@
             if (recipes.length === 0) {
                 screen.appendChild(placeholder("📭", "В этой категории пока пусто"));
                 root.appendChild(screen);
+                restoreSearchFocusIfNeeded(searchWrap);
                 return;
             }
 
-            const list = el("div", { class: "recipe-list" });
-            recipes.forEach(function (r) {
-                const total = Number(r.total_time) || (Number(r.prep_time) + Number(r.cook_time)) || 0;
-                const nut = nutritionPerServing(r);
-                const cal = nut && (Number(nut.calories) || 0);
-                const metaParts = [];
-                const cardTimeLabel = formatTime(total);
-                if (cardTimeLabel) {
-                    metaParts.push(el("span", {}, ["⏱ " + cardTimeLabel]));
-                }
-                if (cal) metaParts.push(el("span", {}, ["🔥 " + cal + " ккал"]));
-                if (r.difficulty) {
-                    metaParts.push(el("span", {}, [diffEmoji(r.difficulty) + " " + diffName(r.difficulty)]));
-                }
-                const bds = el("div", { class: "recipe-card-badges" });
-                bds.appendChild(el("span", { class: "mini-badge" },
-                    [dishEmoji(r.dish_type || dk) + " " + dishName(r.dish_type || dk)]));
-                bds.appendChild(el("span", { class: "mini-badge" },
-                    [mainIngEmoji(r.main_ingredient || mk) + " " + mainIngName(r.main_ingredient || mk)]));
-                if (r.meal_type) {
-                    bds.appendChild(el("span", {
-                        class: "mini-badge mini-badge--meal"
-                    }, [mealEmoji(r.meal_type) + " " + mealName(r.meal_type)]));
-                }
-
-                const unseen = isRecipeUnviewedInStorage(r.id);
-                const cardClass = "recipe-card" + (unseen ? " recipe-card--unseen" : "");
-                const cardChildren = [];
-                if (unseen) {
-                    cardChildren.push(el("div", { class: "recipe-new-tag" }, ["Новый"]));
-                }
-                cardChildren.push(
-                    el("div", { class: "name" }, [r.title || "Без названия"]),
-                    bds,
-                    metaParts.length
-                        ? el("div", { class: "meta" }, metaParts)
-                        : null
-                );
-                list.appendChild(el("div", {
-                    class: cardClass,
-                    role: "button",
-                    tabindex: "0",
-                    onclick: function () { openRecipe(r.id); }
-                }, cardChildren));
+            appendRecipeList(screen, recipes, {
+                defaultDishType: dk,
+                defaultMainIngredient: mk
             });
-
-            screen.appendChild(list);
             root.appendChild(screen);
+            restoreSearchFocusIfNeeded(searchWrap);
         }
 
         // -------------------------------------------------------------- //
@@ -2554,6 +2911,7 @@
                 var res = await fetchDishTree(USER_ID);
                 state.dishTree = res.tree;
                 state.dishIdTree = res.idTree;
+                state.searchIndex = res.searchIndex;
             } catch (e) {
                 state.error = e.message || "Неизвестная ошибка";
                 console.error(e);
@@ -2569,6 +2927,7 @@
             fetchDishTree(USER_ID).then(function (res) {
                 state.dishTree = res.tree;
                 state.dishIdTree = res.idTree;
+                state.searchIndex = res.searchIndex;
                 render();
             }).catch(function (e) { console.warn("dish tree refresh", e); });
         }
