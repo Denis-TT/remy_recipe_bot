@@ -136,7 +136,13 @@ _CHEF_PROMPT_TEMPLATE = (
     "• чем заменить баклажан?\n"
     "• что делать, если нет духовки?\n\n"
     "<i>Отвечаю только по этому рецепту. "
-    "Один запрос раз в 3 минуты. Файлы и фото здесь не разбираю.</i>"
+    "Один запрос раз в 3 минуты. Файлы и фото здесь не разбираю. "
+    "Выйти — кнопка «Нет, спасибо» после ответа или 📋 Меню.</i>"
+)
+
+_CHEF_EXIT_TEXT = (
+    "🍳 Вышли из режима шефа. "
+    "Пришли ссылку на рецепт или открой 📖 Книгу рецептов."
 )
 
 _CHEF_ATTACHMENT_HINT = (
@@ -467,32 +473,53 @@ async def handle_webapp_data(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
 
     action = str(data.get("action") or "").strip()
-    if action != "share_recipe":
-        logger.info("Неизвестное действие WebAppData: %s", action)
-        return
-
     recipe_id = str(data.get("recipe_id") or "").strip()
-    if not recipe_id:
-        await message.reply_text("❌ Не удалось определить рецепт для шаринга.")
+
+    if action == "share_recipe":
+        if not recipe_id:
+            await message.reply_text("❌ Не удалось определить рецепт для шаринга.")
+            return
+
+        bot = _get_bot(context)
+        try:
+            recipe = await bot.storage.get_recipe(recipe_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("❌ Ошибка получения рецепта для WebApp share %s: %s", recipe_id, exc)
+            await message.reply_text("❌ Не удалось загрузить рецепт для шаринга.")
+            return
+
+        if recipe is None or not _recipe_belongs_to_user(recipe, user.id):
+            await message.reply_text("❌ Рецепт не найден.")
+            return
+
+        try:
+            await _send_shared_recipe(message.chat_id, recipe, context.bot)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("❌ WebApp share %s: ошибка отправки: %s", recipe_id, exc, exc_info=True)
+            await message.reply_text("❌ Не удалось отправить рецепт. Попробуй ещё раз.")
         return
 
-    bot = _get_bot(context)
-    try:
-        recipe = await bot.storage.get_recipe(recipe_id)
-    except Exception as exc:  # noqa: BLE001
-        logger.error("❌ Ошибка получения рецепта для WebApp share %s: %s", recipe_id, exc)
-        await message.reply_text("❌ Не удалось загрузить рецепт для шаринга.")
+    if action == "ask_chef":
+        if not recipe_id:
+            await message.reply_text("❌ Не удалось определить рецепт для вопроса шефу.")
+            return
+
+        bot = _get_bot(context)
+        try:
+            recipe = await bot.storage.get_recipe(recipe_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("❌ WebApp ask_chef %s: %s", recipe_id, exc)
+            await message.reply_text("❌ Не удалось загрузить рецепт.")
+            return
+
+        if recipe is None or not _recipe_belongs_to_user(recipe, user.id):
+            await message.reply_text("❌ Рецепт не найден.")
+            return
+
+        await start_chef_session(message, context, user.id, recipe)
         return
 
-    if recipe is None or not _recipe_belongs_to_user(recipe, user.id):
-        await message.reply_text("❌ Рецепт не найден.")
-        return
-
-    try:
-        await _send_shared_recipe(message.chat_id, recipe, context.bot)
-    except Exception as exc:  # noqa: BLE001
-        logger.error("❌ WebApp share %s: ошибка отправки: %s", recipe_id, exc, exc_info=True)
-        await message.reply_text("❌ Не удалось отправить рецепт. Попробуй ещё раз.")
+    logger.info("Неизвестное действие WebAppData: %s", action)
 
 
 def _guess_image_mime(head: bytes) -> str:
@@ -1183,6 +1210,18 @@ def _get_chef_session(bot: "RemyBot", user_id: int) -> Optional[Mapping[str, Any
     return bot.chef_sessions.get(int(user_id))
 
 
+def _touch_chef_session(bot: "RemyBot", user_id: int) -> None:
+    """Продлить TTL сессии шефа (активность пользователя)."""
+    entry = bot.chef_sessions.get(int(user_id))
+    if entry is not None:
+        entry["timestamp"] = time.time()
+
+
+def end_chef_session(bot: "RemyBot", user_id: int) -> bool:
+    """Завершить сессию шефа. Returns: была ли активна."""
+    return bot.chef_sessions.pop(int(user_id), None) is not None
+
+
 async def start_chef_session(
     message: Message,
     context: ContextTypes.DEFAULT_TYPE,
@@ -1248,14 +1287,29 @@ async def try_handle_chef_question(
         return True
 
     bot.chef_rate_limiter.record(user_id)
+    _touch_chef_session(bot, user_id)
     title = _html_escape(str(session.get("title") or "рецепт"))
     body = f"👨‍🍳 <b>Шеф Реми</b> · «{title}»\n\n{_html_escape(answer)}"
     if len(body) > _TG_MESSAGE_LIMIT:
         body = body[: _TG_MESSAGE_LIMIT - 4].rstrip() + "…"
+    from ..keyboards import chef_followup_keyboard
+
+    followup = "\n\n<i>Хотите задать ещё вопрос?</i>"
+    body_with_prompt = body + followup
+    if len(body_with_prompt) > _TG_MESSAGE_LIMIT:
+        body_with_prompt = body
+    kb = chef_followup_keyboard()
     try:
-        await status.edit_text(body, parse_mode=ParseMode.HTML)
+        await status.edit_text(
+            body_with_prompt,
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb,
+        )
     except BadRequest:
-        await message.reply_text(answer[:_TG_MESSAGE_LIMIT])
+        await message.reply_text(
+            answer[:_TG_MESSAGE_LIMIT],
+            reply_markup=kb,
+        )
     return True
 
 

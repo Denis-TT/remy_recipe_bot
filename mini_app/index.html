@@ -3178,6 +3178,15 @@
             if (IS_DEMO) return;
             const id = String(recipeId || "").trim();
             if (!id) return;
+            // sendData — без /start в чате; deep link — запасной вариант.
+            if (tg && typeof tg.sendData === "function") {
+                try {
+                    tg.sendData(JSON.stringify({ action: "ask_chef", recipe_id: id }));
+                    return;
+                } catch (e) {
+                    console.warn("askChefRemy sendData:", e);
+                }
+            }
             const deepLink = "https://t.me/remy_recipe_bot?start=chef_" + encodeURIComponent(id);
             if (tg && typeof tg.openTelegramLink === "function") {
                 tg.openTelegramLink(deepLink);

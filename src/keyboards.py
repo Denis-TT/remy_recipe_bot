@@ -302,3 +302,13 @@ def tutorial_back_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("⬅️ Назад", callback_data="go_to_start")],
     ])
+
+
+def chef_followup_keyboard() -> InlineKeyboardMarkup:
+    """После ответа шефа: продолжить диалог или выйти из режима."""
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ Да, ещё вопрос", callback_data="chef_more"),
+            InlineKeyboardButton("Нет, спасибо", callback_data="chef_exit"),
+        ],
+    ])

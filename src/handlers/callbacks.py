@@ -211,6 +211,14 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await _callback_chef_temp(bot, query, user_id, context)
         return
 
+    if data == "chef_more":
+        await _callback_chef_more(bot, query, user_id)
+        return
+
+    if data == "chef_exit":
+        await _callback_chef_exit(bot, query, user_id)
+        return
+
     if data.startswith("chef_"):
         recipe_id = data[len("chef_"):]
         await _callback_chef(bot, query, user_id, recipe_id, context)
@@ -548,6 +556,43 @@ async def _callback_delete(
 
     logger.info("🗑 Рецепт %s удалён (user %s)", recipe_id, user_id)
     await show_categories(bot, user_id, send=query.edit_message_text)
+
+
+async def _callback_chef_more(
+    bot: "RemyBot",
+    query: CallbackQuery,
+    user_id: int,
+) -> None:
+    """Продолжить сессию шефа после ответа."""
+    from .messages import _get_chef_session, _touch_chef_session
+
+    message = query.message
+    if message is None:
+        return
+    session = _get_chef_session(bot, user_id)
+    if session is None:
+        await message.reply_text(
+            "Сессия шефа уже завершена. Открой рецепт и нажми «Спросить у шефа Реми».",
+        )
+        return
+    _touch_chef_session(bot, user_id)
+    title = str(session.get("title") or "рецепт").strip()
+    await message.reply_text(f"👨‍🍳 Задай следующий вопрос по рецепту «{title}».")
+
+
+async def _callback_chef_exit(
+    bot: "RemyBot",
+    query: CallbackQuery,
+    user_id: int,
+) -> None:
+    """Выйти из режима вопросов шефу."""
+    from .messages import _CHEF_EXIT_TEXT, end_chef_session
+
+    message = query.message
+    if message is None:
+        return
+    end_chef_session(bot, user_id)
+    await message.reply_text(_CHEF_EXIT_TEXT)
 
 
 async def _callback_chef(
