@@ -13,5 +13,18 @@
 #
 # Спецтокен "..." сохраняет автоопределённые Nixpacks пакеты (Python и пр.),
 # а мы лишь добавляем ffmpeg — поэтому остальная сборка не меняется.
+
+[variables]
+# railway.toml pythonVersion иногда игнорируется — дублируем для Nixpacks.
+NIXPACKS_PYTHON_VERSION = "3.11"
+
 [phases.setup]
 nixPkgs = ["...", "ffmpeg"]
+
+# Устойчивость к обрывам PyPI (JSONDecodeError на Railway при pip resolve).
+[phases.install]
+cmds = [
+  "python -m venv --copies /opt/venv",
+  ". /opt/venv/bin/activate && pip install --upgrade pip wheel setuptools",
+  ". /opt/venv/bin/activate && pip install --retries 10 --timeout 120 --prefer-binary -r requirements.txt",
+]
