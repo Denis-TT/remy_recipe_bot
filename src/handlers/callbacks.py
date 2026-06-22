@@ -207,6 +207,15 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await _callback_share(bot, query, user_id, recipe_id, context)
         return
 
+    if data == "chef_temp":
+        await _callback_chef_temp(bot, query, user_id, context)
+        return
+
+    if data.startswith("chef_"):
+        recipe_id = data[len("chef_"):]
+        await _callback_chef(bot, query, user_id, recipe_id, context)
+        return
+
     if data.startswith("delete_"):
         recipe_id = data[len("delete_"):]
         await _callback_delete(bot, query, user_id, recipe_id)
@@ -539,6 +548,70 @@ async def _callback_delete(
 
     logger.info("🗑 Рецепт %s удалён (user %s)", recipe_id, user_id)
     await show_categories(bot, user_id, send=query.edit_message_text)
+
+
+async def _callback_chef(
+    bot: "RemyBot",
+    query: CallbackQuery,
+    user_id: int,
+    recipe_id: str,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """Начать сессию вопросов шефу по сохранённому рецепту."""
+    message = query.message
+    if message is None:
+        return
+    try:
+        await query.answer()
+    except BadRequest:
+        pass
+
+    recipe_id = (recipe_id or "").strip()
+    if not recipe_id:
+        return
+
+    try:
+        recipe = await bot.storage.get_recipe(recipe_id)
+    except Exception as exc:  # noqa: BLE001
+        logger.error("❌ Chef callback: загрузка %s: %s", recipe_id, exc)
+        await message.reply_text("❌ Не удалось загрузить рецепт.")
+        return
+
+    if recipe is None:
+        await message.reply_text("❌ Рецепт не найден.")
+        return
+
+    from .messages import start_chef_session
+
+    await start_chef_session(message, context, user_id, recipe)
+
+
+async def _callback_chef_temp(
+    bot: "RemyBot",
+    query: CallbackQuery,
+    user_id: int,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """Начать сессию шефа по рецепту из temp_recipes (до сохранения)."""
+    message = query.message
+    if message is None:
+        return
+    try:
+        await query.answer()
+    except BadRequest:
+        pass
+
+    bot.cleanup_expired_temp_recipes()
+    entry = bot.temp_recipes.get(user_id)
+    if entry is None:
+        await message.reply_text(
+            "⚠️ Рецепт больше недоступен. Пришли ссылку ещё раз.",
+        )
+        return
+
+    from .messages import start_chef_session
+
+    await start_chef_session(message, context, user_id, dict(entry["recipe"]))
 
 
 async def _callback_share(

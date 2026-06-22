@@ -33,12 +33,13 @@ from telegram.constants import ParseMode
 from telegram.error import BadRequest
 from telegram.ext import ContextTypes
 
+from ..chef_advisor import validate_chef_question
 from ..keyboards import (
     BTN_HELP,
     BTN_MENU,
     BTN_SAVED_RECIPES,
     main_menu_keyboard,
-    save_recipe_keyboard,
+    parse_result_keyboard,
 )
 from ..normalizer import MAX_IMAGE_BYTES
 from ..localization import Localization
@@ -115,6 +116,48 @@ _TG_PHOTO_JPEG_QUALITY: int = 85
 # Публичная ссылка на бота в сообщениях «Поделиться рецептом».
 _REMY_BOT_URL: str = "https://t.me/remy_recipe_bot"
 _REMY_BOT_USERNAME: str = "@remy_recipe_bot"
+_BOT_LINK_MARKERS = ("t.me/", "telegram.me/", "telegram.dog/")
+
+
+def _strip_trailing_url_punct(url: str) -> str:
+    return url.rstrip(".,);]>\"'")
+
+
+def _is_bot_promo_url(url: str) -> bool:
+    low = url.lower()
+    if not any(m in low for m in _BOT_LINK_MARKERS):
+        return False
+    return "remy" in low or "start=" in low
+
+
+def _pick_recipe_url(text: str) -> Optional[str]:
+    """Первая «контентная» ссылка в тексте (не промо бота)."""
+    candidates: List[str] = []
+    for m in _URL_REGEX.finditer(text or ""):
+        candidates.append(_strip_trailing_url_punct(m.group(0)))
+    for u in candidates:
+        if not _is_bot_promo_url(u):
+            return u
+    return candidates[0] if candidates else None
+
+
+_CHEF_PROMPT_TEMPLATE = (
+    "👨‍🍳 <b>Задай вопрос шефу Реми</b> по рецепту «{title}».\n\n"
+    "Можно несколько вопросов в одном сообщении, например:\n"
+    "• чем заменить баклажан?\n"
+    "• что делать, если нет духовки?\n\n"
+    "<i>Отвечаю только по этому рецепту. "
+    "Один запрос раз в 3 минуты. Файлы и фото здесь не разбираю.</i>"
+)
+
+_CHEF_ATTACHMENT_HINT = (
+    "📎 Файлы и голосовые я не читаю. Напиши вопрос текстом — "
+    "по ингредиентам, заменам или технике приготовления."
+)
+
+_CHEF_NO_SESSION_HINT = (
+    "Чтобы спросить шефа, открой рецепт и нажми «👨‍🍳 Спросить у шефа Реми»."
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -287,7 +330,7 @@ async def _present_recipe_with_optional_photo(
     bot: "RemyBot",
 ) -> None:
     formatted = format_recipe(recipe, bot)
-    kb = save_recipe_keyboard()
+    kb = parse_result_keyboard()
     img_path = _local_recipe_image_path(recipe)
     if img_path:
         caption_html = _compact_photo_caption(recipe, bot)
@@ -354,6 +397,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if await try_handle_pending_share(message, context, user.id):
         return
 
+    if await try_handle_chef_question(message, context, user.id):
+        return
+
     raw_text: str = (message.text or "").strip()
     logger.info(
         "📨 Получено сообщение от user %s: %r",
@@ -378,10 +424,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await message.reply_text(commands.HELP_TEXT)
         return
 
-    # URL → запускаем пайплайн обработки рецепта.
-    url_match = _URL_REGEX.search(raw_text)
-    if url_match is not None:
-        await _handle_url(message, context, user.id, url_match.group(0))
+    # URL в тексте — приоритет над распознаванием рецепта (в т. ч. vault).
+    recipe_url = _pick_recipe_url(raw_text)
+    if recipe_url is not None:
+        await _handle_url(message, context, user.id, recipe_url)
         return
 
     # Свободный текст → рецепт без ссылки.
@@ -468,6 +514,10 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     logger.info("📷 Получено изображение от user %s", user.id)
     bot = _get_bot(context)
     user_id = user.id
+
+    if _get_chef_session(bot, user_id) is not None:
+        await message.reply_text(_CHEF_ATTACHMENT_HINT)
+        return
 
     if user_id in bot.processing_urls:
         await message.reply_text(
@@ -1119,6 +1169,124 @@ format_recipe_for_telegram = format_recipe
 
 
 # --------------------------------------------------------------------------- #
+# Шеф Реми — консультации по рецепту
+# --------------------------------------------------------------------------- #
+
+
+def _set_chef_session(bot: "RemyBot", user_id: int, recipe: Mapping[str, Any]) -> None:
+    bot.cleanup_expired_chef_sessions()
+    bot.chef_sessions[int(user_id)] = {
+        "recipe": dict(recipe),
+        "title": str(recipe.get("title") or "рецепт").strip(),
+        "recipe_id": str(recipe.get("id") or "").strip(),
+        "timestamp": time.time(),
+    }
+
+
+def _get_chef_session(bot: "RemyBot", user_id: int) -> Optional[Mapping[str, Any]]:
+    bot.cleanup_expired_chef_sessions()
+    return bot.chef_sessions.get(int(user_id))
+
+
+async def start_chef_session(
+    message: Message,
+    context: ContextTypes.DEFAULT_TYPE,
+    user_id: int,
+    recipe: Mapping[str, Any],
+) -> None:
+    """Открыть режим вопросов шефу по рецепту."""
+    bot = _get_bot(context)
+    _set_chef_session(bot, user_id, recipe)
+    title = _html_escape(str(recipe.get("title") or "рецепт").strip())
+    await message.reply_text(
+        _CHEF_PROMPT_TEMPLATE.format(title=title),
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True,
+    )
+
+
+async def try_handle_chef_question(
+    message: Message,
+    context: ContextTypes.DEFAULT_TYPE,
+    user_id: int,
+) -> bool:
+    """Обработать вопрос в активной сессии шефа."""
+    bot = _get_bot(context)
+    session = _get_chef_session(bot, user_id)
+    if session is None:
+        return False
+
+    raw = (message.text or "").strip()
+    if not raw:
+        return False
+
+    if raw in (BTN_MENU, BTN_SAVED_RECIPES, BTN_HELP):
+        bot.chef_sessions.pop(int(user_id), None)
+        return False
+
+    rejection = validate_chef_question(raw)
+    if rejection:
+        await message.reply_text(rejection)
+        return True
+
+    from ..rate_limit import format_wait_label
+
+    allowed, wait_sec = bot.chef_rate_limiter.check(user_id)
+    if not allowed:
+        limit_sec = bot.config.chef_rate_limit_seconds
+        await message.reply_text(
+            f"⏳ Шеф отдыхает ещё {wait_sec} сек. "
+            f"(лимит: 1 вопрос раз в {format_wait_label(limit_sec)}).",
+        )
+        return True
+
+    recipe = session.get("recipe") or {}
+    status = await message.reply_text("👨‍🍳 Шеф думает…")
+    try:
+        answer = await bot.chef_advisor.answer(recipe, raw)
+    except Exception as exc:  # noqa: BLE001
+        logger.error("❌ Chef advisor: %s", exc, exc_info=True)
+        await _safe_edit(
+            status,
+            "😔 Не удалось получить ответ. Попробуй переформулировать вопрос чуть позже.",
+        )
+        return True
+
+    bot.chef_rate_limiter.record(user_id)
+    title = _html_escape(str(session.get("title") or "рецепт"))
+    body = f"👨‍🍳 <b>Шеф Реми</b> · «{title}»\n\n{_html_escape(answer)}"
+    if len(body) > _TG_MESSAGE_LIMIT:
+        body = body[: _TG_MESSAGE_LIMIT - 4].rstrip() + "…"
+    try:
+        await status.edit_text(body, parse_mode=ParseMode.HTML)
+    except BadRequest:
+        await message.reply_text(answer[:_TG_MESSAGE_LIMIT])
+    return True
+
+
+async def handle_attachment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Мягкий ответ на файлы/медиа вне режима парсинга."""
+    message = update.effective_message
+    user = update.effective_user
+    if message is None or user is None:
+        return
+
+    bot = _get_bot(context)
+    if _get_chef_session(bot, user.id) is not None:
+        await message.reply_text(_CHEF_ATTACHMENT_HINT)
+        return
+
+    if user.id in bot.processing_urls:
+        return
+
+    await message.reply_text(
+        "📎 Файлы и голосовые я пока не разбираю.\n"
+        "Пришли ссылку на рецепт, текст или фото блюда — или нажми 📋 Меню.",
+        reply_markup=main_menu_keyboard(),
+    )
+
+
+# --------------------------------------------------------------------------- #
 # Шаринг / очередь Mini App
 # --------------------------------------------------------------------------- #
 
@@ -1173,10 +1341,18 @@ def _recipe_belongs_to_user(recipe: Mapping[str, Any], user_id: int) -> bool:
         return False
 
 
-def _shared_recipe_markup() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("Открыть Remy", url=_REMY_BOT_URL)],
-    ])
+def _shared_recipe_markup(recipe_id: str) -> InlineKeyboardMarkup:
+    rid = str(recipe_id or "").strip()
+    rows: List[List[InlineKeyboardButton]] = []
+    if rid:
+        rows.append([
+            InlineKeyboardButton(
+                "👨‍🍳 Спросить у шефа Реми",
+                callback_data=f"chef_{rid}",
+            ),
+        ])
+    rows.append([InlineKeyboardButton("🍳 Открыть Remy", url=_REMY_BOT_URL)])
+    return InlineKeyboardMarkup(rows)
 
 
 def _public_image_url(recipe: Mapping[str, Any]) -> str:
@@ -1243,6 +1419,9 @@ def _format_shared_recipe(recipe: Mapping[str, Any]) -> str:
         "👨‍🍳 <b>Рецепт приготовлен ботом Remy!</b>",
         f"Попробуй и ты: {_html_escape(_REMY_BOT_USERNAME)}",
     ])
+    source = str(recipe.get("source_url") or "").strip()
+    if source:
+        lines.extend(["", f"🔗 <b>Источник:</b> {_html_escape(source)}"])
     return "\n".join(lines)
 
 
@@ -1268,7 +1447,8 @@ async def _send_shared_recipe(chat_id: int, recipe: Mapping[str, Any], bot: Any)
         recipe.get("id") or "—",
     )
     text = _format_shared_recipe(recipe)
-    markup = _shared_recipe_markup()
+    recipe_id = str(recipe.get("id") or "").strip()
+    markup = _shared_recipe_markup(recipe_id)
     title = str(recipe.get("title") or "Без названия").strip()
     image_url = _public_image_url(recipe)
 

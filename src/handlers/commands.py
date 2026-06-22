@@ -170,6 +170,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if await _start_share_deeplink(update, context, recipe_id):
             return
 
+    if payload.startswith("chef_"):
+        recipe_id = payload[len("chef_"):]
+        if await _start_chef_deeplink(update, context, recipe_id):
+            return
+
     await message.reply_text(
         WELCOME_TEXT,
         reply_markup=welcome_start_keyboard(),
@@ -219,6 +224,37 @@ async def _start_share_deeplink(
     except Exception as exc:  # noqa: BLE001
         logger.error("❌ Deep link share: не удалось отправить рецепт %s: %s", recipe_id, exc)
         await message.reply_text("❌ Не удалось отправить рецепт. Попробуй ещё раз.")
+    return True
+
+
+async def _start_chef_deeplink(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    recipe_id: str,
+) -> bool:
+    """Обработать ``/start chef_<recipe_id>`` — режим вопросов шефу."""
+    from .messages import start_chef_session
+
+    message = update.effective_message
+    user = update.effective_user
+    recipe_id = (recipe_id or "").strip()
+    if message is None or user is None or not recipe_id:
+        return False
+
+    logger.info("👨‍🍳 Deep link chef: user %s, recipe %s", user.id, recipe_id)
+    bot = _get_bot(context)
+    try:
+        recipe = await bot.storage.get_recipe(recipe_id)
+    except Exception as exc:  # noqa: BLE001
+        logger.error("❌ Deep link chef: загрузка %s: %s", recipe_id, exc)
+        await message.reply_text("❌ Не удалось загрузить рецепт.")
+        return True
+
+    if recipe is None:
+        await message.reply_text("❌ Рецепт не найден.")
+        return True
+
+    await start_chef_session(message, context, user.id, recipe)
     return True
 
 

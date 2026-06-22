@@ -49,6 +49,7 @@ from .localization import Localization
 from .normalizer import RecipeNormalizer
 from .parser import InstagramParser, ParserRegistry, create_parser_registry, ensure_images_dir
 from .apify_guard import ApifyDailyGuard, configure_apify_guard
+from .chef_advisor import ChefAdvisor
 from .rate_limit import UserRateLimiter
 from .recipe_vault import RecipeVault, VaultFailureError, VaultPipelineResult
 from .ytdlp_mixin import YtdlpWhisperMixin
@@ -60,6 +61,10 @@ logger = logging.getLogger("remy.bot")
 
 # Время жизни временного рецепта в `temp_recipes`.
 TEMP_RECIPE_TTL_SECONDS: int = 30 * 60
+
+
+# Время жизни сессии «спросить у шефа».
+CHEF_SESSION_TTL_SECONDS: int = 45 * 60
 
 
 class RemyBot:
@@ -107,6 +112,13 @@ class RemyBot:
         self.url_rate_limiter = UserRateLimiter(self.config.url_rate_limit_seconds)
         self.photo_rate_limiter = UserRateLimiter(self.config.photo_rate_limit_seconds)
         self.text_rate_limiter = UserRateLimiter(self.config.text_rate_limit_seconds)
+        self.chef_rate_limiter = UserRateLimiter(self.config.chef_rate_limit_seconds)
+        self.chef_advisor = ChefAdvisor(
+            self.config.github_token,
+            model=self.config.github_model,
+            reasoning_effort=self.config.github_reasoning_effort,
+        )
+        self.chef_sessions: Dict[int, Dict[str, Any]] = {}
         configure_apify_guard(ApifyDailyGuard(self.config.apify_max_runs_per_day))
         self.heavy_job_semaphore = asyncio.Semaphore(self.config.max_concurrent_video_jobs)
         for parser in self.parser.parsers:
@@ -138,6 +150,18 @@ class RemyBot:
         if expired:
             logger.info("🧹 Очищено просроченных рецептов: %d", len(expired))
 
+        return len(expired)
+
+    def cleanup_expired_chef_sessions(self) -> int:
+        """Удалить просроченные сессии шефа Реми."""
+        now = time.time()
+        expired = [
+            uid
+            for uid, entry in self.chef_sessions.items()
+            if now - float(entry.get("timestamp", 0)) > CHEF_SESSION_TTL_SECONDS
+        ]
+        for uid in expired:
+            self.chef_sessions.pop(uid, None)
         return len(expired)
 
     def _preload_whisper_background(self) -> None:
@@ -206,6 +230,14 @@ class RemyBot:
             MessageHandler(
                 filters.TEXT & ~filters.COMMAND,
                 messages.handle_text,
+            )
+        )
+
+        # --- Файлы / медиа (мягкие ответы вне режима рецепта) ------------
+        app.add_handler(
+            MessageHandler(
+                filters.Document.ALL | filters.VOICE | filters.VIDEO | filters.AUDIO,
+                messages.handle_attachment,
             )
         )
 

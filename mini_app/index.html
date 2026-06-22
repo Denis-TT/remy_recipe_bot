@@ -475,6 +475,55 @@
             gap: 10px;
             margin: 20px 0 0;
         }
+        .chef-ask-card {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            width: 100%;
+            margin: 16px 0 4px;
+            padding: 14px 16px;
+            border: 0;
+            border-radius: var(--radius-lg);
+            cursor: pointer;
+            text-align: left;
+            color: var(--text-primary);
+            background: linear-gradient(135deg, rgba(42, 171, 238, 0.14) 0%, rgba(42, 171, 238, 0.06) 100%);
+            box-shadow: var(--shadow-md);
+            -webkit-tap-highlight-color: transparent;
+            touch-action: manipulation;
+            transition: transform 0.12s ease, opacity 0.12s ease;
+        }
+        .chef-ask-card:active {
+            transform: scale(0.98);
+            opacity: 0.92;
+        }
+        .chef-ask-icon {
+            flex-shrink: 0;
+            width: 44px;
+            height: 44px;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 22px;
+            background: rgba(42, 171, 238, 0.18);
+        }
+        .chef-ask-text {
+            display: flex;
+            flex-direction: column;
+            gap: 2px;
+            min-width: 0;
+        }
+        .chef-ask-title {
+            font-size: 15px;
+            font-weight: 700;
+            letter-spacing: -0.2px;
+        }
+        .chef-ask-sub {
+            font-size: 13px;
+            color: var(--text-secondary);
+            line-height: 1.35;
+        }
         .recipe-share-btn {
             width: 100%;
             min-height: 48px;
@@ -2732,6 +2781,22 @@
             }
             if (badges.childNodes.length) screen.appendChild(badges);
 
+            if (!IS_DEMO && (r.id != null && r.id !== "")) {
+                screen.appendChild(el("button", {
+                    type: "button",
+                    class: "chef-ask-card",
+                    onclick: function () { askChefRemy(String(r.id)); }
+                }, [
+                    el("span", { class: "chef-ask-icon" }, ["👨‍🍳"]),
+                    el("span", { class: "chef-ask-text" }, [
+                        el("span", { class: "chef-ask-title" }, ["Спросить у шефа Реми"]),
+                        el("span", { class: "chef-ask-sub" }, [
+                            "Замены, техника, что делать без духовки…"
+                        ])
+                    ])
+                ]));
+            }
+
             // 4. КБЖУ на порцию — компактная сетка 4 колонки или пояснение.
             const nutritionNoteRaw = String(r.nutrition_note || "").trim();
             const nutritionEstimated = !!r.nutrition_estimated;
@@ -3100,37 +3165,25 @@
         function shareRecipe(recipeId) {
             if (IS_DEMO) return;
             const id = String(recipeId || "").trim();
-            const uid = USER_ID || getUserId(tg);
-            if (!id || !uid) return;
+            if (!id) return;
+            const deepLink = "https://t.me/remy_recipe_bot?start=share_" + encodeURIComponent(id);
+            if (tg && typeof tg.openTelegramLink === "function") {
+                tg.openTelegramLink(deepLink);
+            } else {
+                window.open(deepLink, "_blank");
+            }
+        }
 
-            (async function () {
-                try {
-                    await apiUpsert(
-                        "pending_shares",
-                        { user_id: uid, recipe_id: id },
-                        "user_id"
-                    );
-                } catch (e) {
-                    console.error(e);
-                    if (typeof tg !== "undefined" && tg && typeof tg.showAlert === "function") {
-                        tg.showAlert("Не удалось подготовить отправку. Попробуйте позже.");
-                    } else {
-                        window.alert("Не удалось подготовить отправку. Попробуйте позже.");
-                    }
-                    return;
-                }
-                const botLink = "https://t.me/remy_recipe_bot";
-                if (tg && typeof tg.openTelegramLink === "function") {
-                    tg.openTelegramLink(botLink);
-                } else {
-                    window.open(botLink, "_blank");
-                }
-                if (tg && typeof tg.showAlert === "function") {
-                    tg.showAlert(
-                        "Откройте чат с ботом — рецепт будет отправлен автоматически."
-                    );
-                }
-            })();
+        function askChefRemy(recipeId) {
+            if (IS_DEMO) return;
+            const id = String(recipeId || "").trim();
+            if (!id) return;
+            const deepLink = "https://t.me/remy_recipe_bot?start=chef_" + encodeURIComponent(id);
+            if (tg && typeof tg.openTelegramLink === "function") {
+                tg.openTelegramLink(deepLink);
+            } else {
+                window.open(deepLink, "_blank");
+            }
         }
 
         function notifyRecipeDeleted() {

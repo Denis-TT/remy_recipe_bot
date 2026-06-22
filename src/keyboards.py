@@ -152,14 +152,25 @@ def menu_keyboard(webapp_url: str = "") -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
-def save_recipe_keyboard() -> InlineKeyboardMarkup:
-    """Кнопки «✅ Сохранить» / «❌ Не сохранять» под распарсенным рецептом."""
+def parse_result_keyboard() -> InlineKeyboardMarkup:
+    """Кнопки под распарсенным рецептом (до сохранения): шеф + сохранить."""
     return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "👨‍🍳 Спросить у шефа Реми",
+                callback_data="chef_temp",
+            ),
+        ],
         [
             InlineKeyboardButton("✅ Сохранить", callback_data="save"),
             InlineKeyboardButton("❌ Не сохранять", callback_data="dont_save"),
         ],
     ])
+
+
+def save_recipe_keyboard() -> InlineKeyboardMarkup:
+    """Алиас для обратной совместимости."""
+    return parse_result_keyboard()
 
 
 def dish_types_keyboard(
@@ -249,11 +260,17 @@ def recipe_detail_keyboard(
     dish_type: str = "",
     main_ingredient: str = "",
 ) -> InlineKeyboardMarkup:
-    """Кнопки под детальным просмотром рецепта: «📤 Поделиться», «🗑 Удалить» и «◀️ Назад»."""
+    """Кнопки под детальным просмотром рецепта."""
     back_callback = "back_to_categories"
     if dish_type and main_ingredient:
         back_callback = f"ingredient_{dish_type}_{main_ingredient}"
     return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "👨‍🍳 Спросить у шефа Реми",
+                callback_data=f"chef_{recipe_id}",
+            ),
+        ],
         [
             InlineKeyboardButton("📤 Поделиться", callback_data=f"share_{recipe_id}"),
         ],
