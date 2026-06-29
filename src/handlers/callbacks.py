@@ -5,7 +5,7 @@
 в :class:`src.bot.RemyBot` как единственный `CallbackQueryHandler`.
 Внутри — диспетчер по префиксам `callback_data`:
 
-    save                — сохранить рецепт из `temp_recipes[user_id]`
+    save                — сохранить рецепт из `temp_recipes[temp_id]`
     dont_save           — скрыть кнопки под распарсенным рецептом
     show_categories     — показать список типов блюд пользователя
     show_help           — показать текст помощи
@@ -120,12 +120,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     # --- Сохранение распарсенного рецепта --------------------------------- #
-    if data == "save":
-        await _callback_save(query, bot, user_id)
+    if data.startswith("dont_save_"):
+        await _callback_dont_save(query, bot, user_id, data[len("dont_save_"):])
         return
 
-    if data == "dont_save":
-        await _callback_dont_save(query, bot, user_id)
+    if data.startswith("save_"):
+        await _callback_save(query, bot, user_id, data[len("save_"):])
         return
 
     # --- Навигация по меню ------------------------------------------------- #
@@ -207,8 +207,26 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await _callback_share(bot, query, user_id, recipe_id, context)
         return
 
+    if data.startswith("chef_temp_"):
+        await _callback_chef_temp(
+            bot, query, user_id, context, data[len("chef_temp_"):]
+        )
+        return
+
     if data == "chef_temp":
-        await _callback_chef_temp(bot, query, user_id, context)
+        legacy_msg = query.message
+        if legacy_msg is not None:
+            await legacy_msg.reply_text(
+                "⚠️ Эта кнопка устарела. Пришли ссылку на рецепт ещё раз.",
+            )
+        return
+
+    if data in ("save", "dont_save"):
+        legacy_msg = query.message
+        if legacy_msg is not None:
+            await legacy_msg.reply_text(
+                "⚠️ Эта кнопка устарела. Пришли ссылку на рецепт ещё раз.",
+            )
         return
 
     if data == "chef_more":
@@ -277,13 +295,22 @@ async def _callback_run_example_test(
 # Save / Don't save
 # --------------------------------------------------------------------------- #
 
-async def _callback_save(query: CallbackQuery, bot: "RemyBot", user_id: int) -> None:
+async def _callback_save(
+    query: CallbackQuery,
+    bot: "RemyBot",
+    user_id: int,
+    temp_id: str,
+) -> None:
     """Сохранить рецепт из временного кэша в Supabase."""
     bot.cleanup_expired_temp_recipes()
 
-    entry = bot.temp_recipes.pop(user_id, None)
+    entry = bot.pop_temp_recipe(temp_id, user_id)
     if entry is None:
-        logger.warning("⚠️  Нет временного рецепта для user %s", user_id)
+        logger.warning(
+            "⚠️  Нет временного рецепта temp_id=%s для user %s",
+            temp_id,
+            user_id,
+        )
         await _safe_edit(
             query,
             "⚠️ Рецепт больше недоступен. Пришли ссылку ещё раз.",
@@ -300,7 +327,7 @@ async def _callback_save(query: CallbackQuery, bot: "RemyBot", user_id: int) -> 
     except Exception as exc:  # noqa: BLE001
         logger.error("❌ Ошибка сохранения рецепта: %s", exc)
         # Возвращаем рецепт в кэш, чтобы можно было повторить попытку.
-        bot.temp_recipes[user_id] = entry
+        bot.temp_recipes[temp_id] = entry
         await _safe_edit(
             query,
             f"❌ Не удалось сохранить рецепт: <code>{_html_escape_str(str(exc))}</code>",
@@ -321,9 +348,14 @@ async def _callback_save(query: CallbackQuery, bot: "RemyBot", user_id: int) -> 
         await message.reply_text(f"✅ Сохранено: «{title}»")
 
 
-async def _callback_dont_save(query: CallbackQuery, bot: "RemyBot", user_id: int) -> None:
+async def _callback_dont_save(
+    query: CallbackQuery,
+    bot: "RemyBot",
+    user_id: int,
+    temp_id: str,
+) -> None:
     """Отменить сохранение: снять кнопки, стереть из временного кэша."""
-    bot.temp_recipes.pop(user_id, None)
+    bot.pop_temp_recipe(temp_id, user_id)
     try:
         await query.edit_message_reply_markup(reply_markup=None)
     except BadRequest as exc:
@@ -636,6 +668,7 @@ async def _callback_chef_temp(
     query: CallbackQuery,
     user_id: int,
     context: ContextTypes.DEFAULT_TYPE,
+    temp_id: str,
 ) -> None:
     """Начать сессию шефа по рецепту из temp_recipes (до сохранения)."""
     message = query.message
@@ -647,7 +680,7 @@ async def _callback_chef_temp(
         pass
 
     bot.cleanup_expired_temp_recipes()
-    entry = bot.temp_recipes.get(user_id)
+    entry = bot.get_temp_recipe(temp_id, user_id)
     if entry is None:
         await message.reply_text(
             "⚠️ Рецепт больше недоступен. Пришли ссылку ещё раз.",

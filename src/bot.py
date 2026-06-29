@@ -29,7 +29,8 @@ import asyncio
 import logging
 import threading
 import time
-from typing import Any, Dict, Optional
+import uuid
+from typing import Any, Dict, Mapping, Optional
 
 from telegram.ext import (
     Application,
@@ -81,7 +82,7 @@ class RemyBot:
             в структурированный рецепт.
         storage: Реализация :class:`BaseStorage` (по умолчанию Supabase).
         temp_recipes: Временный кэш распарсенных рецептов,
-            ключ — Telegram user id.
+            ключ — уникальный ``temp_id`` (см. :meth:`store_temp_recipe`).
     """
 
     def __init__(self, cfg: Optional[Config] = None) -> None:
@@ -107,7 +108,7 @@ class RemyBot:
             self.config.supabase_key,
         )
         self.recipe_vault: RecipeVault = RecipeVault(self.storage, self.config)
-        self.temp_recipes: Dict[int, Dict[str, Any]] = {}
+        self.temp_recipes: Dict[str, Dict[str, Any]] = {}
         self.processing_urls: Dict[int, str] = {}
         self.url_rate_limiter = UserRateLimiter(self.config.url_rate_limit_seconds)
         self.photo_rate_limiter = UserRateLimiter(self.config.photo_rate_limit_seconds)
@@ -131,6 +132,40 @@ class RemyBot:
     # Временный кэш рецептов
     # ------------------------------------------------------------------ #
 
+    def store_temp_recipe(self, user_id: int, recipe: Mapping[str, Any]) -> str:
+        """Сохранить распарсенный рецепт до нажатия «Сохранить».
+
+        Returns:
+            ``temp_id`` для ``callback_data`` (save_/dont_save_/chef_temp_).
+        """
+        temp_id = uuid.uuid4().hex
+        self.temp_recipes[temp_id] = {
+            "recipe": dict(recipe),
+            "user_id": int(user_id),
+            "timestamp": time.time(),
+        }
+        self.cleanup_expired_temp_recipes()
+        return temp_id
+
+    def get_temp_recipe(self, temp_id: str, user_id: int) -> Optional[Dict[str, Any]]:
+        """Получить запись временного рецепта, если она принадлежит пользователю."""
+        entry = self.temp_recipes.get(str(temp_id or "").strip())
+        if entry is None:
+            return None
+        if int(entry.get("user_id", 0)) != int(user_id):
+            return None
+        return entry
+
+    def pop_temp_recipe(self, temp_id: str, user_id: int) -> Optional[Dict[str, Any]]:
+        """Извлечь временный рецепт из кэша (атомарно для save/dont_save)."""
+        tid = str(temp_id or "").strip()
+        entry = self.temp_recipes.get(tid)
+        if entry is None:
+            return None
+        if int(entry.get("user_id", 0)) != int(user_id):
+            return None
+        return self.temp_recipes.pop(tid, None)
+
     def cleanup_expired_temp_recipes(self) -> int:
         """Удалить просроченные записи из `temp_recipes`.
 
@@ -140,12 +175,12 @@ class RemyBot:
         """
         now = time.time()
         expired = [
-            user_id
-            for user_id, entry in self.temp_recipes.items()
+            temp_id
+            for temp_id, entry in self.temp_recipes.items()
             if now - float(entry.get("timestamp", 0)) > TEMP_RECIPE_TTL_SECONDS
         ]
-        for user_id in expired:
-            self.temp_recipes.pop(user_id, None)
+        for temp_id in expired:
+            self.temp_recipes.pop(temp_id, None)
 
         if expired:
             logger.info("🧹 Очищено просроченных рецептов: %d", len(expired))
@@ -349,10 +384,11 @@ if __name__ == "__main__":
     bot = RemyBot(_cfg_module.config)
 
     # --- TTL-очистка ---------------------------------------------------- #
-    bot.temp_recipes[1] = {"recipe": {"title": "Актуальный"}, "timestamp": time.time()}
-    bot.temp_recipes[2] = {"recipe": {"title": "Старый"}, "timestamp": 0}
+    fresh_id = bot.store_temp_recipe(1, {"title": "Актуальный"})
+    stale_id = bot.store_temp_recipe(2, {"title": "Старый"})
+    bot.temp_recipes[stale_id]["timestamp"] = 0
     assert bot.cleanup_expired_temp_recipes() == 1
-    assert 1 in bot.temp_recipes and 2 not in bot.temp_recipes
+    assert fresh_id in bot.temp_recipes and stale_id not in bot.temp_recipes
 
     # --- Форматирование рецепта ---------------------------------------- #
     from src.handlers.messages import (  # noqa: E402
@@ -416,9 +452,13 @@ if __name__ == "__main__":
         for btn in row
     )
 
-    save_kb = save_recipe_keyboard()
+    save_kb = save_recipe_keyboard("a" * 32)
     data_values = {btn.callback_data for row in save_kb.inline_keyboard for btn in row}
-    assert data_values == {"save", "dont_save"}
+    assert data_values == {
+        f"save_{'a' * 32}",
+        f"dont_save_{'a' * 32}",
+        f"chef_temp_{'a' * 32}",
+    }
 
     assert callable(messages.handle_photo)
 

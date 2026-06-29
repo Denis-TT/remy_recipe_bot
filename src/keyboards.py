@@ -152,25 +152,26 @@ def menu_keyboard(webapp_url: str = "") -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
-def parse_result_keyboard() -> InlineKeyboardMarkup:
+def parse_result_keyboard(temp_id: str) -> InlineKeyboardMarkup:
     """Кнопки под распарсенным рецептом (до сохранения): шеф + сохранить."""
+    tid = str(temp_id or "").strip()
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton(
                 "👨‍🍳 Спросить у шефа Реми",
-                callback_data="chef_temp",
+                callback_data=f"chef_temp_{tid}",
             ),
         ],
         [
-            InlineKeyboardButton("✅ Сохранить", callback_data="save"),
-            InlineKeyboardButton("❌ Не сохранять", callback_data="dont_save"),
+            InlineKeyboardButton("✅ Сохранить", callback_data=f"save_{tid}"),
+            InlineKeyboardButton("❌ Не сохранять", callback_data=f"dont_save_{tid}"),
         ],
     ])
 
 
-def save_recipe_keyboard() -> InlineKeyboardMarkup:
+def save_recipe_keyboard(temp_id: str) -> InlineKeyboardMarkup:
     """Алиас для обратной совместимости."""
-    return parse_result_keyboard()
+    return parse_result_keyboard(temp_id)
 
 
 def dish_types_keyboard(

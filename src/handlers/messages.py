@@ -323,9 +323,11 @@ async def _present_recipe_with_optional_photo(
     status: Message,
     recipe: Mapping[str, Any],
     bot: "RemyBot",
+    *,
+    temp_id: str,
 ) -> None:
     formatted = format_recipe(recipe, bot)
-    kb = parse_result_keyboard()
+    kb = parse_result_keyboard(temp_id)
     img_path = _local_recipe_image_path(recipe)
     if img_path:
         caption_html = _compact_photo_caption(recipe, bot)
@@ -636,12 +638,13 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             if gen_path:
                 await attach_recipe_image(result, gen_path, bot.storage)
 
-        bot.temp_recipes[user.id] = {"recipe": result, "timestamp": time.time()}
-        bot.cleanup_expired_temp_recipes()
+        temp_id = bot.store_temp_recipe(user.id, result)
 
         logger.info("✅ Рецепт извлечён из изображения")
 
-        await _present_recipe_with_optional_photo(message, status, result, bot)
+        await _present_recipe_with_optional_photo(
+            message, status, result, bot, temp_id=temp_id,
+        )
     finally:
         if bot.processing_urls.get(user_id) == "photo":
             bot.processing_urls.pop(user_id, None)
@@ -851,8 +854,7 @@ async def _handle_text_recipe(
             if gen_path:
                 await attach_recipe_image(recipe, gen_path, bot.storage)
 
-        bot.temp_recipes[user_id] = {"recipe": recipe, "timestamp": time.time()}
-        bot.cleanup_expired_temp_recipes()
+        temp_id = bot.store_temp_recipe(user_id, recipe)
 
         logger.info(
             "✅ Рецепт из текста: «%s», meal_type=%s",
@@ -861,7 +863,9 @@ async def _handle_text_recipe(
         )
 
         await progress.set_stage("present")
-        await _present_recipe_with_optional_photo(message, status, recipe, bot)
+        await _present_recipe_with_optional_photo(
+            message, status, recipe, bot, temp_id=temp_id,
+        )
     finally:
         if bot.processing_urls.get(user_id) == job_key:
             bot.processing_urls.pop(user_id, None)
@@ -1045,8 +1049,7 @@ async def _handle_url(
         if img_vault.startswith(("http://", "https://")):
             recipe["image_url"] = img_vault
 
-        bot.temp_recipes[user_id] = {"recipe": recipe, "timestamp": time.time()}
-        bot.cleanup_expired_temp_recipes()
+        temp_id = bot.store_temp_recipe(user_id, recipe)
 
         logger.info(
             "✅ Рецепт обработан%s: «%s», meal_type=%s",
@@ -1057,7 +1060,9 @@ async def _handle_url(
 
         if not from_vault:
             await progress.set_stage("present")
-        await _present_recipe_with_optional_photo(message, status, recipe, bot)
+        await _present_recipe_with_optional_photo(
+            message, status, recipe, bot, temp_id=temp_id,
+        )
     finally:
         if bot.processing_urls.get(user_id) == job_key:
             bot.processing_urls.pop(user_id, None)
