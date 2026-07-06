@@ -1,0 +1,42 @@
+# Сбрасывает таймер неактивности Supabase Free Plan (пауза после ~7 дней без API).
+# Секреты: Settings → Secrets and variables → Actions → SUPABASE_URL, SUPABASE_ANON_KEY
+# См. docs/deploy.md §1.6
+
+name: Supabase keep-alive
+
+on:
+  schedule:
+    # Пн и чт, 09:00 UTC — чаще раза в 7 дней, с запасом до auto-pause.
+    - cron: "0 9 * * 1,4"
+  workflow_dispatch:
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Ping Supabase (Edge Function)
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${SUPABASE_URL:-}" || -z "${SUPABASE_ANON_KEY:-}" ]]; then
+            echo "::error::Добавьте SUPABASE_URL и SUPABASE_ANON_KEY в Secrets репозитория (Settings → Secrets → Actions)."
+            exit 1
+          fi
+          url="${SUPABASE_URL%/}/functions/v1/telegram-auth"
+          echo "Pinging ${url} ..."
+          http_code=$(curl -sS -o /tmp/supabase-keepalive-body -w "%{http_code}" \
+            -X POST "${url}" \
+            -H "apikey: ${SUPABASE_ANON_KEY}" \
+            -H "Authorization: Bearer ${SUPABASE_ANON_KEY}" \
+            -H "Content-Type: application/json" \
+            -d '{"keepalive":true}')
+          if [[ "${http_code}" == "000" || "${http_code}" -ge 500 ]]; then
+            echo "::error::Supabase недоступен (HTTP ${http_code})"
+            cat /tmp/supabase-keepalive-body || true
+            exit 1
+          fi
+          # Без initData функция вернёт 4xx — это нормально, главное что вызов дошёл.
+          echo "OK (HTTP ${http_code}) — активность Supabase зафиксирована."

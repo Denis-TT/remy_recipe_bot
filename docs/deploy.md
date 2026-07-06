@@ -129,6 +129,29 @@ DELETE FROM recipes WHERE title='test';
 
 Если каждая команда отработала — всё готово.
 
+### 1.6. Keep-alive на Free Plan (чтобы проект не ушёл в pause)
+
+На бесплатном тарифе Supabase **ставит проект на паузу после ~7 дней без
+API-активности**. Если ботом и Mini App никто не пользуется — БД «засыпает».
+
+В репозитории есть workflow `.github/workflows/supabase-keepalive.yml`:
+**2 раза в неделю** (пн и чт, 09:00 UTC) он вызывает Edge Function
+`telegram-auth`. Ответ будет 4xx без `initData` — это ожидаемо; для Supabase
+важен сам факт запроса.
+
+**Один раз после пуша в GitHub:**
+
+1. Репозиторий → **Settings → Secrets and variables → Actions → New repository secret**:
+   | Secret | Значение |
+   | --- | --- |
+   | `SUPABASE_URL` | Project URL из п. 1.3 |
+   | `SUPABASE_ANON_KEY` | **anon** ключ из п. 1.3 (не service_role) |
+2. **Actions** → workflow **Supabase keep-alive** → **Run workflow** (проверка вручную).
+3. Зелёный run с `OK (HTTP 4xx)` — всё настроено.
+
+> Edge Function `telegram-auth` должна быть задеплоена (п. 1.4).  
+> Расписание можно поменять в `cron` внутри yaml; главное — чаще одного раза в 7 дней.
+
 ---
 
 ## 2. Railway — сам бот
@@ -321,6 +344,8 @@ Railway перезапустит сервис; `RemyBot` автоматичес�
 | Mini App: «Авторизация не удалась» / HTTP 401 | Edge Function `telegram-auth` не задеплоена или неверный `TELEGRAM_BOT_TOKEN` в secrets. |
 | Mini App: пустые категории после RLS | Миграция `migration_rls_user_isolation.sql` накатана, но Mini App старый (без JWT) или нет `access_token`. |
 | Mini App: `USER_ID = 0` | Открыт не через Telegram. Dev: `?user_id=123&dev_secret=<REMY_DEV_AUTH_SECRET>`. |
+| Supabase: проект на pause / «Resume project» | Free Plan: 7 дней без API. Настрой keep-alive (§1.6) или нажми Resume в Dashboard. |
+| GitHub Actions keep-alive красный | Нет secrets `SUPABASE_URL` / `SUPABASE_ANON_KEY` или не задеплоена `telegram-auth`. |
 | В `/menu` нет кнопки Mini App | `WEBAPP_URL` пуст **или** не начинается с `https://` (ключевая проверка в `keyboards.py → _is_valid_webapp_url`). |
 | Mini App: отступ сверху слишком большой / малый | Режим fullscreen vs fullsize: `applyTelegramInsets()` в `mini_app/index.html`. Обнови Mini App после правок. |
 | Отправить Instagram Reels (пример из `/start`) | Парсинг видео: нужны `APIFY_API_TOKEN` и/или Whisper; смотри логи Railway. |
@@ -332,6 +357,7 @@ Railway перезапустит сервис; `RemyBot` автоматичес�
 
 - [ ] Все миграции из §1.2 накатаны (включая `migration_recipe_views.sql`).
 - [ ] Edge Function `telegram-auth` задеплоена, secrets заданы.
+- [ ] GitHub Actions: secrets `SUPABASE_URL` + `SUPABASE_ANON_KEY`, keep-alive workflow зелёный (§1.6).
 - [ ] Railway: `SUPABASE_KEY` = **service_role**; Mini App: **anon** key.
 - [ ] `.env.example` ↔ фактические Variables в Railway — имена совпадают.
 - [ ] `requirements.txt` не содержит лишнего и собран на Railway без
