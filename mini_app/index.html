@@ -1155,6 +1155,48 @@
             to   { background-position: 0   0; }
         }
 
+        /* Полноэкранный лоадер при старте / авторизации */
+        .app-loader {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            gap: 14px;
+            padding: 32px 20px 20px;
+            color: var(--text-secondary);
+            text-align: center;
+        }
+        .app-loader__spinner {
+            width: 40px;
+            height: 40px;
+            border: 3px solid var(--border);
+            border-top-color: var(--accent);
+            border-radius: 50%;
+            animation: remy-spin 0.8s linear infinite;
+        }
+        .app-loader__title {
+            color: var(--text-primary);
+            font-weight: 600;
+            font-size: 16px;
+        }
+        .app-loader__hint {
+            font-size: 13px;
+            line-height: 1.45;
+            max-width: 260px;
+        }
+        @keyframes remy-spin {
+            to { transform: rotate(360deg); }
+        }
+        [data-theme="dark"] .skeleton {
+            background: linear-gradient(
+                90deg,
+                rgba(255, 255, 255, 0.06) 25%,
+                rgba(255, 255, 255, 0.03) 37%,
+                rgba(255, 255, 255, 0.06) 63%
+            );
+            background-size: 400% 100%;
+        }
+
         /* ============================================================= *
          * Transitions между экранами
          * ============================================================= */
@@ -1175,9 +1217,10 @@
 </head>
 <body>
     <div id="app">
-        <div class="placeholder">
-            <span class="ico">⏳</span>
-            <div class="ph-title">Загружаем…</div>
+        <div class="app-loader" aria-live="polite" aria-busy="true">
+            <div class="app-loader__spinner" aria-hidden="true"></div>
+            <div class="app-loader__title">Книга рецептов</div>
+            <div class="app-loader__hint">Загружаем…</div>
         </div>
     </div>
 
@@ -1937,7 +1980,7 @@
             currentRecipeId: null,
             recipe: null,
             error: null,
-            loading: false,
+            loading: true,
             /** Блокировка кнопки «Удалить» на время запроса */
             deleting: false
         };
@@ -2229,6 +2272,14 @@
             }, children);
         }
 
+        function buildAppLoader(title, hint) {
+            return el("div", { class: "app-loader", "aria-live": "polite", "aria-busy": "true" }, [
+                el("div", { class: "app-loader__spinner", "aria-hidden": "true" }),
+                el("div", { class: "app-loader__title" }, [title || "Загружаем…"]),
+                hint ? el("div", { class: "app-loader__hint" }, [hint]) : null
+            ]);
+        }
+
         // Спец-экран для демо-режима (нет user_id ни из Telegram, ни из URL).
         // Показывается вместо пустой заглушки «📭 Пока пусто» на экране
         // категорий, когда USER_ID === "demo_user" и рецептов, очевидно,
@@ -2430,10 +2481,15 @@
 
             if (state.loading) {
                 if (!isSearchActive()) {
-                    screen.appendChild(homeMotivationLine());
+                    screen.appendChild(buildAppLoader(
+                        "Книга рецептов",
+                        ACCESS_TOKEN ? "Загружаем ваши рецепты…" : "Подключаемся к боту…"
+                    ));
                     const grid = el("div", { class: "categories" });
                     grid.appendChild(skeleton(6, "cat"));
                     screen.appendChild(grid);
+                } else {
+                    screen.appendChild(buildAppLoader("Поиск…", null));
                 }
                 root.appendChild(screen);
                 restoreSearchFocusIfNeeded(searchWrap);
@@ -3401,25 +3457,23 @@
         }
 
         window.addEventListener("DOMContentLoaded", function () {
+            applyTheme(getTheme());
             mountDemoBadge();
             render();
             (async function bootstrap() {
-                if (!IS_DEMO) {
-                    state.loading = true;
-                    render();
-                    try {
+                try {
+                    if (!IS_DEMO) {
                         await authenticateTelegram();
-                    } catch (e) {
-                        state.error = (e && e.message) ? e.message : String(e);
-                        console.error(e);
-                    } finally {
-                        state.loading = false;
                         render();
                     }
-                    if (state.error) return;
+                    await initViewedState();
+                    await loadDishTree();
+                } catch (e) {
+                    state.error = (e && e.message) ? e.message : String(e);
+                    state.loading = false;
+                    console.error(e);
+                    render();
                 }
-                await initViewedState();
-                loadDishTree();
             })();
         });
 
