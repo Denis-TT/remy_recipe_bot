@@ -54,20 +54,25 @@ def reply_for_intent(intent: TextIntent, cfg: Optional["Config"] = None) -> Opti
         url_sec = int(getattr(cfg, "url_rate_limit_seconds", 180) or 180)
         photo_sec = int(getattr(cfg, "photo_rate_limit_seconds", 120) or 120)
         text_sec = int(getattr(cfg, "text_rate_limit_seconds", 120) or 120)
-        chef_sec = int(getattr(cfg, "chef_rate_limit_seconds", 180) or 180)
+        chef_sec = int(getattr(cfg, "chef_rate_limit_seconds", 0) or 0)
         max_vid = int(getattr(cfg, "max_video_duration_seconds", 120) or 120)
         vid_label = (
             f"{max_vid // 60} мин" if max_vid % 60 == 0 else f"{max_vid} сек"
         )
-        return (
-            "⏱ <b>Лимиты Реми</b>\n\n"
-            f"• Ссылки — 1 раз в {_rate_label(url_sec)}\n"
-            f"• Фото блюда — 1 раз в {_rate_label(photo_sec)}\n"
-            f"• Текст рецепта — 1 раз в {_rate_label(text_sec)}\n"
-            f"• Вопрос шефу — 1 раз в {_rate_label(chef_sec)}\n"
-            f"• Видео до {vid_label} — полный разбор\n\n"
-            "Повторная ссылка из базы Remy (vault) лимит не тратит."
-        )
+        lines = [
+            "⏱ <b>Лимиты Реми</b>\n",
+            f"• Ссылки — 1 раз в {_rate_label(url_sec)}",
+            f"• Фото блюда — 1 раз в {_rate_label(photo_sec)}",
+            f"• Текст рецепта — 1 раз в {_rate_label(text_sec)}",
+        ]
+        if chef_sec > 0:
+            lines.append(f"• Вопрос шефу — 1 раз в {_rate_label(chef_sec)}")
+        lines.extend([
+            f"• Видео до {vid_label} — полный разбор",
+            "",
+            "Повторная ссылка из базы Remy (vault) лимит не тратит.",
+        ])
+        return "\n".join(lines)
 
     if intent == TextIntent.MINI_APP:
         webapp = (getattr(cfg, "webapp_url", None) or "").strip() if cfg else ""

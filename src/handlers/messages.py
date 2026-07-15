@@ -1303,17 +1303,6 @@ async def try_handle_chef_question(
         await message.reply_text(rejection)
         return True
 
-    from ..rate_limit import format_wait_label
-
-    allowed, wait_sec = bot.chef_rate_limiter.check(user_id)
-    if not allowed:
-        limit_sec = bot.config.chef_rate_limit_seconds
-        await message.reply_text(
-            f"⏳ Шеф отдыхает ещё {wait_sec} сек. "
-            f"(лимит: 1 вопрос раз в {format_wait_label(limit_sec)}).",
-        )
-        return True
-
     recipe = session.get("recipe") or {}
     status = await message.reply_text("👨‍🍳 Шеф думает…")
     try:
@@ -1326,7 +1315,6 @@ async def try_handle_chef_question(
         )
         return True
 
-    bot.chef_rate_limiter.record(user_id)
     _touch_chef_session(bot, user_id)
     title = _html_escape(str(session.get("title") or "рецепт"))
     body = f"👨‍🍳 <b>Шеф Реми</b> · «{title}»\n\n{_html_escape(answer)}"

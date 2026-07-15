@@ -113,7 +113,6 @@ class RemyBot:
         self.url_rate_limiter = UserRateLimiter(self.config.url_rate_limit_seconds)
         self.photo_rate_limiter = UserRateLimiter(self.config.photo_rate_limit_seconds)
         self.text_rate_limiter = UserRateLimiter(self.config.text_rate_limit_seconds)
-        self.chef_rate_limiter = UserRateLimiter(self.config.chef_rate_limit_seconds)
         self.chef_advisor = ChefAdvisor(
             self.config.github_token,
             model=self.config.github_model,

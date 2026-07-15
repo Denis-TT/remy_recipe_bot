@@ -71,8 +71,8 @@ class Config:
     # Лимиты на фото и текст (GitHub Models), сек.
     photo_rate_limit_seconds: int = 120
     text_rate_limit_seconds: int = 120
-    # Вопросы шефу Реми по рецепту (сек).
-    chef_rate_limit_seconds: int = 180
+    # Вопросы шефу Реми по рецепту (сек). 0 = без лимита.
+    chef_rate_limit_seconds: int = 0
     # Apify Actor runs в сутки (0 = без лимита).
     apify_max_runs_per_day: int = 80
     # Recipe Vault: глобальная база URL → рецепт.
@@ -202,9 +202,9 @@ class Config:
             default=120,
             name="TEXT_RATE_LIMIT_SECONDS",
         )
-        chef_rate_limit_seconds = cls._parse_positive_int(
-            os.getenv("CHEF_RATE_LIMIT_SECONDS", "180"),
-            default=180,
+        chef_rate_limit_seconds = cls._parse_non_negative_int(
+            os.getenv("CHEF_RATE_LIMIT_SECONDS", "0"),
+            default=0,
             name="CHEF_RATE_LIMIT_SECONDS",
         )
         apify_max_runs_per_day = cls._parse_non_negative_int(
