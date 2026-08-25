@@ -99,8 +99,9 @@ class RemyBot:
         ensure_images_dir()
         self.parser: ParserRegistry = create_parser_registry(self.config)
         self.normalizer: RecipeNormalizer = RecipeNormalizer(
-            self.config.github_token,
-            model=self.config.github_model,
+            self.config.llm_api_key,
+            model=self.config.llm_model,
+            api_url=self.config.llm_api_url,
             reasoning_effort=self.config.github_reasoning_effort,
         )
         self.storage: SupabaseStorage = SupabaseStorage(
@@ -114,9 +115,10 @@ class RemyBot:
         self.photo_rate_limiter = UserRateLimiter(self.config.photo_rate_limit_seconds)
         self.text_rate_limiter = UserRateLimiter(self.config.text_rate_limit_seconds)
         self.chef_advisor = ChefAdvisor(
-            self.config.github_token,
-            model=self.config.github_model,
+            self.config.llm_api_key,
+            model=self.config.llm_model,
             reasoning_effort=self.config.github_reasoning_effort,
+            api_url=self.config.llm_api_url,
         )
         self.chef_sessions: Dict[int, Dict[str, Any]] = {}
         configure_apify_guard(ApifyDailyGuard(self.config.apify_max_runs_per_day))

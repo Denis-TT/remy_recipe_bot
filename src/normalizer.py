@@ -227,6 +227,18 @@ API_TIMEOUT_SECONDS = 120.0
 #: ТОЛЬКО при сбое парсинга JSON, не при HTTP-ошибке/таймауте.
 MAX_ATTEMPTS = 2
 
+#: Повторы при временной перегрузке провайдера (429/503).
+HTTP_RETRY_STATUSES = frozenset({429, 503})
+HTTP_RETRY_ATTEMPTS = 2
+HTTP_RETRY_BASE_SECONDS = 1.5
+
+#: Запасные модели HF Router, если основная перегружена (429).
+HF_FALLBACK_MODELS = (
+    "openai/gpt-oss-120b:fireworks-ai",
+    "moonshotai/Kimi-K2-Instruct:novita",
+    "deepseek-ai/DeepSeek-V3-0324:novita",
+)
+
 #: Стоп-слова для эвристического извлечения title из текста.
 _TITLE_STOP_WORDS = (
     "ингредиент", "приготовление", "способ", "рецепт", "кухня",
@@ -507,10 +519,6 @@ class RecipeNormalizer:
                 f"{user_text}\n\n[SERVER image_url — copy verbatim to JSON field \"image_url\"]: "
                 f"{json.dumps(str(image_url).strip(), ensure_ascii=True)}"
             )
-        payload = self._build_chat_payload(
-            system=SYSTEM_PROMPT,
-            user_content=user_content,
-        )
         headers = {
             "Authorization": f"Bearer {self.github_token}",
             "Content-Type": "application/json",
@@ -518,31 +526,67 @@ class RecipeNormalizer:
         }
 
         timeout = aiohttp.ClientTimeout(total=API_TIMEOUT_SECONDS)
+        models = self._candidate_models()
 
-        logger.info(
-            "🤖 Отправка запроса к GitHub Models API (модель: %s)", self.model
-        )
-
+        last_status = 0
+        last_body = ""
         try:
             async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
-                async with session.post(self.api_url, json=payload) as response:
-                    body = await response.text(errors="replace")
-
-                    logger.info(
-                        "📡 Ответ получен (статус: %d, %d символов)",
-                        response.status, len(body),
+                for model in models:
+                    payload = self._build_chat_payload(
+                        system=SYSTEM_PROMPT,
+                        user_content=user_content,
+                        model=model,
                     )
+                    logger.info("🤖 Отправка запроса к LLM API (модель: %s)", model)
+                    for attempt in range(1, HTTP_RETRY_ATTEMPTS + 1):
+                        async with session.post(self.api_url, json=payload) as response:
+                            body = await response.text(errors="replace")
+                            last_status = response.status
+                            last_body = body
 
-                    if response.status >= 400:
-                        logger.error(
-                            "❌ Ошибка API (статус %d): %s",
-                            response.status, self._truncate(body, 500),
-                        )
-                        raise RuntimeError(
-                            f"Ошибка GitHub Models API (статус {response.status})"
-                        )
+                            logger.info(
+                                "📡 Ответ получен (статус: %d, %d символов)",
+                                response.status,
+                                len(body),
+                            )
 
-                    return self._extract_content(body)
+                            if response.status < 400:
+                                return self._extract_content(body)
+
+                            if (
+                                response.status in HTTP_RETRY_STATUSES
+                                and attempt < HTTP_RETRY_ATTEMPTS
+                            ):
+                                wait = HTTP_RETRY_BASE_SECONDS * (2 ** (attempt - 1))
+                                logger.warning(
+                                    "⏳ LLM перегружен (HTTP %d, %s), повтор через "
+                                    "%.1f с (%d/%d)",
+                                    response.status,
+                                    model,
+                                    wait,
+                                    attempt,
+                                    HTTP_RETRY_ATTEMPTS,
+                                )
+                                await asyncio.sleep(wait)
+                                continue
+
+                            if response.status in HTTP_RETRY_STATUSES:
+                                logger.warning(
+                                    "⚠️ Модель %s недоступна (HTTP %d), пробую другую",
+                                    model,
+                                    response.status,
+                                )
+                                break
+
+                            logger.error(
+                                "❌ Ошибка API (статус %d): %s",
+                                response.status,
+                                self._truncate(body, 500),
+                            )
+                            raise RuntimeError(
+                                f"Ошибка LLM API (статус {response.status})"
+                            )
 
         except asyncio.TimeoutError:
             logger.error("❌ Таймаут при обращении к AI (%.0f с)", API_TIMEOUT_SECONDS)
@@ -550,6 +594,25 @@ class RecipeNormalizer:
         except aiohttp.ClientError as exc:
             logger.error("❌ Сетевая ошибка при обращении к AI: %s", exc)
             raise RuntimeError(f"Сетевая ошибка при обращении к AI: {exc}") from exc
+
+        logger.error(
+            "❌ Ошибка API после повторов (статус %d): %s",
+            last_status,
+            self._truncate(last_body, 500),
+        )
+        raise RuntimeError(f"Ошибка LLM API (статус {last_status})")
+
+    def _candidate_models(self) -> list[str]:
+        """Основная модель + запасные (для HF Router при 429)."""
+        primary = (self.model or "").strip()
+        models: list[str] = []
+        if primary:
+            models.append(primary)
+        if "huggingface.co" in (self.api_url or ""):
+            for m in HF_FALLBACK_MODELS:
+                if m not in models:
+                    models.append(m)
+        return models or [DEFAULT_MODEL]
 
     async def _call_api_vision(
         self,
@@ -578,7 +641,7 @@ class RecipeNormalizer:
         }
         timeout = aiohttp.ClientTimeout(total=API_TIMEOUT_SECONDS)
 
-        logger.info("🤖 Отправка vision-запроса к GitHub Models API (модель: %s)", model)
+        logger.info("🤖 Отправка vision-запроса к LLM API (модель: %s)", model)
 
         try:
             async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:

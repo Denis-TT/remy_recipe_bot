@@ -994,9 +994,12 @@ async def _handle_url(
             )
         except Exception as exc:  # noqa: BLE001
             logger.error("❌ Ошибка нормализации: %s", exc)
+            from ..recipe_vault.models import is_transient_llm_error
+
             raise VaultFailureError(
                 f"Не удалось обработать рецепт: {exc}",
                 reason=str(exc),
+                transient=is_transient_llm_error(exc),
             ) from exc
 
         title_ok = bool((recipe.get("title") or "").strip())

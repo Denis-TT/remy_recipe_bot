@@ -78,6 +78,14 @@ class RecipeVault:
 
         if row.get("is_failure"):
             reason = str(row.get("failure_reason") or "Не удалось обработать ссылку.")
+            from .models import is_transient_llm_error
+
+            if is_transient_llm_error(reason):
+                logger.info(
+                    "ℹ️ Recipe Vault: игнорирую устаревший временный failure: %s",
+                    cache_key,
+                )
+                return None
             return VaultFailureHit(reason=reason)
 
         recipe = recipe_from_vault_row(row)
@@ -139,8 +147,13 @@ class RecipeVault:
             fut.set_result(result)
             return result
         except VaultFailureError as exc:
-            if self.enabled:
+            if self.enabled and not exc.transient:
                 await self._persist_failure(cache_key, source_url, source_type, exc)
+            elif exc.transient:
+                logger.info(
+                    "ℹ️ Recipe Vault: временный сбой, без negative cache: %s",
+                    cache_key,
+                )
             fut.set_exception(exc)
             raise
         except Exception as exc:

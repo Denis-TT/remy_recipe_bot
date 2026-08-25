@@ -185,29 +185,43 @@ class ChefAdvisor:
 
         logger.info("👨‍🍳 Chef Remy: вопрос по «%s»", recipe.get("title"))
 
+        last_status = 0
         try:
             async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
-                async with session.post(self.api_url, json=payload) as response:
-                    body = await response.text(errors="replace")
-                    if response.status >= 400:
+                for attempt in range(1, 4):
+                    async with session.post(self.api_url, json=payload) as response:
+                        body = await response.text(errors="replace")
+                        last_status = response.status
+                        if response.status < 400:
+                            data = json.loads(body)
+                            content = (
+                                data.get("choices", [{}])[0]
+                                .get("message", {})
+                                .get("content", "")
+                            )
+                            answer = str(content or "").strip()
+                            if not answer:
+                                raise RuntimeError("Пустой ответ")
+                            if len(answer) > 3500:
+                                answer = answer[:3490].rstrip() + "…"
+                            return answer
+                        if response.status in {429, 503} and attempt < 3:
+                            wait = 2.0 * (2 ** (attempt - 1))
+                            logger.warning(
+                                "⏳ Chef API перегружен (HTTP %d), повтор через %.0f с",
+                                response.status,
+                                wait,
+                            )
+                            await asyncio.sleep(wait)
+                            continue
                         logger.error("Chef API %s: %s", response.status, body[:300])
                         raise RuntimeError(f"API {response.status}")
-                    data = json.loads(body)
-                    content = (
-                        data.get("choices", [{}])[0]
-                        .get("message", {})
-                        .get("content", "")
-                    )
-                    answer = str(content or "").strip()
-                    if not answer:
-                        raise RuntimeError("Пустой ответ")
-                    if len(answer) > 3500:
-                        answer = answer[:3490].rstrip() + "…"
-                    return answer
         except asyncio.TimeoutError:
             raise RuntimeError("Таймаут при обращении к шефу") from None
         except aiohttp.ClientError as exc:
             raise RuntimeError(f"Сетевая ошибка: {exc}") from exc
+
+        raise RuntimeError(f"API {last_status}")
 
 
 if __name__ == "__main__":

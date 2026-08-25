@@ -19,6 +19,10 @@ def current_parser_version(max_video_duration_seconds: int) -> str:
 
 
 def current_normalize_version(cfg: "Config") -> str:
-    model = str(getattr(cfg, "github_model", "") or "unknown").strip()
+    model = str(
+        getattr(cfg, "llm_model", "")
+        or getattr(cfg, "github_model", "")
+        or "unknown"
+    ).strip()
     effort = str(getattr(cfg, "github_reasoning_effort", "") or "medium").strip()
     return f"n{VAULT_PROMPT_VERSION}:{model}:{effort}"

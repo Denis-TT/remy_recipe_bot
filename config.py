@@ -56,10 +56,14 @@ class Config:
     hf_api_key: str = ""
     # Устарело: ранее yt-dlp; поле оставлено для совместимости существующих .env.
     youtube_cookie_file: str = ""
-    # GitHub Models: модель нормализации рецептов (например gpt-5-mini).
+    # GitHub Models (устарело с 2026-07-30): модель нормализации рецептов.
     github_model: str = "gpt-5-mini"
     # Усилие рассуждения для reasoning-моделей (minimal, low, medium, high).
     github_reasoning_effort: str = "medium"
+    # OpenAI-compatible LLM (нормализация, шеф, vision).
+    llm_api_key: str = ""
+    llm_api_url: str = ""
+    llm_model: str = ""
     # Минимальный интервал между обработками URL одним пользователем (сек).
     url_rate_limit_seconds: int = 180
     # Макс. длина видео для скачивания аудио и Whisper (сек); длиннее — только описание/субтитры.
@@ -116,8 +120,12 @@ class Config:
             missing.append("TELEGRAM_BOT_TOKEN")
 
         github_token = os.getenv("GITHUB_TOKEN", "").strip()
-        if not github_token:
-            missing.append("GITHUB_TOKEN")
+        openai_api_key = cls._env_optional_secret("OPENAI_API_KEY")
+        llm_api_key_explicit = cls._env_optional_secret("LLM_API_KEY")
+        llm_api_url_explicit = os.getenv("LLM_API_URL", "").strip()
+        llm_model_explicit = (
+            os.getenv("LLM_MODEL") or os.getenv("OPENAI_MODEL") or ""
+        ).strip()
 
         supabase_url = os.getenv("SUPABASE_URL", "").strip()
         if not supabase_url:
@@ -153,6 +161,21 @@ class Config:
         images_dir = _img.rstrip("/") or "/images"
 
         hf_api_key = cls._env_optional_secret("HF_API_KEY")
+
+        llm_api_key, llm_api_url, llm_model = cls._resolve_llm(
+            llm_api_key=llm_api_key_explicit,
+            llm_api_url=llm_api_url_explicit,
+            llm_model=llm_model_explicit,
+            openai_api_key=openai_api_key,
+            hf_api_key=hf_api_key,
+            github_token=github_token,
+            github_model=(
+                os.getenv("GITHUB_MODEL") or os.getenv("GITHUB_MODELS_MODEL") or "gpt-5-mini"
+            ).strip()
+            or "gpt-5-mini",
+        )
+        if not llm_api_key:
+            missing.append("HF_API_KEY или OPENAI_API_KEY или LLM_API_KEY")
 
         youtube_cookie_file = os.getenv("YOUTUBE_COOKIE_FILE", "").strip()
 
@@ -261,6 +284,9 @@ class Config:
             youtube_cookie_file=youtube_cookie_file,
             github_model=github_model,
             github_reasoning_effort=github_reasoning_effort,
+            llm_api_key=llm_api_key,
+            llm_api_url=llm_api_url,
+            llm_model=llm_model,
             url_rate_limit_seconds=url_rate_limit_seconds,
             max_video_duration_seconds=max_video_duration_seconds,
             max_concurrent_video_jobs=max_concurrent_video_jobs,
@@ -274,6 +300,50 @@ class Config:
             vault_promote_hits=vault_promote_hits,
             vault_failure_ttl_hours=vault_failure_ttl_hours,
         )
+
+    @staticmethod
+    def _resolve_llm(
+        *,
+        llm_api_key: str,
+        llm_api_url: str,
+        llm_model: str,
+        openai_api_key: str,
+        hf_api_key: str,
+        github_token: str,
+        github_model: str,
+    ) -> tuple[str, str, str]:
+        """Выбрать ключ, URL и модель для Chat Completions API."""
+        explicit_model = (llm_model or "").strip()
+
+        if llm_api_key and llm_api_url:
+            return (
+                llm_api_key,
+                llm_api_url.rstrip("/"),
+                explicit_model or "gpt-4o-mini",
+            )
+
+        if openai_api_key:
+            return (
+                openai_api_key,
+                "https://api.openai.com/v1/chat/completions",
+                explicit_model or github_model or "gpt-4o-mini",
+            )
+
+        if hf_api_key:
+            return (
+                hf_api_key,
+                "https://router.huggingface.co/v1/chat/completions",
+                explicit_model or "openai/gpt-oss-120b:fireworks-ai",
+            )
+
+        if github_token:
+            return (
+                github_token,
+                "https://models.inference.ai.azure.com/chat/completions",
+                explicit_model or github_model or "gpt-5-mini",
+            )
+
+        return "", "", ""
 
     @staticmethod
     def _parse_positive_int(raw: str, *, default: int, name: str) -> int:

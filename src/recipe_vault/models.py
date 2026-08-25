@@ -35,10 +35,36 @@ class VaultPipelineResult:
 class VaultFailureError(Exception):
     """Пользовательская ошибка, которую можно положить в negative cache."""
 
-    def __init__(self, user_message: str, *, reason: str = "") -> None:
+    def __init__(
+        self,
+        user_message: str,
+        *,
+        reason: str = "",
+        transient: bool = False,
+    ) -> None:
         super().__init__(user_message)
         self.user_message = user_message
         self.reason = reason or user_message
+        # Временные сбои (429, таймаут) — не кладём в Vault на 12 часов.
+        self.transient = bool(transient)
+
+
+def is_transient_llm_error(exc: BaseException) -> bool:
+    """429/503/таймаут/сеть — можно повторить, не кэшировать как failure."""
+    text = str(exc).lower()
+    markers = (
+        "статус 429",
+        "статус 503",
+        "status 429",
+        "status 503",
+        "таймаут",
+        "timeout",
+        "сетевая ошибка",
+        "перегружен",
+        "server overload",
+        "rate limit",
+    )
+    return any(m in text for m in markers)
 
 
 def recipe_from_vault_row(row: Mapping[str, Any]) -> dict[str, Any]:
