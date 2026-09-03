@@ -93,12 +93,17 @@ nutrition_estimated=true, nutrition_calculable=false, заполните nutriti
 ошибки распознавания аудио (например, «столёная соль» → «соль»).
 7. СЕКРЕТЫ ШЕФА: Обязательно выносите в шаги важные технологические предупреждения автора \
 («мешать только деревянной лопаткой», «насухо вытереть ягоды», «срезать специи с корочки»).
+8. НАЗВАНИЕ БЛЮДА (title): придумайте краткое аппетитное название блюда на русском \
+(например «Куриные крылья в соевом соусе»). Запрещено копировать метки платформы \
+и поля видео: «Название (Reels)», «Reels», «TikTok», «YouTube», «Video by …», \
+«Исходный title поля видео», «Описание (…)». Если в источнике нет явного названия блюда — \
+составьте его по ингредиентам и способу приготовления.
 
 ФОРМАТ ВЫВОДА:
 Пишите коротко, ёмко, без приветствий. Верните ТОЛЬКО валидный JSON (без markdown):
 
 {
-    "title": "Название на русском",
+    "title": "Борщ со сметаной",
     "description": "Краткое описание (2–3 предложения)",
     "cuisine": "russian",
     "meal_type": "lunch",
@@ -243,6 +248,26 @@ HF_FALLBACK_MODELS = (
 _TITLE_STOP_WORDS = (
     "ингредиент", "приготовление", "способ", "рецепт", "кухня",
     "описание", "состав",
+)
+
+#: Метки платформы / плейсхолдеры, которые нельзя оставлять как title блюда.
+_BAD_TITLE_EXACT = frozenset({
+    "untitled",
+    "recipe",
+    "рецепт",
+    "без названия",
+    "название на русском",
+    "reels",
+    "instagram",
+    "tiktok",
+    "youtube",
+    "vk video",
+    "video",
+})
+_BAD_TITLE_RE = re.compile(
+    r"(?i)^(?:название\b|исходный\s+title\b|описание\s*\(|"
+    r"речь\s+в\s+видео|video\s+by\b|reel\b|reels\b|"
+    r"tiktok\b|youtube\b|instagram\b|@)"
 )
 
 #: Регэксп для снятия markdown-обёртки ```json ... ``` / ``` ... ```.
@@ -737,11 +762,13 @@ class RecipeNormalizer:
         вызовов.
         """
         # ---- title ----
-        title = str(data.get("title") or "").strip()
-        if not title or title.lower() in {"untitled", "recipe", "рецепт"}:
-            logger.warning("⚠️  AI вернул пустой title, извлекаю из текста...")
+        title = str(data.get("title") or "").strip().rstrip(":").strip()
+        if self._is_bad_title(title):
+            logger.warning("⚠️  Подозрительный title «%s», подбираю из рецепта...", title)
             extracted = self._extract_title_from_text(raw_text)
-            logger.info("📝 Title извлечён из текста: «%s»", extracted)
+            if self._is_bad_title(extracted):
+                extracted = self._suggest_title_from_recipe(data)
+            logger.info("📝 Title после правки: «%s»", extracted)
             title = extracted
         data["title"] = title
 
@@ -943,25 +970,81 @@ class RecipeNormalizer:
     # ------------------------------------------------------------------ #
 
     @staticmethod
+    def _is_bad_title(title: str) -> bool:
+        """True, если title пустой, плейсхолдер или метка платформы (Reels и т.п.)."""
+        t = (title or "").strip().rstrip(":").strip()
+        if not t:
+            return True
+        low = t.lower()
+        if low in _BAD_TITLE_EXACT:
+            return True
+        if _BAD_TITLE_RE.search(t):
+            return True
+        # Только @ник или короткий ник без пробелов — не название блюда.
+        if t.startswith("@") or (len(t) <= 24 and " " not in t and re.fullmatch(r"[\w.]+", t)):
+            if not any(ch in t for ch in "ёйцукенгшщзхъфывапролджэячсмитьбюЁ"):
+                # латиница-ник; русские однословные блюда («Борщ») оставляем
+                if re.fullmatch(r"[A-Za-z0-9_.@]+", t):
+                    return True
+        if len(t) < 3:
+            return True
+        return False
+
+    @staticmethod
+    def _suggest_title_from_recipe(data: Dict[str, Any]) -> str:
+        """Собрать название из ингредиентов / типа блюда, если AI/фолбэк дали мусор."""
+        ingredients = data.get("ingredients") or []
+        names: List[str] = []
+        for ing in ingredients:
+            if isinstance(ing, dict):
+                name = str(ing.get("name") or "").strip()
+            else:
+                name = str(ing or "").strip()
+            if not name:
+                continue
+            low = name.lower()
+            if low in {"соль", "перец", "вода", "масло", "сахар"}:
+                continue
+            names.append(name)
+            if len(names) >= 2:
+                break
+        if names:
+            return " и ".join(names)[:80]
+        dish = str(data.get("dish_type") or "").strip()
+        meal = str(data.get("meal_type") or "").strip()
+        if dish and dish not in {"other", "main"}:
+            return dish.capitalize()
+        if meal and meal != "other":
+            return meal.capitalize()
+        return "Блюдо по рецепту"
+
+    @staticmethod
     def _extract_title_from_text(text: str) -> str:
         """Достать заголовок из первого предложения текста.
 
         Ищет первую непустую строку длиной 5–100 символов,
-        пропуская строки со стоп-словами («ингредиент»,
-        «приготовление», «способ», «рецепт», «кухня», ...).
+        пропуская строки со стоп-словами и метками платформы.
         Если подходящей не нашлось — возвращает первые 100 символов
         текста, приведённые в одну строку.
         """
         for line in text.splitlines():
-            stripped = line.strip()
+            stripped = line.strip().rstrip(":").strip()
             if not (5 <= len(stripped) <= 100):
                 continue
             low = stripped.lower()
             if any(stop in low for stop in _TITLE_STOP_WORDS):
                 continue
+            if RecipeNormalizer._is_bad_title(stripped):
+                continue
+            if stripped.endswith("):") or stripped.endswith(")"):
+                # «Описание (Reels, приоритетный источник):» и похожие метки
+                if "источник" in low or "дополнение" in low or "платформ" in low:
+                    continue
             return stripped
 
         fallback = " ".join(text.split())[:100].strip()
+        if RecipeNormalizer._is_bad_title(fallback):
+            return "Без названия"
         return fallback or "Без названия"
 
     @staticmethod

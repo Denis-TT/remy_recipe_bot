@@ -11,7 +11,7 @@ if TYPE_CHECKING:
 VAULT_PARSER_VERSION: str = "1"
 
 # Bump при изменении промпта нормализатора (без смены модели).
-VAULT_PROMPT_VERSION: str = "1"
+VAULT_PROMPT_VERSION: str = "2"
 
 
 def current_parser_version(max_video_duration_seconds: int) -> str:

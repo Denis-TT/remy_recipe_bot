@@ -117,10 +117,17 @@ def video_compose_text(
     description: str,
     transcript: str,
 ) -> str:
-    """Собрать сырой текст: описание в приоритете, речь/субтитры — дополнение."""
+    """Собрать сырой текст: описание в приоритете, речь/субтитры — дополнение.
+
+    Метки полей не должны выглядеть как название блюда: иначе нормализатор
+    может взять строку вида ``Название (Reels):`` в title.
+    """
     chunks: list[str] = []
     if title.strip():
-        chunks.append(f"Название ({platform}):\n{title.strip()}")
+        chunks.append(
+            f"Исходный title поля видео ({platform}) — не путать с названием блюда:\n"
+            f"{title.strip()}"
+        )
     if description.strip():
         chunks.append(
             f"Описание ({platform}, приоритетный источник):\n{description.strip()}"
