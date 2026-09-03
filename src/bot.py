@@ -64,8 +64,8 @@ logger = logging.getLogger("remy.bot")
 TEMP_RECIPE_TTL_SECONDS: int = 30 * 60
 
 
-# Время жизни сессии «спросить у шефа».
-CHEF_SESSION_TTL_SECONDS: int = 45 * 60
+# Время жизни сессии «спросить у шефа». 0 = без таймаута (выход только кнопкой/меню).
+CHEF_SESSION_TTL_SECONDS: int = 0
 
 
 class RemyBot:
@@ -189,7 +189,9 @@ class RemyBot:
         return len(expired)
 
     def cleanup_expired_chef_sessions(self) -> int:
-        """Удалить просроченные сессии шефа Реми."""
+        """Удалить просроченные сессии шефа Реми. При TTL=0 ничего не чистит."""
+        if CHEF_SESSION_TTL_SECONDS <= 0:
+            return 0
         now = time.time()
         expired = [
             uid

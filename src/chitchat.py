@@ -48,7 +48,7 @@ def reply_for_intent(intent: TextIntent, cfg: Optional["Config"] = None) -> Opti
     if intent == TextIntent.LIMITS:
         if cfg is None:
             return (
-                "⏱ Лимиты зависят от типа запроса (ссылка, фото, текст, вопрос шефу). "
+                "⏱ Лимиты зависят от типа запроса (ссылка, фото, текст). "
                 "Подробности — в /help или «📖 Инструкция» в меню /start."
             )
         url_sec = int(getattr(cfg, "url_rate_limit_seconds", 180) or 180)
