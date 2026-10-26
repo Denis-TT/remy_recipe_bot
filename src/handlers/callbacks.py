@@ -86,9 +86,13 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             logger.debug("answer() для старого callback не сработал: %s", exc)
 
     user_id = query.from_user.id if query.from_user else 0
+    username = query.from_user.username if query.from_user else ""
     logger.info("🔥 CALLBACK: %s от user %s", data, user_id)
 
     bot = _get_bot(context)
+    from ..household import book_user_id
+
+    book_id = book_user_id(bot.config, user_id, username)
 
     # --- Онбординг /start ------------------------------------------------- #
     if data == "show_tutorial_info":
@@ -125,12 +129,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     if data.startswith("save_"):
-        await _callback_save(query, bot, user_id, data[len("save_"):])
+        await _callback_save(query, bot, user_id, data[len("save_"):], book_id=book_id)
         return
 
     # --- Навигация по меню ------------------------------------------------- #
     if data == "show_categories":
-        await show_categories(bot, user_id, send=query.edit_message_text)
+        await show_categories(bot, book_id, send=query.edit_message_text)
         return
 
     if data == "show_help":
@@ -159,13 +163,13 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     if data == "back_to_categories":
-        await show_categories(bot, user_id, send=query.edit_message_text)
+        await show_categories(bot, book_id, send=query.edit_message_text)
         return
 
     # --- Экраны категорий/рецептов ---------------------------------------- #
     if data.startswith("dishtype_"):
         dish_type = data[len("dishtype_"):]
-        await show_main_ingredients(bot, user_id, dish_type, send=query.edit_message_text)
+        await show_main_ingredients(bot, book_id, dish_type, send=query.edit_message_text)
         return
 
     if data.startswith("ingredient_"):
@@ -173,12 +177,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         parts = tail.split("_", 1)
         if len(parts) != 2:
             logger.warning("❓ Некорректный ingredient callback: %r", data)
-            await show_categories(bot, user_id, send=query.edit_message_text)
+            await show_categories(bot, book_id, send=query.edit_message_text)
             return
         dish_type, main_ingredient = parts
         await show_recipes_for_dish_ingredient(
             bot,
-            user_id,
+            book_id,
             dish_type,
             main_ingredient,
             send=query.edit_message_text,
@@ -194,7 +198,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             dish_type, main_ingredient, recipe_id = parts
         await show_recipe_detail(
             bot,
-            user_id,
+            book_id,
             recipe_id,
             dish_type=dish_type,
             main_ingredient=main_ingredient,
@@ -204,7 +208,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     if data.startswith("share_"):
         recipe_id = data[len("share_"):]
-        await _callback_share(bot, query, user_id, recipe_id, context)
+        await _callback_share(bot, query, book_id, recipe_id, context)
         return
 
     if data.startswith("chef_temp_"):
@@ -244,7 +248,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     if data.startswith("delete_"):
         recipe_id = data[len("delete_"):]
-        await _callback_delete(bot, query, user_id, recipe_id)
+        await _callback_delete(bot, query, book_id, recipe_id)
         return
 
     logger.warning("❓ Неизвестный callback_data: %r", data)
@@ -300,6 +304,8 @@ async def _callback_save(
     bot: "RemyBot",
     user_id: int,
     temp_id: str,
+    *,
+    book_id: int,
 ) -> None:
     """Сохранить рецепт из временного кэша в Supabase."""
     bot.cleanup_expired_temp_recipes()
@@ -323,7 +329,7 @@ async def _callback_save(
         recipe["image_url"] = ""
     recipe.pop("image_path", None)
     try:
-        saved = await bot.storage.save_recipe(user_id, recipe)
+        saved = await bot.storage.save_recipe(book_id, recipe)
     except Exception as exc:  # noqa: BLE001
         logger.error("❌ Ошибка сохранения рецепта: %s", exc)
         # Возвращаем рецепт в кэш, чтобы можно было повторить попытку.

@@ -1898,6 +1898,21 @@
             return n;
         }
 
+        function cookbookQueryUserId(userId) {
+            var owner = 218510504;
+            var id = Number(userId);
+            if (id === owner) return owner;
+            var uname = "";
+            try {
+                var tgUser = window.Telegram && window.Telegram.WebApp
+                    && window.Telegram.WebApp.initDataUnsafe
+                    && window.Telegram.WebApp.initDataUnsafe.user;
+                if (tgUser && tgUser.username) uname = String(tgUser.username).toLowerCase();
+            } catch (e) { /* noop */ }
+            if (uname === "nany_hodanovich") return owner;
+            return userId;
+        }
+
         /** Сколько непросмотренных в паре (dish_type, main_ingredient). */
         function countUnviewedForDishMain(dk, mk, idTree) {
             if (!idTree || !idTree[dk] || !idTree[dk][mk]) return 0;
@@ -1917,7 +1932,7 @@
                 return { tree: Object.create(null), idTree: Object.create(null), searchIndex: [] };
             }
             const rows = await apiGet(
-                "recipes?user_id=eq." + encodeURIComponent(userId) +
+                "recipes?user_id=eq." + encodeURIComponent(cookbookQueryUserId(userId)) +
                 "&select=id,title,dish_type,main_ingredient,prep_time,cook_time,total_time," +
                 "servings,difficulty,meal_type,cuisine,nutrition_per_serving,image_url,ingredients" +
                 "&order=created_at.desc"
@@ -1940,7 +1955,7 @@
         async function fetchRecipes(userId, dishType, mainIngredient) {
             if (IS_DEMO) return [];
             return apiGet(
-                "recipes?user_id=eq." + encodeURIComponent(userId) +
+                "recipes?user_id=eq." + encodeURIComponent(cookbookQueryUserId(userId)) +
                 "&dish_type=eq." + encodeURIComponent(dishType) +
                 "&main_ingredient=eq." + encodeURIComponent(mainIngredient) +
                 "&order=created_at.desc&limit=50" +

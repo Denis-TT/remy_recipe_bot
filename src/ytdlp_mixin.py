@@ -263,8 +263,16 @@ class YtdlpWhisperMixin:
         from .parser import ParseResult
 
         async def _notify(stage: str, detail: str = "") -> None:
-            if on_progress is not None:
+            if on_progress is None:
+                return
+            try:
                 await on_progress(stage, detail)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "%s: прогресс не обновлён (%s), продолжаю",
+                    type(self).__name__,
+                    exc,
+                )
 
         title = ""
         description = ""
@@ -430,16 +438,8 @@ class YtdlpWhisperMixin:
             opts["ffmpeg_location"] = os.path.dirname(self._ffmpeg_path) or self._ffmpeg_path
         return opts
 
-    async def _fetch_ytdlp_info(self, url: str, *, download: bool = False) -> dict:
+    async def _run_ytdlp(self, url: str, ydl_opts: dict[str, Any], *, download: bool) -> dict:
         import yt_dlp  # type: ignore[import-untyped]
-
-        ydl_opts = self._ytdlp_base_opts()
-        if not download:
-            ydl_opts["skip_download"] = True
-
-        cookie_path = self._ytdlp_cookiefile()
-        if cookie_path:
-            ydl_opts["cookiefile"] = cookie_path
 
         def _extract() -> dict:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -448,8 +448,34 @@ class YtdlpWhisperMixin:
                     raise RuntimeError("yt-dlp вернул пустые метаданные")
                 return result
 
+        last: Optional[BaseException] = None
+        for attempt in range(2):
+            try:
+                return await asyncio.to_thread(_extract)
+            except Exception as exc:  # noqa: BLE001
+                last = exc
+                if attempt == 0 and "empty media" in str(exc).lower():
+                    logger.warning(
+                        "Instagram вернул пустой ответ, повторяю (%s)",
+                        self.AUDIO_LOG_LABEL,
+                    )
+                    await asyncio.sleep(2)
+                    continue
+                raise
+        assert last is not None
+        raise last
+
+    async def _fetch_ytdlp_info(self, url: str, *, download: bool = False) -> dict:
+        ydl_opts = self._ytdlp_base_opts()
+        if not download:
+            ydl_opts["skip_download"] = True
+
+        cookie_path = self._ytdlp_cookiefile()
+        if cookie_path:
+            ydl_opts["cookiefile"] = cookie_path
+
         try:
-            return await asyncio.to_thread(_extract)
+            return await self._run_ytdlp(url, ydl_opts, download=download)
         finally:
             if cookie_path and os.path.isfile(cookie_path):
                 with contextlib.suppress(OSError):
@@ -458,8 +484,6 @@ class YtdlpWhisperMixin:
     async def _download_audio(self, url: str) -> str:
         if not self._ffmpeg_path:
             raise RuntimeError("Локальный режим недоступен: ffmpeg не найден")
-
-        import yt_dlp  # type: ignore[import-untyped]
 
         logger.info("🎵 Скачиваю аудио (%s)...", self.AUDIO_LOG_LABEL)
 
@@ -480,12 +504,8 @@ class YtdlpWhisperMixin:
         if cookie_path:
             ydl_opts["cookiefile"] = cookie_path
 
-        def _extract() -> dict:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                return ydl.extract_info(url, download=True)
-
         try:
-            info = await asyncio.to_thread(_extract)
+            info = await self._run_ytdlp(url, ydl_opts, download=True)
         except Exception as exc:  # noqa: BLE001
             logger.error("❌ Ошибка скачивания аудио (%s): %s", self.AUDIO_LOG_LABEL, exc)
             raise

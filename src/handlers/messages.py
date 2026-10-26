@@ -31,7 +31,7 @@ from typing import TYPE_CHECKING, Any, List, Mapping, Optional
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputFile, Message, Update
 from telegram.constants import ParseMode
-from telegram.error import BadRequest
+from telegram.error import BadRequest, NetworkError, TimedOut
 from telegram.ext import ContextTypes
 
 from ..chef_advisor import validate_chef_question
@@ -136,7 +136,7 @@ _CHEF_PROMPT_TEMPLATE = (
     "• чем заменить баклажан?\n"
     "• что делать, если нет духовки?\n\n"
     "<i>Отвечаю только по этому рецепту. "
-    "Один запрос раз в 3 минуты. Файлы и фото здесь не разбираю. "
+    "Файлы и фото здесь не разбираю. "
     "Выйти — кнопка «Нет, спасибо» после ответа или 📋 Меню.</i>"
 )
 
@@ -391,6 +391,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if message is None or user is None:
         return
 
+    from ..household import note_and_greet
+
+    await note_and_greet(_get_bot(context), context, user)
+
     if await try_handle_pending_share(message, context, user.id):
         return
 
@@ -416,7 +420,13 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     if raw_text == BTN_SAVED_RECIPES:
         bot = _get_bot(context)
-        await callbacks.show_categories_for_message(message, bot, user.id)
+        from ..household import book_user_id
+
+        await callbacks.show_categories_for_message(
+            message,
+            bot,
+            book_user_id(bot.config, user.id, user.username),
+        )
         return
 
     if raw_text == BTN_HELP:
@@ -492,7 +502,7 @@ async def handle_webapp_data(update: Update, context: ContextTypes.DEFAULT_TYPE)
             await message.reply_text("❌ Не удалось загрузить рецепт для шаринга.")
             return
 
-        if recipe is None or not _recipe_belongs_to_user(recipe, user.id):
+        if recipe is None or not _recipe_belongs_to_user(recipe, _book_id_for(context, user)):
             await message.reply_text("❌ Рецепт не найден.")
             return
 
@@ -516,7 +526,7 @@ async def handle_webapp_data(update: Update, context: ContextTypes.DEFAULT_TYPE)
             await message.reply_text("❌ Не удалось загрузить рецепт.")
             return
 
-        if recipe is None or not _recipe_belongs_to_user(recipe, user.id):
+        if recipe is None or not _recipe_belongs_to_user(recipe, _book_id_for(context, user)):
             await message.reply_text("❌ Рецепт не найден.")
             return
 
@@ -545,6 +555,10 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     user = update.effective_user
     if message is None or user is None or not message.photo:
         return
+
+    from ..household import note_and_greet
+
+    await note_and_greet(_get_bot(context), context, user)
 
     logger.info("📷 Получено изображение от user %s", user.id)
     bot = _get_bot(context)
@@ -959,9 +973,12 @@ async def _handle_url(
             raise VaultFailureError(str(exc), reason=str(exc)) from exc
         except Exception as exc:  # noqa: BLE001
             logger.error("❌ Ошибка обработки URL: %s", exc)
+            from ..recipe_vault.models import is_transient_llm_error
+
             raise VaultFailureError(
                 f"Не удалось прочитать страницу: {exc}",
                 reason=str(exc),
+                transient=is_transient_llm_error(exc),
             ) from exc
 
         if not raw_text or not raw_text.strip():
@@ -1257,7 +1274,10 @@ async def try_bootstrap_chef_from_pending(
         logger.error("❌ pending_chef: загрузка %s: %s", recipe_id, exc)
         return
 
-    if recipe is None or not _recipe_belongs_to_user(recipe, user_id):
+    if recipe is None or not _recipe_belongs_to_user(
+        recipe,
+        _book_id_for(context, message.from_user) if message.from_user else user_id,
+    ):
         logger.warning("⚠️ pending_chef: рецепт %s не найден для user %s", recipe_id, user_id)
         return
 
@@ -1395,7 +1415,10 @@ async def try_handle_pending_share(
         await message.reply_text("❌ Не удалось загрузить рецепт для отправки.")
         return True
 
-    if recipe is None or not _recipe_belongs_to_user(recipe, user_id):
+    if recipe is None or not _recipe_belongs_to_user(
+        recipe,
+        _book_id_for(context, message.from_user) if message.from_user else user_id,
+    ):
         await message.reply_text("❌ Рецепт не найден.")
         return True
 
@@ -1410,6 +1433,13 @@ async def try_handle_pending_share(
 # --------------------------------------------------------------------------- #
 # Шаринг рецепта (карточка для пересылки)
 # --------------------------------------------------------------------------- #
+
+def _book_id_for(context: ContextTypes.DEFAULT_TYPE, user: Any) -> int:
+    from ..household import book_user_id
+
+    bot = _get_bot(context)
+    return book_user_id(bot.config, int(user.id), getattr(user, "username", None))
+
 
 def _recipe_belongs_to_user(recipe: Mapping[str, Any], user_id: int) -> bool:
     owner = recipe.get("user_id")
@@ -1634,9 +1664,22 @@ async def _safe_edit(message: Message, text: str, **kwargs: Any) -> None:
     modified"); падать из-за этого в async-пайплайне незачем.
     """
     try:
-        await message.edit_text(text, parse_mode=ParseMode.HTML, **kwargs)
+        await message.edit_text(
+            text,
+            parse_mode=ParseMode.HTML,
+            read_timeout=20,
+            write_timeout=20,
+            connect_timeout=15,
+            pool_timeout=15,
+            **kwargs,
+        )
     except BadRequest as exc:
         logger.warning("⚠️  Не удалось отредактировать сообщение: %s", exc)
+    except (TimedOut, NetworkError) as exc:
+        logger.warning(
+            "⚠️  Таймаут Telegram при обновлении статуса, продолжаю: %s",
+            exc,
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -1739,7 +1782,9 @@ if __name__ == "__main__":
         _demo_img["image_url"] = _tmp_img.name
 
         async def _run_present() -> None:
-            await _present_recipe_with_optional_photo(_mock_msg, _mock_status, _demo_img, _bot)
+            await _present_recipe_with_optional_photo(
+                _mock_msg, _mock_status, _demo_img, _bot, temp_id="t1",
+            )
 
         asyncio.run(_run_present())
         _mock_msg.reply_photo.assert_called_once()

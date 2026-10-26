@@ -65,7 +65,7 @@ class Config:
     llm_api_url: str = ""
     llm_model: str = ""
     # Минимальный интервал между обработками URL одним пользователем (сек).
-    url_rate_limit_seconds: int = 180
+    url_rate_limit_seconds: int = 0
     # Макс. длина видео для скачивания аудио и Whisper (сек); длиннее — только описание/субтитры.
     max_video_duration_seconds: int = 120
     # Одновременных тяжёлых видео-задач (yt-dlp + Whisper) на весь бот.
@@ -73,8 +73,8 @@ class Config:
     # Эталонная ссылка для кнопки «Протестировать пример» в /start.
     example_test_url: str = "https://www.instagram.com/reel/DZw5dtOtmxO/"
     # Лимиты на фото и текст (GitHub Models), сек.
-    photo_rate_limit_seconds: int = 120
-    text_rate_limit_seconds: int = 120
+    photo_rate_limit_seconds: int = 0
+    text_rate_limit_seconds: int = 0
     # Вопросы шефу Реми по рецепту (сек). 0 = без лимита.
     chef_rate_limit_seconds: int = 0
     # Apify Actor runs в сутки (0 = без лимита).
@@ -84,6 +84,9 @@ class Config:
     vault_draft_ttl_days: int = 90
     vault_promote_hits: int = 2
     vault_failure_ttl_hours: int = 12
+    # Общая книга: гости пишут рецепты на user_id владельца. 0 = у каждого своя.
+    cookbook_owner_id: int = 0
+    household_usernames: tuple[str, ...] = ()
 
     @property
     def is_development(self) -> bool:
@@ -194,9 +197,9 @@ class Config:
             )
             github_reasoning_effort = "medium"
 
-        url_rate_limit_seconds = cls._parse_positive_int(
-            os.getenv("URL_RATE_LIMIT_SECONDS", "180"),
-            default=180,
+        url_rate_limit_seconds = cls._parse_non_negative_int(
+            os.getenv("URL_RATE_LIMIT_SECONDS", "0"),
+            default=0,
             name="URL_RATE_LIMIT_SECONDS",
         )
         max_video_duration_seconds = cls._parse_positive_int(
@@ -215,14 +218,14 @@ class Config:
             "https://www.instagram.com/reel/DZw5dtOtmxO/",
         ).strip()
 
-        photo_rate_limit_seconds = cls._parse_positive_int(
-            os.getenv("PHOTO_RATE_LIMIT_SECONDS", "120"),
-            default=120,
+        photo_rate_limit_seconds = cls._parse_non_negative_int(
+            os.getenv("PHOTO_RATE_LIMIT_SECONDS", "0"),
+            default=0,
             name="PHOTO_RATE_LIMIT_SECONDS",
         )
-        text_rate_limit_seconds = cls._parse_positive_int(
-            os.getenv("TEXT_RATE_LIMIT_SECONDS", "120"),
-            default=120,
+        text_rate_limit_seconds = cls._parse_non_negative_int(
+            os.getenv("TEXT_RATE_LIMIT_SECONDS", "0"),
+            default=0,
             name="TEXT_RATE_LIMIT_SECONDS",
         )
         chef_rate_limit_seconds = cls._parse_non_negative_int(
@@ -256,6 +259,16 @@ class Config:
             os.getenv("VAULT_FAILURE_TTL_HOURS", "12"),
             default=12,
             name="VAULT_FAILURE_TTL_HOURS",
+        )
+        cookbook_owner_id = cls._parse_non_negative_int(
+            os.getenv("COOKBOOK_OWNER_ID", "0"),
+            default=0,
+            name="COOKBOOK_OWNER_ID",
+        )
+        household_usernames = tuple(
+            part.strip().lstrip("@").lower()
+            for part in os.getenv("HOUSEHOLD_USERNAMES", "").split(",")
+            if part.strip()
         )
 
         environment = os.getenv("ENVIRONMENT", "production").strip().lower() or "production"
@@ -299,6 +312,8 @@ class Config:
             vault_draft_ttl_days=vault_draft_ttl_days,
             vault_promote_hits=vault_promote_hits,
             vault_failure_ttl_hours=vault_failure_ttl_hours,
+            cookbook_owner_id=cookbook_owner_id,
+            household_usernames=household_usernames,
         )
 
     @staticmethod

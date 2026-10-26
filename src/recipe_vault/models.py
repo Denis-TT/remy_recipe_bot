@@ -53,11 +53,14 @@ def is_transient_llm_error(exc: BaseException) -> bool:
     """429/503/таймаут/сеть — можно повторить, не кэшировать как failure."""
     text = str(exc).lower()
     markers = (
+        "статус 404",
         "статус 429",
         "статус 503",
+        "status 404",
         "status 429",
         "status 503",
         "таймаут",
+        "timed out",
         "timeout",
         "сетевая ошибка",
         "перегружен",

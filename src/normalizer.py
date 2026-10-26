@@ -232,16 +232,29 @@ API_TIMEOUT_SECONDS = 120.0
 #: ТОЛЬКО при сбое парсинга JSON, не при HTTP-ошибке/таймауте.
 MAX_ATTEMPTS = 2
 
-#: Повторы при временной перегрузке провайдера (429/503).
-HTTP_RETRY_STATUSES = frozenset({429, 503})
+#: Повторы / смена модели: перегрузка, кончились кредиты, slug снят.
+HTTP_RETRY_STATUSES = frozenset({402, 404, 429, 503})
 HTTP_RETRY_ATTEMPTS = 2
 HTTP_RETRY_BASE_SECONDS = 1.5
 
 #: Запасные модели HF Router, если основная перегружена (429).
 HF_FALLBACK_MODELS = (
-    "openai/gpt-oss-120b:fireworks-ai",
-    "moonshotai/Kimi-K2-Instruct:novita",
-    "deepseek-ai/DeepSeek-V3-0324:novita",
+    "deepseek-ai/DeepSeek-V4-Flash:deepinfra",
+    "deepseek-ai/DeepSeek-V3.2:novita",
+    "moonshotai/Kimi-K2.5:novita",
+)
+
+#: Бесплатные модели OpenRouter. nex-n2.5-pro:free сняли с бесплатного тарифа.
+OPENROUTER_FALLBACK_MODELS = (
+    "nvidia/nemotron-3-ultra-550b-a55b:free",
+    "dots-studio/dots-3-note-preview:free",
+    "openrouter/free",
+)
+
+#: Бесплатные модели, которые принимают фото. Ultra текстовая и на картинку отвечает 404.
+OPENROUTER_VISION_MODELS = (
+    "nvidia/nemotron-3.5-super-vl:free",
+    "dots-studio/dots-3-note-preview:free",
 )
 
 #: Стоп-слова для эвристического извлечения title из текста.
@@ -425,10 +438,7 @@ class RecipeNormalizer:
             raise ValueError("Пустое изображение")
 
         raw_placeholder = "[изображение]"
-        models_try: List[str] = []
-        for cand in (self.model, "gpt-5-chat", "gpt-4o"):
-            if cand and cand not in models_try:
-                models_try.append(cand)
+        models_try = self._vision_models()
 
         last_http_error: Optional[RuntimeError] = None
         raw_content: Optional[str] = None
@@ -549,8 +559,12 @@ class RecipeNormalizer:
             "Content-Type": "application/json",
             "Accept": "application/json",
         }
+        if "openrouter.ai" in (self.api_url or ""):
+            headers["HTTP-Referer"] = "https://github.com/Denis-TT/remy_recipe_bot"
+            headers["X-Title"] = "Remy Recipe Bot"
 
-        timeout = aiohttp.ClientTimeout(total=API_TIMEOUT_SECONDS)
+        # Таймаут на один запрос, не на всю цепочку моделей.
+        timeout = aiohttp.ClientTimeout(total=30, sock_connect=15)
         models = self._candidate_models()
 
         last_status = 0
@@ -563,55 +577,82 @@ class RecipeNormalizer:
                         user_content=user_content,
                         model=model,
                     )
+                    if "openrouter.ai" in (self.api_url or "") and ":free" in model:
+                        # Как в jobbot-by: free-модели иначе тратят лимит на reasoning.
+                        payload["reasoning"] = {"enabled": False}
                     logger.info("🤖 Отправка запроса к LLM API (модель: %s)", model)
                     for attempt in range(1, HTTP_RETRY_ATTEMPTS + 1):
-                        async with session.post(self.api_url, json=payload) as response:
-                            body = await response.text(errors="replace")
-                            last_status = response.status
-                            last_body = body
+                        try:
+                            async with session.post(self.api_url, json=payload) as response:
+                                body = await response.text(errors="replace")
+                                last_status = response.status
+                                last_body = body
 
-                            logger.info(
-                                "📡 Ответ получен (статус: %d, %d символов)",
-                                response.status,
-                                len(body),
-                            )
-
-                            if response.status < 400:
-                                return self._extract_content(body)
-
-                            if (
-                                response.status in HTTP_RETRY_STATUSES
-                                and attempt < HTTP_RETRY_ATTEMPTS
-                            ):
-                                wait = HTTP_RETRY_BASE_SECONDS * (2 ** (attempt - 1))
-                                logger.warning(
-                                    "⏳ LLM перегружен (HTTP %d, %s), повтор через "
-                                    "%.1f с (%d/%d)",
+                                logger.info(
+                                    "📡 Ответ получен (статус: %d, %d символов)",
                                     response.status,
-                                    model,
-                                    wait,
-                                    attempt,
-                                    HTTP_RETRY_ATTEMPTS,
+                                    len(body),
                                 )
-                                await asyncio.sleep(wait)
-                                continue
 
-                            if response.status in HTTP_RETRY_STATUSES:
-                                logger.warning(
-                                    "⚠️ Модель %s недоступна (HTTP %d), пробую другую",
-                                    model,
+                                if response.status < 400:
+                                    embedded = self._provider_error_code(body)
+                                    if embedded is not None:
+                                        logger.warning(
+                                            "⚠️ Модель %s: ошибка провайдера в теле "
+                                            "(code %s), пробую другую",
+                                            model,
+                                            embedded,
+                                        )
+                                        break
+                                    return self._extract_content(body)
+
+                                if response.status == 404:
+                                    logger.warning(
+                                        "⚠️ Модель %s не найдена (HTTP 404), пробую другую",
+                                        model,
+                                    )
+                                    break
+
+                                if (
+                                    response.status in HTTP_RETRY_STATUSES
+                                    and attempt < HTTP_RETRY_ATTEMPTS
+                                ):
+                                    wait = HTTP_RETRY_BASE_SECONDS * (2 ** (attempt - 1))
+                                    logger.warning(
+                                        "⏳ LLM перегружен (HTTP %d, %s), повтор через "
+                                        "%.1f с (%d/%d)",
+                                        response.status,
+                                        model,
+                                        wait,
+                                        attempt,
+                                        HTTP_RETRY_ATTEMPTS,
+                                    )
+                                    await asyncio.sleep(wait)
+                                    continue
+
+                                if response.status in HTTP_RETRY_STATUSES:
+                                    logger.warning(
+                                        "⚠️ Модель %s недоступна (HTTP %d), пробую другую",
+                                        model,
+                                        response.status,
+                                    )
+                                    break
+
+                                logger.error(
+                                    "❌ Ошибка API (статус %d): %s",
                                     response.status,
+                                    self._truncate(body, 500),
                                 )
-                                break
-
-                            logger.error(
-                                "❌ Ошибка API (статус %d): %s",
-                                response.status,
-                                self._truncate(body, 500),
+                                raise RuntimeError(
+                                    f"Ошибка LLM API (статус {response.status})"
+                                )
+                        except asyncio.TimeoutError:
+                            logger.warning(
+                                "⚠️ Модель %s: таймаут запроса, пробую другую",
+                                model,
                             )
-                            raise RuntimeError(
-                                f"Ошибка LLM API (статус {response.status})"
-                            )
+                            last_body = "timeout"
+                            break
 
         except asyncio.TimeoutError:
             logger.error("❌ Таймаут при обращении к AI (%.0f с)", API_TIMEOUT_SECONDS)
@@ -620,6 +661,9 @@ class RecipeNormalizer:
             logger.error("❌ Сетевая ошибка при обращении к AI: %s", exc)
             raise RuntimeError(f"Сетевая ошибка при обращении к AI: {exc}") from exc
 
+        if last_body == "timeout":
+            logger.error("❌ Таймаут всех моделей LLM")
+            raise RuntimeError("Таймаут при обращении к AI")
         logger.error(
             "❌ Ошибка API после повторов (статус %d): %s",
             last_status,
@@ -628,15 +672,38 @@ class RecipeNormalizer:
         raise RuntimeError(f"Ошибка LLM API (статус {last_status})")
 
     def _candidate_models(self) -> list[str]:
-        """Основная модель + запасные (для HF Router при 429)."""
-        primary = (self.model or "").strip()
+        """Основная модель (+ список через запятую) и запасные по провайдеру."""
         models: list[str] = []
-        if primary:
-            models.append(primary)
-        if "huggingface.co" in (self.api_url or ""):
-            for m in HF_FALLBACK_MODELS:
-                if m not in models:
-                    models.append(m)
+        for part in (self.model or "").split(","):
+            m = part.strip()
+            if m and m not in models:
+                models.append(m)
+
+        url = self.api_url or ""
+        extras: tuple[str, ...] = ()
+        if "openrouter.ai" in url:
+            extras = OPENROUTER_FALLBACK_MODELS
+        elif "huggingface.co" in url:
+            extras = HF_FALLBACK_MODELS
+        for m in extras:
+            if m not in models:
+                models.append(m)
+        return models or [DEFAULT_MODEL]
+
+    def _vision_models(self) -> list[str]:
+        """Модели для фото: сначала те, что принимают картинку, затем остальные."""
+        models: list[str] = []
+        if "openrouter.ai" in (self.api_url or ""):
+            for part in OPENROUTER_VISION_MODELS:
+                if part not in models:
+                    models.append(part)
+        for part in self._candidate_models():
+            if part not in models:
+                models.append(part)
+        if "openrouter.ai" not in (self.api_url or ""):
+            for part in ("gpt-5-chat", "gpt-4o"):
+                if part not in models:
+                    models.append(part)
         return models or [DEFAULT_MODEL]
 
     async def _call_api_vision(
@@ -659,12 +726,17 @@ class RecipeNormalizer:
             ],
             model=model,
         )
+        if "openrouter.ai" in (self.api_url or "") and ":free" in model:
+            payload["reasoning"] = {"enabled": False}
         headers = {
             "Authorization": f"Bearer {self.github_token}",
             "Content-Type": "application/json",
             "Accept": "application/json",
         }
-        timeout = aiohttp.ClientTimeout(total=API_TIMEOUT_SECONDS)
+        if "openrouter.ai" in (self.api_url or ""):
+            headers["HTTP-Referer"] = "https://github.com/Denis-TT/remy_recipe_bot"
+            headers["X-Title"] = "Remy Recipe Bot"
+        timeout = aiohttp.ClientTimeout(total=35, sock_connect=15)
 
         logger.info("🤖 Отправка vision-запроса к LLM API (модель: %s)", model)
 
@@ -677,6 +749,10 @@ class RecipeNormalizer:
                         response.status,
                         len(body),
                     )
+                    if response.status < 400 and self._provider_error_code(body) is not None:
+                        raise RuntimeError(
+                            f"Ошибка LLM vision API (статус {self._provider_error_code(body)})"
+                        )
                     if response.status >= 400:
                         logger.error(
                             "❌ Vision API (статус %d): %s",
@@ -684,15 +760,32 @@ class RecipeNormalizer:
                             self._truncate(body, 500),
                         )
                         raise RuntimeError(
-                            f"Ошибка GitHub Models vision API (статус {response.status})"
+                            f"Ошибка LLM vision API (статус {response.status})"
                         )
                     return self._extract_content(body)
         except asyncio.TimeoutError:
-            logger.error("❌ Таймаут vision-запроса к AI (%.0f с)", API_TIMEOUT_SECONDS)
+            logger.error("❌ Таймаут vision-запроса к AI (35 с)")
             raise RuntimeError("Таймаут при обращении к AI (vision)") from None
         except aiohttp.ClientError as exc:
             logger.error("❌ Сетевая ошибка vision: %s", exc)
             raise RuntimeError(f"Сетевая ошибка при vision: {exc}") from exc
+
+    @staticmethod
+    def _provider_error_code(response_body: str) -> Optional[int]:
+        """OpenRouter иногда отдаёт HTTP 200 и ошибку провайдера в JSON."""
+        try:
+            envelope = json.loads(response_body)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(envelope, dict):
+            return None
+        err = envelope.get("error")
+        if not isinstance(err, dict):
+            return None
+        try:
+            return int(err.get("code"))
+        except (TypeError, ValueError):
+            return 503
 
     @staticmethod
     def _extract_content(response_body: str) -> str:
@@ -1246,6 +1339,11 @@ if __name__ == "__main__":
     )
 
     async def _test() -> None:
+        assert RecipeNormalizer._provider_error_code(
+            '{"id":"x","error":{"message":"overloaded","code":503}}'
+        ) == 503
+        assert RecipeNormalizer._provider_error_code('{"choices":[]}') is None
+
         # ---- Тест 2 (без API): пустой текст ----
         temp_normalizer = RecipeNormalizer(github_token="dummy-for-validation")
         try:

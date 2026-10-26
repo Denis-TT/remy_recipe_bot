@@ -71,17 +71,20 @@ def format_example_simulation_text(url: str) -> str:
 def format_tutorial_text(cfg: "Config") -> str:
     """Текст инструкции с актуальными лимитами из конфига."""
     max_sec = int(getattr(cfg, "max_video_duration_seconds", 120) or 120)
-    rate_sec = int(getattr(cfg, "url_rate_limit_seconds", 180) or 180)
+    rate_sec = int(getattr(cfg, "url_rate_limit_seconds", 0) or 0)
 
     if max_sec % 60 == 0:
         max_label = f"{max_sec // 60} мин"
     else:
         max_label = f"{max_sec} сек"
 
-    if rate_sec % 60 == 0:
-        rate_label = f"{rate_sec // 60} мин"
-    else:
-        rate_label = f"{rate_sec} сек"
+    rate_line = ""
+    if rate_sec > 0:
+        if rate_sec % 60 == 0:
+            rate_label = f"{rate_sec // 60} мин"
+        else:
+            rate_label = f"{rate_sec} сек"
+        rate_line = f"• Не чаще 1 ссылки раз в {rate_label}\n"
 
     return (
         "📖 Как пользоваться Реми\n"
@@ -93,7 +96,7 @@ def format_tutorial_text(cfg: "Config") -> str:
         "⚠️ Лимиты:\n"
         f"• Видео до {max_label} — полный разбор (голос + описание)\n"
         "• Длиннее — только если в описании или субтитрах достаточно текста\n"
-        f"• Не чаще 1 ссылки раз в {rate_label}\n"
+        f"{rate_line}"
         "\n"
         "Нажми «🔥 Протестировать пример» или «🔗 Отправить свою ссылку»!"
     )
@@ -148,6 +151,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     if user is not None:
         logger.info("🚀 /start от user %s (@%s)", user.id, user.username or "—")
+        from ..household import note_and_greet
+
+        await note_and_greet(_get_bot(context), context, user)
 
     message = update.effective_message
     if message is None:
@@ -198,7 +204,7 @@ async def _start_share_deeplink(
     """
     # Ленивый импорт: messages импортирует commands на уровне модуля,
     # поэтому обратный импорт делаем внутри функции.
-    from .messages import _recipe_belongs_to_user, _send_shared_recipe
+    from .messages import _book_id_for, _recipe_belongs_to_user, _send_shared_recipe
 
     message = update.effective_message
     user = update.effective_user
@@ -214,7 +220,7 @@ async def _start_share_deeplink(
         logger.error("❌ Deep link share: ошибка загрузки рецепта %s: %s", recipe_id, exc)
         return False
 
-    if recipe is None or not _recipe_belongs_to_user(recipe, user.id):
+    if recipe is None or not _recipe_belongs_to_user(recipe, _book_id_for(context, user)):
         logger.warning("⚠️ Deep link share: рецепт %s не найден/чужой для user %s", recipe_id, user.id)
         await message.reply_text("❌ Рецепт не найден.")
         return True

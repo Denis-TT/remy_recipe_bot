@@ -1557,6 +1557,51 @@ class InstagramParser(YtdlpWhisperMixin, BaseParser):
             )
         )
 
+    @staticmethod
+    def _canonicalize_url(url: str) -> str:
+        """Ссылки «Поделиться» (/share/reel/, /share/p/) ведут на короткий код, не на ролик.
+
+        yt-dlp такие URL не принимает. Достаём канонический /reel/ или /p/.
+        """
+        if not re.search(r"instagram\.com/share/(?:reel|p)/", url or "", re.IGNORECASE):
+            return url
+        req = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": WebParser.HEADERS["User-Agent"],
+                "Accept": "text/html,application/xhtml+xml",
+            },
+            method="GET",
+        )
+        final = url
+        body = ""
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                final = resp.geturl() or url
+                if re.search(r"instagram\.com/share/", final, re.IGNORECASE):
+                    body = resp.read(200_000).decode("utf-8", "replace")
+        except urllib.error.HTTPError as exc:
+            loc = ""
+            if exc.headers:
+                loc = exc.headers.get("Location") or ""
+            final = loc or url
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            logger.warning("Instagram share: не открылась ссылка: %s", exc)
+            return url
+
+        found = re.search(
+            r"https?://(?:www\.|m\.)?instagram\.com/(reel|reels|p)/([A-Za-z0-9_-]+)",
+            f"{final}\n{body}",
+            re.IGNORECASE,
+        )
+        if not found:
+            logger.warning("Instagram share: в ответе нет reel/p")
+            return url
+        kind = "reel" if found.group(1).lower().startswith("reel") else "p"
+        canon = f"https://www.instagram.com/{kind}/{found.group(2)}/"
+        logger.info("Instagram share → %s", canon)
+        return canon
+
     async def parse(
         self,
         url: str,
@@ -1565,6 +1610,7 @@ class InstagramParser(YtdlpWhisperMixin, BaseParser):
     ) -> ParseResult:
         if not self.can_parse(url):
             raise ValueError(f"InstagramParser не поддерживает URL: {url!r}")
+        url = await asyncio.to_thread(self._canonicalize_url, url)
         return await self.parse_ytdlp_video(url, on_progress=on_progress)
 
     @staticmethod
@@ -2148,6 +2194,30 @@ if __name__ == "__main__":
         ) == "AbCd123"
         assert InstagramParser._extract_shortcode("https://m.instagram.com/reels/ReEl_42/") == "ReEl_42"
         assert InstagramParser._extract_shortcode("https://www.instagram.com/p/xY9_/") == "xY9_"
+        assert InstagramParser._canonicalize_url(
+            "https://www.instagram.com/reel/AbCd123/"
+        ) == "https://www.instagram.com/reel/AbCd123/"
+        share_html = (
+            '<html><a href="https://www.instagram.com/reel/AbCd123/?igsh=1">reel</a></html>'
+        )
+
+        class _ShareResp:
+            def geturl(self):
+                return "https://www.instagram.com/share/reel/BAABCxyz12/"
+
+            def read(self, _n):
+                return share_html.encode()
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+        with patch("urllib.request.urlopen", return_value=_ShareResp()):
+            assert InstagramParser._canonicalize_url(
+                "https://www.instagram.com/share/reel/BAABCxyz12/"
+            ) == "https://www.instagram.com/reel/AbCd123/"
         assert not InstagramParser.can_parse("https://www.youtube.com/watch?v=dQw4w9WgXcQ")
         assert not InstagramParser.can_parse("")
         ig_actor_item = {

@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import socket
 import threading
 import time
 import uuid
@@ -42,6 +43,7 @@ from telegram.ext import (
 )
 from telegram import Update
 from telegram.error import BadRequest
+from telegram.request import HTTPXRequest
 
 from config import Config, config as default_config
 
@@ -239,7 +241,32 @@ class RemyBot:
         """
         logger.info("🤖 Инициализация Telegram-приложения...")
 
-        app = Application.builder().token(self.config.telegram_token).build()
+        # После сна мак оставляет полуоткрытый сокет к Telegram, и long poll
+        # висит в poll() без таймаута. Keepalive сбрасывает такой сокет.
+        keepalive = [
+            (socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1),
+            (socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 10),
+            (socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3),
+        ]
+        if hasattr(socket, "TCP_KEEPALIVE"):
+            keepalive.append((socket.IPPROTO_TCP, socket.TCP_KEEPALIVE, 30))
+        elif hasattr(socket, "TCP_KEEPIDLE"):
+            keepalive.append((socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 30))
+
+        updates_request = HTTPXRequest(
+            connection_pool_size=1,
+            connect_timeout=15.0,
+            read_timeout=10.0,
+            write_timeout=10.0,
+            pool_timeout=5.0,
+            socket_options=tuple(keepalive),
+        )
+        app = (
+            Application.builder()
+            .token(self.config.telegram_token)
+            .get_updates_request(updates_request)
+            .build()
+        )
 
         # Делаем себя доступными для всех хендлеров.
         app.bot_data["remy"] = self
@@ -286,12 +313,16 @@ class RemyBot:
         self._preload_whisper_background()
         logger.info("🚀 Бот Remy запущен (polling)...")
 
-        try:
-            from run import mark_bot_polling_ready
+        import sys
 
-            mark_bot_polling_ready()
-        except ImportError:
-            pass
+        marker = getattr(sys.modules.get("__main__"), "mark_bot_polling_ready", None)
+        if not callable(marker):
+            try:
+                from run import mark_bot_polling_ready as marker
+            except ImportError:
+                marker = None
+        if callable(marker):
+            marker()
 
         try:
             # stop_signals=None: сигналы обрабатываются `run.py`.
@@ -300,6 +331,7 @@ class RemyBot:
             app.run_polling(
                 drop_pending_updates=True,
                 stop_signals=None,
+                bootstrap_retries=-1,
             )
         finally:
             logger.info("🛑 Polling остановлен")

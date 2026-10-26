@@ -147,6 +147,26 @@ class SupabaseStorage(BaseStorage):
         )
         return saved
 
+    async def upsert_household_member(
+        self,
+        member_id: int,
+        cookbook_user_id: int,
+        username: str = "",
+    ) -> None:
+        """Привязать Telegram-аккаунт к общей книге рецептов."""
+        await self._request(
+            "POST",
+            "/household_members",
+            json_body={
+                "member_id": int(member_id),
+                "cookbook_user_id": int(cookbook_user_id),
+                "username": (username or "").strip().lstrip("@").lower(),
+            },
+            extra_headers={
+                "Prefer": "resolution=merge-duplicates,return=minimal",
+            },
+        )
+
     # ------------------------------------------------------------------ #
     # CRUD: read
     # ------------------------------------------------------------------ #

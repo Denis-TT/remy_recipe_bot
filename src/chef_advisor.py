@@ -162,60 +162,85 @@ class ChefAdvisor:
             "Ответь на все пункты вопроса, если их несколько."
         )
 
-        payload: Dict[str, Any] = {
-            "model": self.model,
-            "messages": [
-                {"role": "system", "content": CHEF_SYSTEM_PROMPT},
-                {"role": "user", "content": user_msg},
-            ],
-        }
-        if "gpt-5" in self.model or "o1" in self.model or "o3" in self.model:
-            payload["max_completion_tokens"] = 1200
-            payload["reasoning_effort"] = self.reasoning_effort
-        else:
-            payload["temperature"] = 0.4
-            payload["max_tokens"] = 1200
-
         headers = {
             "Authorization": f"Bearer {self.github_token}",
             "Content-Type": "application/json",
             "Accept": "application/json",
         }
-        timeout = aiohttp.ClientTimeout(total=API_TIMEOUT_SECONDS)
+        if "openrouter.ai" in (self.api_url or ""):
+            headers["HTTP-Referer"] = "https://github.com/Denis-TT/remy_recipe_bot"
+            headers["X-Title"] = "Remy Recipe Bot"
+
+        timeout = aiohttp.ClientTimeout(total=30, sock_connect=15)
+        models = [m.strip() for m in (self.model or "").split(",") if m.strip()]
+        if not models:
+            models = [self.model or "gpt-5-mini"]
 
         logger.info("👨‍🍳 Chef Remy: вопрос по «%s»", recipe.get("title"))
 
         last_status = 0
         try:
             async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
-                for attempt in range(1, 4):
-                    async with session.post(self.api_url, json=payload) as response:
-                        body = await response.text(errors="replace")
-                        last_status = response.status
-                        if response.status < 400:
-                            data = json.loads(body)
-                            content = (
-                                data.get("choices", [{}])[0]
-                                .get("message", {})
-                                .get("content", "")
-                            )
-                            answer = str(content or "").strip()
-                            if not answer:
-                                raise RuntimeError("Пустой ответ")
-                            if len(answer) > 3500:
-                                answer = answer[:3490].rstrip() + "…"
-                            return answer
-                        if response.status in {429, 503} and attempt < 3:
-                            wait = 2.0 * (2 ** (attempt - 1))
-                            logger.warning(
-                                "⏳ Chef API перегружен (HTTP %d), повтор через %.0f с",
-                                response.status,
-                                wait,
-                            )
-                            await asyncio.sleep(wait)
-                            continue
-                        logger.error("Chef API %s: %s", response.status, body[:300])
-                        raise RuntimeError(f"API {response.status}")
+                for model in models:
+                    payload: Dict[str, Any] = {
+                        "model": model,
+                        "messages": [
+                            {"role": "system", "content": CHEF_SYSTEM_PROMPT},
+                            {"role": "user", "content": user_msg},
+                        ],
+                    }
+                    if "gpt-5" in model or "o1" in model or "o3" in model:
+                        payload["max_completion_tokens"] = 1200
+                        payload["reasoning_effort"] = self.reasoning_effort
+                    else:
+                        payload["temperature"] = 0.4
+                        payload["max_tokens"] = 1200
+                    if "openrouter.ai" in (self.api_url or "") and ":free" in model:
+                        payload["reasoning"] = {"enabled": False}
+
+                    for attempt in range(1, 3):
+                        try:
+                            async with session.post(self.api_url, json=payload) as response:
+                                body = await response.text(errors="replace")
+                                last_status = response.status
+                                if response.status < 400:
+                                    try:
+                                        data = json.loads(body)
+                                    except json.JSONDecodeError:
+                                        break
+                                    if isinstance(data, dict) and isinstance(data.get("error"), dict):
+                                        logger.warning(
+                                            "⚠️ Chef модель %s: ошибка провайдера в теле, пробую другую",
+                                            model,
+                                        )
+                                        break
+                                    content = (
+                                        data.get("choices", [{}])[0]
+                                        .get("message", {})
+                                        .get("content", "")
+                                    )
+                                    answer = str(content or "").strip()
+                                    if not answer:
+                                        break
+                                    if len(answer) > 3500:
+                                        answer = answer[:3490].rstrip() + "…"
+                                    return answer
+                                if response.status in {402, 404, 429, 503} and attempt < 2:
+                                    await asyncio.sleep(2.0 * attempt)
+                                    continue
+                                if response.status in {402, 404, 429, 503}:
+                                    logger.warning(
+                                        "⚠️ Chef модель %s недоступна (HTTP %d)",
+                                        model,
+                                        response.status,
+                                    )
+                                    break
+                                logger.error("Chef API %s: %s", response.status, body[:300])
+                                raise RuntimeError(f"API {response.status}")
+                        except asyncio.TimeoutError:
+                            logger.warning("⚠️ Chef модель %s: таймаут, пробую другую", model)
+                            last_status = 0
+                            break
         except asyncio.TimeoutError:
             raise RuntimeError("Таймаут при обращении к шефу") from None
         except aiohttp.ClientError as exc:

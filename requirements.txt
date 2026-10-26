@@ -18,7 +18,7 @@ google-api-python-client==2.149.0
 # Instagram Reels: локальное скачивание аудио + распознавание речи.
 # yt-dlp тянет аудиодорожку, faster-whisper (CTranslate2, int8) распознаёт офлайн.
 # Apify остаётся fallback'ом при ошибке/таймауте. На Railway есть ffmpeg (nixpacks.toml).
-yt-dlp>=2024.12.0
+yt-dlp>=2026.10.21
 faster-whisper>=1.1.0
 
 # Telegram bot framework (block 6: bot)
